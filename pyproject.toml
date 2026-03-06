@@ -52,3 +52,6 @@ disallow_any_generics = true
 check_untyped_defs = true
 no_implicit_reexport = true
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
