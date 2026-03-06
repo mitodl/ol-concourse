@@ -1,0 +1,154 @@
+---
+resources:
+  - name: ol-concourse
+    type: git
+    icon: github
+    source:
+      uri: https://github.com/mitodl/ol-concourse
+      branch: main
+
+  - name: concourse-packer-resource
+    type: registry-image
+    icon: docker
+    source:
+      tag: latest
+      repository: mitodl/concourse-packer-resource
+      username: ((dockerhub.username))
+      password: ((dockerhub.password))
+
+  - name: concourse-pulumi-resource
+    type: registry-image
+    icon: docker
+    source:
+      tag: latest
+      repository: mitodl/concourse-pulumi-resource
+      username: ((dockerhub.username))
+      password: ((dockerhub.password))
+
+  - name: concourse-pulumi-resource-provisioner
+    type: registry-image
+    icon: docker
+    source:
+      tag: latest
+      repository: mitodl/concourse-pulumi-resource-provisioner
+      username: ((dockerhub.username))
+      password: ((dockerhub.password))
+
+  - name: concourse-github-issues-resource
+    type: registry-image
+    icon: docker
+    source:
+      tag: latest
+      repository: mitodl/concourse-github-issues-resource
+      username: ((dockerhub.username))
+      password: ((dockerhub.password))
+
+jobs:
+  - name: build-and-publish-packer-image
+    public: true
+    plan:
+      - get: ol-concourse
+        trigger: true
+        params:
+          include_submodules: false
+      - task: build-image
+        privileged: true
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: concourse/oci-build-task
+          inputs:
+            - name: ol-concourse
+          outputs:
+            - name: image
+          run:
+            path: build
+          params:
+            CONTEXT: ol-concourse/resources/packer
+            DOCKERFILE: ol-concourse/resources/packer/Dockerfile
+      - put: concourse-packer-resource
+        params:
+          image: image/image.tar
+          additional_tags: ol-concourse/.git/ref
+
+  - name: build-and-publish-pulumi-image
+    public: true
+    plan:
+      - get: ol-concourse
+        trigger: true
+        params:
+          include_submodules: false
+      - task: build-image
+        privileged: true
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: concourse/oci-build-task
+          inputs:
+            - name: ol-concourse
+          outputs:
+            - name: image
+          run:
+            path: build
+          params:
+            CONTEXT: ol-concourse/resources/pulumi
+            DOCKERFILE: ol-concourse/resources/pulumi/Dockerfile
+      - task: build-image-provisioner
+        privileged: true
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: concourse/oci-build-task
+          inputs:
+            - name: ol-concourse
+          outputs:
+            - name: image-provisioner
+          run:
+            path: build
+          params:
+            CONTEXT: ol-concourse/resources/pulumi
+            DOCKERFILE: ol-concourse/resources/pulumi/Dockerfile.mitol_provision
+            OUTPUT_OCI: image-provisioner/image.tar
+      - put: concourse-pulumi-resource
+        params:
+          image: image/image.tar
+          additional_tags: ol-concourse/.git/ref
+      - put: concourse-pulumi-resource-provisioner
+        params:
+          image: image-provisioner/image.tar
+          additional_tags: ol-concourse/.git/ref
+
+  - name: build-and-publish-github-issues-image
+    public: true
+    plan:
+      - get: ol-concourse
+        trigger: true
+        params:
+          include_submodules: false
+      - task: build-image
+        privileged: true
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: concourse/oci-build-task
+          inputs:
+            - name: ol-concourse
+          outputs:
+            - name: image
+          run:
+            path: build
+          params:
+            CONTEXT: ol-concourse/resources/github-issues
+            DOCKERFILE: ol-concourse/resources/github-issues/Dockerfile
+      - put: concourse-github-issues-resource
+        params:
+          image: image/image.tar
+          additional_tags: ol-concourse/.git/ref

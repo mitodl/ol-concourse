@@ -1,0 +1,54 @@
+---
+resource_types:
+  - name: pypi
+    type: registry-image
+    source:
+      repository: cfplatformeng/concourse-pypi-resource
+
+resources:
+  - name: ol-concourse
+    type: git
+    icon: github
+    source:
+      uri: https://github.com/mitodl/ol-concourse
+      branch: main
+      paths:
+        - pipeline_lib/pyproject.toml
+        - pipeline_lib/src/**
+
+  - name: ol-concourse-lib-pypi
+    type: pypi
+    icon: language-python
+    source:
+      name: ol-concourse-lib
+      username: ((pypi.username))
+      password: ((pypi.password))
+
+jobs:
+  - name: publish-ol-concourse-lib
+    public: true
+    plan:
+      - get: ol-concourse
+        trigger: true
+      - task: build-package
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: ghcr.io/astral-sh/uv
+              tag: 0.7-python3.13
+          inputs:
+            - name: ol-concourse
+          outputs:
+            - name: dist
+          run:
+            path: /bin/sh
+            args:
+              - -exc
+              - |
+                cd ol-concourse
+                uv build --package ol-concourse-lib --out-dir ../dist/
+      - put: ol-concourse-lib-pypi
+        params:
+          glob: dist/ol_concourse_lib-*.tar.gz

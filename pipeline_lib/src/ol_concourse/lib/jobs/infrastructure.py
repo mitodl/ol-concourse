@@ -4,8 +4,7 @@ from collections.abc import Iterable
 from copy import deepcopy
 from pathlib import Path
 
-from bridge.settings.github.team_members import DEVOPS_MIT
-from ol_concourse.lib.constants import REGISTRY_IMAGE
+from ol_concourse.lib.constants import GH_ISSUES_DEFAULT_REPOSITORY, REGISTRY_IMAGE
 from ol_concourse.lib.models.fragment import PipelineFragment
 from ol_concourse.lib.models.pipeline import (
     AnonymousResource,
@@ -30,7 +29,6 @@ from ol_concourse.lib.resource_types import (
     pulumi_provisioner_resource,
 )
 from ol_concourse.lib.resources import github_issues, pulumi_provisioner
-from ol_concourse.pipelines.constants import GH_ISSUES_DEFAULT_REPOSITORY
 
 
 def packer_jobs(  # noqa: PLR0913
@@ -276,7 +274,7 @@ def pulumi_jobs_chain(  # noqa: PLR0913, C901, PLR0912
                 put=gh_issues_post.name,
                 params={
                     "labels": github_issue_labels or default_github_issue_labels,
-                    "assignees": github_issue_assignees or DEVOPS_MIT,
+                    "assignees": github_issue_assignees or [],
                 },
             )
             chain_fragment.resources.append(gh_issues_post)

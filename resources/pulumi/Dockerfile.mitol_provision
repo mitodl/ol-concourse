@@ -1,0 +1,48 @@
+# MIT ODL provisioner image: uses python:3.13-slim + manually installs Pulumi CLI,
+# kubectl, and AWS CLI. Copies Python venv/binaries from mitodl/ol-infrastructure.
+FROM mitodl/ol-infrastructure AS infra
+
+FROM python:3.13-slim
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && \
+    apt-get install --no-install-recommends -y curl unzip groff && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built Python environment and tools from ol-infrastructure image
+COPY --from=infra /usr/local/ /usr/local/
+
+ARG PULUMI_VERSION=latest
+RUN curl -fsSL https://get.pulumi.com -o pulumi.sh && \
+    /bin/sh pulumi.sh --install-root /usr/local --version "${PULUMI_VERSION}" --silent && \
+    rm pulumi.sh
+
+# Install kubectl
+RUN curl -fsSL "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl" \
+    -o /usr/local/bin/kubectl && \
+    chmod +x /usr/local/bin/kubectl
+
+# Install AWS CLI v2
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip && \
+    unzip awscliv2.zip && \
+    ./aws/install && \
+    rm -rf awscliv2.zip aws/
+
+WORKDIR /opt/resource/
+
+COPY requirements.txt requirements.txt
+RUN python3 -m pip install --upgrade pip && \
+    pip install -r requirements.txt --no-deps
+
+COPY concourse.py ./concourse.py
+COPY pulumi_utils.py ./pulumi_utils.py
+COPY io_utils.py ./io_utils.py
+RUN python3 -m concoursetools . -r concourse.py
+
+# Automatically install Pulumi plugins for all pulumi packages present in the venv
+RUN pip freeze | sort | grep -i pulumi | grep -v 'pulumi==' | \
+    sed -E 's/pulumi(verse)?[-_](.*?)==(.*)/resource \2 \3/' | \
+    sed 's/_/-/' | \
+    xargs -n 3 pulumi plugin install --non-interactive
+
+ENTRYPOINT ["python3"]
