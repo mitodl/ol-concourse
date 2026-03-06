@@ -1,0 +1,54 @@
+[project]
+name = "ol-concourse"
+version = "0.0.0"
+description = "MIT Open Learning Concourse CI/CD monorepo — resources and pipeline tooling"
+requires-python = ">=3.13"
+# This is a workspace root; no runtime dependencies here.
+dependencies = []
+
+[tool.uv.workspace]
+members = ["pipeline_lib", "resources/*"]
+
+[dependency-groups]
+dev = [
+    "concoursetools>=0.8.0,<0.9",
+    "pre-commit>=4.0.0,<5",
+    "ruff>=0.14.0",
+    "mypy>=1.0",
+    "pytest>=8.0.0,<9",
+    "pytest-mock>=3.14.0,<4",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "A", "B", "C4", "D", "DTZ", "E", "ERA", "EXE", "F", "G",
+    "ICN", "ISC", "N", "PIE", "PTH", "PLR", "Q", "RET", "RUF",
+    "S", "SIM", "T10", "T20", "TCH", "TID", "UP", "W", "YTT",
+]
+ignore = [
+    "B008", "B905", "D104", "D200", "D202", "D205", "D301", "D400",
+    "N801", "N802", "N803", "N806", "N813", "N815", "N816",
+    "PIE804", "RET504", "RET505", "RET506", "RET507", "RET508",
+    "UP007",
+]
+fixable = ["I", "D", "B", "E", "F", "UP", "C4", "Q", "RET", "PIE", "SIM", "W", "RUF"]
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "double"
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.mypy]
+python_version = "3.13"
+follow_imports = "normal"
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_any_generics = true
+check_untyped_defs = true
+no_implicit_reexport = true
+ignore_missing_imports = true

@@ -1,0 +1,38 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv
+.uv/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# MyPy
+.mypy_cache/
+
+# Ruff
+.ruff_cache/
+
+# Pytest
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Docker build context artifacts (generated, not committed)
+resources/*/requirements.txt
+
+# Aider
+.aider*
