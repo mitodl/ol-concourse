@@ -51,6 +51,26 @@ jobs:
         trigger: true
         params:
           include_submodules: false
+      - task: generate-requirements
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: ghcr.io/astral-sh/uv
+              tag: 0.7-python3.13
+          inputs:
+            - name: ol-concourse
+          outputs:
+            - name: ol-concourse
+          run:
+            path: /bin/sh
+            args:
+              - -exc
+              - |
+                cd ol-concourse
+                uv export --package ol-concourse-packer --no-dev --no-emit-workspace \
+                  --no-hashes -o resources/packer/requirements.txt
       - task: build-image
         privileged: true
         config:
@@ -80,6 +100,26 @@ jobs:
         trigger: true
         params:
           include_submodules: false
+      - task: generate-requirements
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: ghcr.io/astral-sh/uv
+              tag: 0.7-python3.13
+          inputs:
+            - name: ol-concourse
+          outputs:
+            - name: ol-concourse
+          run:
+            path: /bin/sh
+            args:
+              - -exc
+              - |
+                cd ol-concourse
+                uv export --package ol-concourse-pulumi --no-dev --no-emit-workspace \
+                  --no-hashes -o resources/pulumi/requirements.txt
       - task: build-image
         privileged: true
         config:
@@ -131,6 +171,26 @@ jobs:
         trigger: true
         params:
           include_submodules: false
+      - task: generate-requirements
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: ghcr.io/astral-sh/uv
+              tag: 0.7-python3.13
+          inputs:
+            - name: ol-concourse
+          outputs:
+            - name: ol-concourse
+          run:
+            path: /bin/sh
+            args:
+              - -exc
+              - |
+                cd ol-concourse
+                uv export --package ol-concourse-github-issues --no-dev --no-emit-workspace \
+                  --no-hashes -o resources/github-issues/requirements.txt
       - task: build-image
         privileged: true
         config:
