@@ -1,6 +1,6 @@
 # Production image: uses the official Pulumi Python image which includes the
 # Pulumi CLI, Python runtime, and common plugins pre-installed.
-FROM pulumi/pulumi-python:3.207.0@sha256:53edc98fdbe605cf3433ce18b04e2063adb446777f19c5a80c82f5d2fc564a12
+FROM pulumi/pulumi-python:3.226.0@sha256:79e6109af8da1457c40887ab42382907b480ab75ddc3656dd3eaa6b94c337a5a
 
 ENV PYTHONUNBUFFERED=1
 WORKDIR /opt/resource/
