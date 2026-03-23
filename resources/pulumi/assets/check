@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Check for new versions of the Pulumi stack resource."""
+from concourse import PulumiResource
+
+if __name__ == "__main__":
+    PulumiResource.check_main()

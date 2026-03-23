@@ -1,33 +1,6 @@
-"""Concourse resource for running Pulumi deployments.
+"""Concourse resource type for managing Pulumi stack deployments."""
 
-Example source configuration:
-  resources:
-  - name: pulumi-stack
-    type: pulumi
-    source:
-      stack_name: applications.myapp.production
-      project_name: ol-infrastructure-myapp
-      source_dir: src/ol_infrastructure/applications/myapp
-
-Example put step params:
-  params:
-    action: update         # "create", "update", or "destroy"
-    preview: false
-    refresh_stack: true
-    stack_config:
-      aws:region: us-east-1
-    env_pulumi:
-      AWS_REGION: us-east-1
-    env_os:
-      PATH: "${PATH}:/usr/local/bin"
-    env_vars_from_files:
-      PULUMI_CONFIG_PASSPHRASE: path/to/passphrase
-
-Example get step params (in):
-  params:
-    skip_implicit_get: false
-    output_key: my_output_key   # optional: fetch a single output value
-"""
+from __future__ import annotations
 
 import json
 import os
@@ -35,8 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from concoursetools import BuildMetadata, ConcourseResource
-from concoursetools.version import TypedVersion
+from concoursetools import BuildMetadata, ConcourseResource, TypedVersion
 
 import io_utils
 import pulumi_utils
@@ -44,17 +16,20 @@ import pulumi_utils
 
 @dataclass
 class PulumiVersion(TypedVersion):
-    """Version type for the Pulumi resource."""
+    """Static version — Pulumi stacks are not polled for external changes."""
 
     id: str = "0"
 
 
 class PulumiResource(ConcourseResource[PulumiVersion]):
-    """Concourse resource for creating, updating, and destroying Pulumi stacks."""
+    """Concourse resource for running Pulumi stack operations.
+
+    Source configuration maps to __init__ parameters. All fields are
+    optional here and can be overridden per-step via params.
+    """
 
     def __init__(
         self,
-        /,
         stack_name: str = "",
         project_name: str = "",
         source_dir: str = ".",
@@ -65,14 +40,22 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         self.stack_name = stack_name
         self.project_name = project_name
         self.source_dir = source_dir
-        self.env_pulumi = env_pulumi or {}
-        self.env_os = env_os or {}
+        self.env_pulumi: dict[str, str] = env_pulumi or {}
+        self.env_os: dict[str, str] = env_os or {}
+
+    # ------------------------------------------------------------------
+    # check
+    # ------------------------------------------------------------------
 
     def fetch_new_versions(
         self, previous_version: PulumiVersion | None
     ) -> list[PulumiVersion]:
-        """Return a static version — Pulumi stacks don't have a meaningful version."""
+        """Return a static version. Triggering is handled by git resource changes."""
         return [PulumiVersion(id="0")]
+
+    # ------------------------------------------------------------------
+    # get
+    # ------------------------------------------------------------------
 
     def download_version(
         self,
@@ -80,54 +63,63 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         destination_dir: Path,
         build_metadata: BuildMetadata,
         *,
-        skip_implicit_get: bool = False,
+        output_key: str | None = None,
+        run_preview: bool = False,
         stack_name: str | None = None,
         project_name: str | None = None,
         source_dir: str | None = None,
         env_pulumi: dict[str, str] | None = None,
         env_os: dict[str, str] | None = None,
-        output_key: str | None = None,
     ) -> tuple[PulumiVersion, dict[str, str]]:
-        """Fetch stack outputs and write them to a JSON file in destination_dir.
+        """Read stack outputs and optionally run a preview.
 
-        :param skip_implicit_get: If True, skip stack output fetch entirely.
-        :param stack_name: Override stack name from source config.
-        :param project_name: Override project name from source config.
-        :param source_dir: Override source directory from source config.
-        :param env_pulumi: Pulumi environment variables.
-        :param env_os: OS environment variables to merge.
-        :param output_key: If set, fetch only this single output key.
+        destination_dir is this resource's own output directory; its parent
+        is the job working directory that contains all fetched inputs.
         """
-        if skip_implicit_get:
-            return PulumiVersion(id="0"), {}
+        effective = self._resolve_params(
+            stack_name=stack_name,
+            project_name=project_name,
+            source_dir=source_dir,
+            env_pulumi=env_pulumi,
+            env_os=env_os,
+        )
 
-        resolved_stack = stack_name or self.stack_name
-        resolved_project = project_name or self.project_name
-        resolved_source = source_dir or self.source_dir
-        resolved_env = {**self.env_pulumi, **(env_pulumi or {})}
+        _apply_os_env(effective["env_os"])
 
-        if env_os:
-            os.environ.update(env_os)
-        elif self.env_os:
-            os.environ.update(self.env_os)
-
-        stack_source_dir = destination_dir / resolved_source
-        env_config = {"env_pulumi": resolved_env}
+        # job working dir is the parent of this resource's destination dir
+        work_dir = destination_dir.parent / effective["source_dir"]
 
         outputs = pulumi_utils.read_stack(
-            stack_name=resolved_stack,
-            project_name=resolved_project,
-            source_dir=stack_source_dir,
-            env=env_config,
+            stack_name=effective["stack_name"],
+            project_name=effective["project_name"],
+            source_dir=work_dir,
+            env_pulumi=effective["env_pulumi"],
             output_key=output_key,
         )
 
-        outputs_path = stack_source_dir / f"{resolved_stack}_outputs.json"
-        outputs_path.write_text(json.dumps(outputs, indent=2))
+        outputs_file = destination_dir / f"{effective['stack_name']}_outputs.json"
+        outputs_file.write_text(json.dumps(outputs, indent=2))
 
-        return PulumiVersion(id="0"), {}
+        metadata: dict[str, str] = {"outputs_file": str(outputs_file)}
 
-    def publish_new_version(  # noqa: PLR0913
+        if run_preview:
+            preview_file = destination_dir / f"{effective['stack_name']}_preview.json"
+            pulumi_utils.run_preview(
+                stack_name=effective["stack_name"],
+                project_name=effective["project_name"],
+                source_dir=work_dir,
+                env_pulumi=effective["env_pulumi"],
+                output_file=preview_file,
+            )
+            metadata["preview_file"] = str(preview_file)
+
+        return version, metadata
+
+    # ------------------------------------------------------------------
+    # put
+    # ------------------------------------------------------------------
+
+    def publish_new_version(
         self,
         sources_dir: Path,
         build_metadata: BuildMetadata,
@@ -143,28 +135,22 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         env_os: dict[str, str] | None = None,
         env_vars_from_files: dict[str, str] | None = None,
     ) -> tuple[PulumiVersion, dict[str, str]]:
-        """Create, update, or destroy a Pulumi stack.
+        """Execute a Pulumi action against a stack.
 
-        :param action: One of "create", "update", or "destroy".
-        :param stack_name: Override stack name from source config.
-        :param project_name: Override project name from source config.
-        :param source_dir: Override source directory path from source config.
-        :param stack_config: Dict of Pulumi config key-value pairs.
-        :param preview: If True, run a preview only (no changes applied).
-        :param refresh_stack: If True, refresh stack state before update/destroy.
-        :param env_pulumi: Pulumi-specific environment variables.
-        :param env_os: OS environment variables to merge.
-        :param env_vars_from_files: Map of env var name → file path.
+        sources_dir is the job working directory containing all fetched inputs.
         """
-        resolved_stack = stack_name or self.stack_name
-        resolved_project = project_name or self.project_name
-        resolved_source = source_dir or self.source_dir
-        resolved_env = {**self.env_pulumi, **(env_pulumi or {})}
+        if action not in ("create", "update", "destroy"):
+            raise ValueError(
+                f"Invalid action '{action}'. Must be one of: create, update, destroy"
+            )
 
-        if env_os:
-            os.environ.update(env_os)
-        elif self.env_os:
-            os.environ.update(self.env_os)
+        effective = self._resolve_params(
+            stack_name=stack_name,
+            project_name=project_name,
+            source_dir=source_dir,
+            env_pulumi=env_pulumi,
+            env_os=env_os,
+        )
 
         if env_vars_from_files:
             for var_name, file_path in env_vars_from_files.items():
@@ -172,42 +158,99 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
                     file_path, working_dir=str(sources_dir)
                 )
 
-        stack_source_dir = sources_dir / resolved_source
-        env_config = {"env_pulumi": resolved_env}
+        _apply_os_env(effective["env_os"])
+
+        work_dir = sources_dir / effective["source_dir"]
         cfg = stack_config or {}
 
-        if action == "create":
-            version_id = pulumi_utils.create_stack(
-                stack_name=resolved_stack,
-                project_name=resolved_project,
-                source_dir=stack_source_dir,
-                stack_config=cfg,
-                env=env_config,
-                preview=preview,
-            )
-        elif action == "update":
-            version_id = pulumi_utils.update_stack(
-                stack_name=resolved_stack,
-                project_name=resolved_project,
-                source_dir=stack_source_dir,
-                stack_config=cfg,
-                env=env_config,
-                refresh_stack=refresh_stack,
-                preview=preview,
-            )
-        elif action == "destroy":
+        metadata: dict[str, str] = {
+            "action": action,
+            "stack": effective["stack_name"],
+        }
+
+        if action == "destroy":
             version_id = pulumi_utils.destroy_stack(
-                stack_name=resolved_stack,
-                project_name=resolved_project,
-                env=env_config,
+                stack_name=effective["stack_name"],
+                project_name=effective["project_name"],
+                env_pulumi=effective["env_pulumi"],
                 refresh_stack=refresh_stack,
             )
+            metadata["result"] = "succeeded"
+
+        elif preview:
+            preview_file = work_dir / f"{effective['stack_name']}_preview.json"
+            if action == "create":
+                pulumi_utils.create_stack(
+                    stack_name=effective["stack_name"],
+                    project_name=effective["project_name"],
+                    source_dir=work_dir,
+                    stack_config=cfg,
+                    env_pulumi=effective["env_pulumi"],
+                    preview=True,
+                    preview_file=preview_file,
+                )
+            else:
+                pulumi_utils.update_stack(
+                    stack_name=effective["stack_name"],
+                    project_name=effective["project_name"],
+                    source_dir=work_dir,
+                    stack_config=cfg,
+                    env_pulumi=effective["env_pulumi"],
+                    refresh_stack=refresh_stack,
+                    preview=True,
+                    preview_file=preview_file,
+                )
+            version_id = 0
+            preview_data = json.loads(preview_file.read_text())
+            metadata["preview_file"] = str(preview_file)
+            metadata["changes"] = json.dumps(preview_data.get("change_summary", {}))
+
         else:
-            msg = f'Invalid action "{action}": must be "create", "update", or "destroy"'
-            raise ValueError(msg)
+            if action == "create":
+                version_id = pulumi_utils.create_stack(
+                    stack_name=effective["stack_name"],
+                    project_name=effective["project_name"],
+                    source_dir=work_dir,
+                    stack_config=cfg,
+                    env_pulumi=effective["env_pulumi"],
+                )
+            else:
+                version_id = pulumi_utils.update_stack(
+                    stack_name=effective["stack_name"],
+                    project_name=effective["project_name"],
+                    source_dir=work_dir,
+                    stack_config=cfg,
+                    env_pulumi=effective["env_pulumi"],
+                    refresh_stack=refresh_stack,
+                )
+            metadata["result"] = "succeeded"
 
-        return PulumiVersion(id=str(version_id)), {}
+        return PulumiVersion(id=str(version_id)), metadata
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_params(
+        self,
+        stack_name: str | None,
+        project_name: str | None,
+        source_dir: str | None,
+        env_pulumi: dict[str, str] | None,
+        env_os: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        """Merge step-level overrides onto source-level defaults."""
+        merged_env_pulumi = {**self.env_pulumi, **(env_pulumi or {})}
+        merged_env_os = {**self.env_os, **(env_os or {})}
+        return {
+            "stack_name": stack_name or self.stack_name,
+            "project_name": project_name or self.project_name,
+            "source_dir": source_dir or self.source_dir,
+            "env_pulumi": merged_env_pulumi,
+            "env_os": merged_env_os,
+        }
 
 
-if __name__ == "__main__":
-    PulumiResource.check_main()
+def _apply_os_env(env_vars: dict[str, str]) -> None:
+    for key, value in env_vars.items():
+        os.environ[key] = value

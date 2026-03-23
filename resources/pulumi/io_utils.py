@@ -1,21 +1,22 @@
+"""File I/O helpers for the Concourse Pulumi resource."""
+
+from __future__ import annotations
+
 import os
 
 
-# =============================================================================
-# read_value_from_file
-# =============================================================================
-def read_value_from_file(file_path: str, working_dir=None) -> str:
-    # get original working directory
-    original_working_dir = os.getcwd()  # noqa: PTH109
-    # change to specified working dir
+def read_value_from_file(file_path: str, working_dir: str | None = None) -> str:
+    """Read a file's contents, stripping trailing whitespace.
+
+    Temporarily changes to working_dir (if given) so relative file_path values
+    resolve correctly regardless of the process's current working directory.
+    """
+    original_dir = os.getcwd()  # noqa: PTH109
     if working_dir:
         os.chdir(working_dir)
-    # read the contents of the value file
-    with open(file_path) as value_file:  # noqa: PTH123
-        file_value = value_file.read()
-    # trim any trailing newline
-    file_value = file_value.rstrip("\n")
-    # change back to original working dir
-    if os.getcwd() != original_working_dir:  # noqa: PTH109
-        os.chdir(original_working_dir)
-    return file_value
+    try:
+        with open(file_path) as fh:  # noqa: PTH123
+            return fh.read().rstrip("\n")
+    finally:
+        if os.getcwd() != original_dir:  # noqa: PTH109
+            os.chdir(original_dir)

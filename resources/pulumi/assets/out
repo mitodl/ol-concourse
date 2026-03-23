@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Deploy or manage a Pulumi stack (create, update, or destroy)."""
+from concourse import PulumiResource
+
+if __name__ == "__main__":
+    PulumiResource.out_main()

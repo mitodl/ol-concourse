@@ -1,212 +1,265 @@
-"""the pulumi CRUD+L interface"""
+"""Pulumi Automation API operations for the Concourse Pulumi resource."""
 
-import logging
-import sys
+from __future__ import annotations
+
+import json
 from pathlib import Path
-from typing import Union
+from typing import Any
 
-from pulumi import automation
+from pulumi import automation as auto
+from pulumi.automation import LocalWorkspaceOptions
+from pulumi.automation.events import EngineEvent, OpType, ResourcePreEvent
 
-logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
-logger = logging.getLogger(__name__)
 
-
-def list_stack(project_name: str, runtime: str) -> list:
-    """returns list of stacks for given workspace in project and runtime"""  # noqa: D401, D403
-    workspace: automation.LocalWorkspace = automation.LocalWorkspace(
-        project_settings=automation.ProjectSettings(name=project_name, runtime=runtime)
-    )
-    stacks: list = workspace.list_stacks()
-
-    return [stack.name for stack in stacks]
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def read_stack(
     stack_name: str,
     project_name: str,
-    source_dir: Union[str, Path],
-    env: dict,
+    source_dir: str | Path,
+    env_pulumi: dict[str, str],
+    *,
     output_key: str | None = None,
-):
-    """returns output value or values from a specified stack"""  # noqa: D403, D401
-    import sys
+) -> dict[str, Any]:
+    """Select a stack and return its outputs.
 
-    logger.info(sys.argv[1])
+    Returns a dict of all outputs, or a single-key dict when output_key is set.
+    Raises StackNotFoundError (with a descriptive message) if the stack does not exist.
+    """
     try:
-        stack: automation.Stack = automation.select_stack(
+        stack = auto.select_stack(
             stack_name=stack_name,
             project_name=project_name,
-            work_dir=source_dir,
-            opts=__params_env_to_workspace(params=env),
+            work_dir=str(source_dir),
+            opts=_workspace_opts(env_pulumi),
         )
-        outputs: dict = stack.outputs()
+    except auto.StackNotFoundError as exc:
+        raise auto.StackNotFoundError(f"Stack '{stack_name}' not found") from exc
 
-        # return single value from outputs, or return all outputs
-        if output_key:
-            return outputs[output_key].value
-        return outputs
-    except automation.StackNotFoundError as exception:
-        raise automation.StackNotFoundError(
-            f"stack '{stack_name}' does not exist"
-        ) from exception
+    outputs = stack.outputs()
+    if output_key:
+        return {output_key: outputs[output_key].value if output_key in outputs else None}
+    return {k: v.value for k, v in outputs.items()}
 
 
-def create_stack(  # noqa: PLR0913
+def run_preview(
     stack_name: str,
     project_name: str,
-    source_dir: Union[str, Path],
-    stack_config: dict,
-    env: dict,
+    source_dir: str | Path,
+    env_pulumi: dict[str, str],
+    output_file: Path,
+) -> dict:
+    """Select a stack, run a preview, write JSON to output_file, and return the payload."""
+    try:
+        stack = auto.select_stack(
+            stack_name=stack_name,
+            project_name=project_name,
+            work_dir=str(source_dir),
+            opts=_workspace_opts(env_pulumi),
+        )
+    except auto.StackNotFoundError as exc:
+        raise auto.StackNotFoundError(f"Stack '{stack_name}' not found") from exc
+
+    return _run_preview_on_stack(stack, output_file)
+
+
+def create_stack(
+    stack_name: str,
+    project_name: str,
+    source_dir: str | Path,
+    stack_config: dict[str, str],
+    env_pulumi: dict[str, str],
+    *,
     preview: bool = False,
+    preview_file: Path | None = None,
 ) -> int:
-    """creates a stack and returns its output values"""  # noqa: D403, D401
+    """Create a new stack and run pulumi up (or preview).
 
-    logger.info(sys.argv[1])
+    Returns the Pulumi stack version number, or 0 for a preview run.
+    Raises StackAlreadyExistsError if the stack already exists.
+    """
     try:
-        # create the stack if it does not exist
-        stack: automation.Stack = automation.create_stack(
+        stack = auto.create_stack(
             stack_name=stack_name,
             project_name=project_name,
-            work_dir=source_dir,
-            opts=__env_to_workspace(env=env),
+            work_dir=str(source_dir),
+            opts=_workspace_opts(env_pulumi),
         )
-        # add config kv pairs
-        for config_key, config_value in stack_config.items():
-            stack.set_config(config_key, automation.ConfigValue(config_value))
-        if preview:
-            # preview instead and output to stdout
-            logger.info(f"stack '{stack_name}' preview below:")
-            stack.preview(on_output=logger.info)
-            return 0
-        else:
-            # deploy the stack and output logs to stdout
-            up_result = stack.up(on_output=logger.info)
-            logger.info(f"stack '{stack_name}' successfully created!")
-            return up_result.summary.version
-    except automation.StackAlreadyExistsError as exception:
-        raise automation.StackAlreadyExistsError(
-            f"stack '{stack_name}' already exists"
-        ) from exception
+    except auto.StackAlreadyExistsError as exc:
+        raise auto.StackAlreadyExistsError(
+            f"Stack '{stack_name}' already exists"
+        ) from exc
+
+    _apply_stack_config(stack, stack_config)
+
+    if preview:
+        _run_preview_on_stack(stack, preview_file)
+        return 0
+
+    result = stack.up(on_output=print)
+    return result.summary.version
 
 
-def update_stack(  # noqa: PLR0913
+def update_stack(
     stack_name: str,
     project_name: str,
-    source_dir: Union[str, Path],
-    stack_config: dict,
-    env: dict | None = None,
+    source_dir: str | Path,
+    stack_config: dict[str, str],
+    env_pulumi: dict[str, str],
+    *,
     refresh_stack: bool = True,
     preview: bool = False,
-    run_program: bool = False,
+    preview_file: Path | None = None,
 ) -> int:
-    """updates a stack and returns its output values"""  # noqa: D403, D401
-    import sys
+    """Select an existing stack, optionally refresh, then run pulumi up (or preview).
 
-    logger.info(sys.argv[1])
+    Returns the Pulumi stack version number, or 0 for a preview run.
+    Raises StackNotFoundError or ConcurrentUpdateError as appropriate.
+    """
     try:
-        # updates the stack if not already updating
-        stack: automation.Stack = automation.select_stack(
+        stack = auto.select_stack(
             stack_name=stack_name,
             project_name=project_name,
-            work_dir=source_dir,
-            opts=__env_to_workspace(env=env),
+            work_dir=str(source_dir),
+            opts=_workspace_opts(env_pulumi),
         )
-        # add config kv pairs
-        for config_key, config_value in stack_config.items():
-            stack.set_config(config_key, automation.ConfigValue(config_value))
-        # refresh the stack
-        if refresh_stack:
-            stack.refresh(on_output=logger.info, run_program=run_program)
-        if preview:
-            # preview instead and output to stdout
-            logger.info(f"stack '{stack_name}' preview below:")
-            stack.preview(on_output=logger.info)
-            return 0
-        else:
-            # deploy the stack and output logs to stdout
-            up_result = stack.up(on_output=logger.info, run_program=run_program)
-            logger.info(f"stack '{stack_name}' successfully updated!")
-            return up_result.summary.version
-    except automation.ConcurrentUpdateError as exception:
-        raise automation.ConcurrentUpdateError(
-            f"stack '{stack_name}' already has update in progress"
-        ) from exception
+    except auto.StackNotFoundError as exc:
+        raise auto.StackNotFoundError(f"Stack '{stack_name}' not found") from exc
+    except auto.ConcurrentUpdateError as exc:
+        raise auto.ConcurrentUpdateError(
+            f"Stack '{stack_name}' already has an update in progress"
+        ) from exc
+
+    _apply_stack_config(stack, stack_config)
+
+    if refresh_stack:
+        stack.refresh(on_output=print)
+
+    if preview:
+        _run_preview_on_stack(stack, preview_file)
+        return 0
+
+    try:
+        result = stack.up(on_output=print)
+    except auto.ConcurrentUpdateError as exc:
+        raise auto.ConcurrentUpdateError(
+            f"Stack '{stack_name}' already has an update in progress"
+        ) from exc
+
+    return result.summary.version
 
 
 def destroy_stack(
     stack_name: str,
     project_name: str,
-    env: dict | None = None,
-    refresh_stack: bool = False,
-    run_program: bool = False,
+    env_pulumi: dict[str, str],
+    *,
+    refresh_stack: bool = True,
 ) -> int:
-    """destroys and removes a stack"""  # noqa: D403
+    """Select a stack, run pulumi destroy, then remove it from the backend.
+
+    Uses a no-op program so no source directory is required.
+    Returns the Pulumi stack version number.
+    Raises StackNotFoundError or ConcurrentUpdateError as appropriate.
+    """
     try:
-        # select the stack
-        stack: automation.Stack = automation.select_stack(
+        stack = auto.select_stack(
             stack_name=stack_name,
             project_name=project_name,
-            # no-op program for destroy
             program=lambda *args: None,
-            opts=__env_to_workspace(env=env),
+            opts=_workspace_opts(env_pulumi),
         )
-        # refresh the stack
-        if refresh_stack:
-            stack.refresh(on_output=logger.info, run_program=run_program)
-        # destroy the stack and output logs to stdout
-        destroy_result = stack.destroy(on_output=logger.info, run_program=run_program)
-        stack.workspace.remove_stack(stack_name)
-        return destroy_result.summary.version
-    except automation.StackNotFoundError as exception:
-        raise automation.StackNotFoundError(
-            f"stack '{stack_name}' does not exist"
-        ) from exception
-    except automation.ConcurrentUpdateError as exception:
-        raise automation.ConcurrentUpdateError(
-            f"stack '{stack_name}' already has update in progress"
-        ) from exception
-    except Exception as exception:
-        raise Exception(str(exception)) from exception
+    except auto.StackNotFoundError as exc:
+        raise auto.StackNotFoundError(f"Stack '{stack_name}' not found") from exc
+    except auto.ConcurrentUpdateError as exc:
+        raise auto.ConcurrentUpdateError(
+            f"Stack '{stack_name}' already has an update in progress"
+        ) from exc
 
+    if refresh_stack:
+        stack.refresh(on_output=print)
 
-def __env_to_workspace(
-    env: dict | None = None,
-) -> automation.LocalWorkspaceOptions:
-    """converts env dict into workspace options"""  # noqa: D403, D401
-    env = env or {}
-    aws_shared_credentials_file = Path(sys.argv[1]).joinpath(
-        (env).get("AWS_SHARED_CREDENTIALS_FILE", "")
-    )
-    env["AWS_SHARED_CREDENTIALS_FILE"] = aws_shared_credentials_file
-    return automation.LocalWorkspaceOptions(env_vars=env)
-
-
-def __params_env_to_workspace(
-    params: dict,
-) -> automation.LocalWorkspaceOptions:
     try:
-        env_pulumi = params.get("env_pulumi", {})
-        env_os = params.get("env_os", {})
-        aws_region = env_os.get("AWS_DEFAULT_REGION", None)
-        aws_shared_credentials_file = Path(sys.argv[1]).joinpath(
-            env_pulumi.get("AWS_SHARED_CREDENTIALS_FILE", None)
-        )
-        project_name = params.get("project_name", {})
-        s3_bucket = params.get("s3_bucket", "")
-    except Exception as e:
-        logger.error(e)
-        raise e
-    else:
-        opts = automation.LocalWorkspaceOptions(
-            env_vars={
-                "AWS_REGION": aws_region,
-                "AWS_SHARED_CREDENTIALS_FILE": aws_shared_credentials_file,
-            },
-            project_settings=automation.ProjectSettings(
-                runtime=automation.ProjectRuntimeInfo(name=project_name),
-                name=project_name,
-                backend=automation.ProjectBackend(url=s3_bucket),
-            ),
-        )
+        result = stack.destroy(on_output=print)
+    except auto.ConcurrentUpdateError as exc:
+        raise auto.ConcurrentUpdateError(
+            f"Stack '{stack_name}' already has an update in progress"
+        ) from exc
 
-    return opts
+    stack.workspace.remove_stack(stack_name)
+    return result.summary.version
+
+
+def serialize_resource_event(event: ResourcePreEvent) -> dict[str, Any]:
+    """Convert a ResourcePreEvent into a JSON-serialisable dict."""
+    meta = event.metadata
+    detailed: dict[str, Any] = {}
+    if meta.detailed_diff:
+        detailed = {
+            path: {
+                "diff_kind": diff.diff_kind.value,
+                "input_diff": diff.input_diff,
+            }
+            for path, diff in meta.detailed_diff.items()
+        }
+    return {
+        "operation": meta.op.value,
+        "urn": meta.urn,
+        "type": meta.type,
+        "diffs": meta.diffs or [],
+        "detailed_diff": detailed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+def _workspace_opts(env_pulumi: dict[str, str]) -> LocalWorkspaceOptions:
+    return LocalWorkspaceOptions(env_vars=env_pulumi)
+
+
+def _apply_stack_config(stack: auto.Stack, config: dict[str, str]) -> None:
+    for key, value in config.items():
+        stack.set_config(key, auto.ConfigValue(value=str(value)))
+
+
+def _run_preview_on_stack(stack: auto.Stack, output_file: Path | None) -> dict:
+    """Run pulumi preview on an already-selected stack.
+
+    Writes structured JSON to output_file (if given) and returns the payload.
+    """
+    resource_events: list[ResourcePreEvent] = []
+
+    def on_event(event: EngineEvent) -> None:
+        if event.resource_pre_event and event.resource_pre_event.metadata:
+            resource_events.append(event.resource_pre_event)
+
+    result = stack.preview(
+        diff=True,
+        on_output=print,
+        on_event=on_event,
+    )
+
+    changes = [
+        serialize_resource_event(evt)
+        for evt in resource_events
+        if evt.metadata and evt.metadata.op != OpType.SAME
+    ]
+
+    payload = {
+        "change_summary": {
+            k.value: v for k, v in (result.change_summary or {}).items()
+        },
+        "changes": changes,
+        "stdout": result.stdout,
+    }
+
+    if output_file is not None:
+        output_file.write_text(json.dumps(payload, indent=2))
+
+    return payload
