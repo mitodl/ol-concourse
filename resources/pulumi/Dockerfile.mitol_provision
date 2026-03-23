@@ -2,6 +2,8 @@
 # kubectl, and AWS CLI. Copies Python venv/binaries from mitodl/ol-infrastructure.
 FROM mitodl/ol-infrastructure AS infra
 
+FROM ghcr.io/astral-sh/uv:latest AS uv
+
 FROM python:3.13-slim
 ENV PYTHONUNBUFFERED=1
 
@@ -11,6 +13,7 @@ RUN apt-get update && \
 
 # Copy pre-built Python environment and tools from ol-infrastructure image
 COPY --from=infra /usr/local/ /usr/local/
+COPY --from=uv /uv /usr/local/bin/uv
 
 ARG PULUMI_VERSION=latest
 RUN curl -fsSL https://get.pulumi.com -o pulumi.sh && \
