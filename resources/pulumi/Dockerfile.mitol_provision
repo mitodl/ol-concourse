@@ -1,5 +1,5 @@
 # MIT ODL provisioner image: uses python:3.13-slim + manually installs Pulumi CLI,
-# kubectl, and AWS CLI. Copies Python venv/binaries from mitodl/ol-infrastructure.
+# kubectl, and AWS CLI. Syncs Python dependencies from mitodl/ol-infrastructure via uv.
 FROM mitodl/ol-infrastructure AS infra
 
 FROM ghcr.io/astral-sh/uv:latest AS uv
@@ -8,12 +8,15 @@ FROM python:3.13-slim
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && \
-    apt-get install --no-install-recommends -y curl unzip groff && \
+    apt-get install --no-install-recommends -y curl git unzip groff && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Copy pre-built Python environment and tools from ol-infrastructure image
-COPY --from=infra /usr/local/ /usr/local/
 COPY --from=uv /uv /usr/local/bin/uv
+
+# Pre-sync Python dependencies from ol-infrastructure so uv sync is a no-op at runtime
+COPY --from=infra /opt/ol-infrastructure/pyproject.toml /opt/ol-infrastructure/
+COPY --from=infra /opt/ol-infrastructure/uv.lock /opt/ol-infrastructure/
+RUN uv sync --frozen --project /opt/ol-infrastructure
 
 ARG PULUMI_VERSION=latest
 RUN curl -fsSL https://get.pulumi.com -o pulumi.sh && \
