@@ -1,0 +1,29 @@
+[project]
+name = "ol-concourse-pypi"
+version = "0.1.0"
+description = "Concourse resource type for PyPI package publishing and version tracking"
+authors = [{ name = "MIT Open Learning", email = "odl-devops@mit.edu" }]
+requires-python = ">=3.13"
+readme = "README.md"
+license = "BSD-3-Clause"
+dependencies = [
+    "concoursetools>=0.8.0,<0.9",
+    "packaging>=24.0",
+    "requests>=2.32.0",
+    "twine>=6.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0,<9",
+    "pytest-mock>=3.14.0,<4",
+    "responses>=0.25.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+sources = ["."]
+include = ["concourse.py"]
