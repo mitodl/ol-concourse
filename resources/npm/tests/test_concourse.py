@@ -252,7 +252,7 @@ def test_publish_new_version_npmrc_content(resource, tmp_path):
 
     assert len(captured_npmrc) == 1
     assert TOKEN in captured_npmrc[0]
-    assert "registry.npmjs.org" in captured_npmrc[0]
+    assert "//registry.npmjs.org/:" in captured_npmrc[0]
 
 
 # ---------------------------------------------------------------------------
