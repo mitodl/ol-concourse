@@ -20,7 +20,7 @@ resources:
     type: pypi
     icon: language-python
     source:
-      name: ol-concourse
+      package_name: ol-concourse
       username: ((pypi_creds.username))
       password: ((pypi_creds.password))
 
