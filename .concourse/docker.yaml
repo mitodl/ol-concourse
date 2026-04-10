@@ -1,11 +1,59 @@
 ---
 resources:
-  - name: ol-concourse
+  - name: ol-concourse-packer-src
     type: git
     icon: github
     source:
       uri: https://github.com/mitodl/ol-concourse
       branch: main
+      paths:
+        - resources/packer
+        - uv.lock
+        - pyproject.toml
+
+  - name: ol-concourse-pulumi-src
+    type: git
+    icon: github
+    source:
+      uri: https://github.com/mitodl/ol-concourse
+      branch: main
+      paths:
+        - resources/pulumi
+        - uv.lock
+        - pyproject.toml
+
+  - name: ol-concourse-github-issues-src
+    type: git
+    icon: github
+    source:
+      uri: https://github.com/mitodl/ol-concourse
+      branch: main
+      paths:
+        - resources/github-issues
+        - uv.lock
+        - pyproject.toml
+
+  - name: ol-concourse-pypi-src
+    type: git
+    icon: github
+    source:
+      uri: https://github.com/mitodl/ol-concourse
+      branch: main
+      paths:
+        - resources/pypi
+        - uv.lock
+        - pyproject.toml
+
+  - name: ol-concourse-npm-src
+    type: git
+    icon: github
+    source:
+      uri: https://github.com/mitodl/ol-concourse
+      branch: main
+      paths:
+        - resources/npm
+        - uv.lock
+        - pyproject.toml
 
   - name: concourse-packer-resource
     type: registry-image
@@ -65,7 +113,7 @@ jobs:
   - name: build-and-publish-packer-image
     public: true
     plan:
-      - get: ol-concourse
+      - get: ol-concourse-packer-src
         trigger: true
       - task: generate-requirements
         config:
@@ -76,15 +124,16 @@ jobs:
               repository: ghcr.io/astral-sh/uv
               tag: 0.7-python3.13
           inputs:
-            - name: ol-concourse
+            - name: ol-concourse-packer-src
           outputs:
-            - name: ol-concourse
+            - name: build-context
           run:
             path: /bin/sh
             args:
               - -exc
               - |
-                cd ol-concourse
+                cp -a ol-concourse-packer-src/. build-context/
+                cd build-context
                 uv export --package ol-concourse-packer --no-dev --no-emit-workspace \
                   --no-hashes -o resources/packer/requirements.txt
       - task: build-image
@@ -96,23 +145,23 @@ jobs:
             source:
               repository: concourse/oci-build-task
           inputs:
-            - name: ol-concourse
+            - name: build-context
           outputs:
             - name: image
           run:
             path: build
           params:
-            CONTEXT: ol-concourse/resources/packer
-            DOCKERFILE: ol-concourse/resources/packer/Dockerfile
+            CONTEXT: build-context/resources/packer
+            DOCKERFILE: build-context/resources/packer/Dockerfile
       - put: concourse-packer-resource
         params:
           image: image/image.tar
-          additional_tags: ol-concourse/.git/ref
+          additional_tags: ol-concourse-packer-src/.git/ref
 
   - name: build-and-publish-pulumi-image
     public: true
     plan:
-      - get: ol-concourse
+      - get: ol-concourse-pulumi-src
         trigger: true
       - task: generate-requirements
         config:
@@ -123,15 +172,16 @@ jobs:
               repository: ghcr.io/astral-sh/uv
               tag: 0.7-python3.13
           inputs:
-            - name: ol-concourse
+            - name: ol-concourse-pulumi-src
           outputs:
-            - name: ol-concourse
+            - name: build-context
           run:
             path: /bin/sh
             args:
               - -exc
               - |
-                cd ol-concourse
+                cp -a ol-concourse-pulumi-src/. build-context/
+                cd build-context
                 uv export --package ol-concourse-pulumi --no-dev --no-emit-workspace \
                   --no-hashes -o resources/pulumi/requirements.txt
       - task: build-image
@@ -143,14 +193,14 @@ jobs:
             source:
               repository: concourse/oci-build-task
           inputs:
-            - name: ol-concourse
+            - name: build-context
           outputs:
             - name: image
           run:
             path: build
           params:
-            CONTEXT: ol-concourse/resources/pulumi
-            DOCKERFILE: ol-concourse/resources/pulumi/Dockerfile
+            CONTEXT: build-context/resources/pulumi
+            DOCKERFILE: build-context/resources/pulumi/Dockerfile
       - task: build-image-provisioner
         privileged: true
         config:
@@ -160,28 +210,28 @@ jobs:
             source:
               repository: concourse/oci-build-task
           inputs:
-            - name: ol-concourse
+            - name: build-context
           outputs:
             - name: image-provisioner
           run:
             path: build
           params:
-            CONTEXT: ol-concourse/resources/pulumi
-            DOCKERFILE: ol-concourse/resources/pulumi/Dockerfile.mitol_provision
+            CONTEXT: build-context/resources/pulumi
+            DOCKERFILE: build-context/resources/pulumi/Dockerfile.mitol_provision
             OUTPUT_OCI: image-provisioner/image.tar
       - put: concourse-pulumi-resource
         params:
           image: image/image.tar
-          additional_tags: ol-concourse/.git/ref
+          additional_tags: ol-concourse-pulumi-src/.git/ref
       - put: concourse-pulumi-resource-provisioner
         params:
           image: image-provisioner/image.tar
-          additional_tags: ol-concourse/.git/ref
+          additional_tags: ol-concourse-pulumi-src/.git/ref
 
   - name: build-and-publish-github-issues-image
     public: true
     plan:
-      - get: ol-concourse
+      - get: ol-concourse-github-issues-src
         trigger: true
       - task: generate-requirements
         config:
@@ -192,15 +242,16 @@ jobs:
               repository: ghcr.io/astral-sh/uv
               tag: 0.7-python3.13
           inputs:
-            - name: ol-concourse
+            - name: ol-concourse-github-issues-src
           outputs:
-            - name: ol-concourse
+            - name: build-context
           run:
             path: /bin/sh
             args:
               - -exc
               - |
-                cd ol-concourse
+                cp -a ol-concourse-github-issues-src/. build-context/
+                cd build-context
                 uv export --package ol-concourse-github-issues --no-dev --no-emit-workspace \
                   --no-hashes -o resources/github-issues/requirements.txt
       - task: build-image
@@ -212,23 +263,23 @@ jobs:
             source:
               repository: concourse/oci-build-task
           inputs:
-            - name: ol-concourse
+            - name: build-context
           outputs:
             - name: image
           run:
             path: build
           params:
-            CONTEXT: ol-concourse/resources/github-issues
-            DOCKERFILE: ol-concourse/resources/github-issues/Dockerfile
+            CONTEXT: build-context/resources/github-issues
+            DOCKERFILE: build-context/resources/github-issues/Dockerfile
       - put: concourse-github-issues-resource
         params:
           image: image/image.tar
-          additional_tags: ol-concourse/.git/ref
+          additional_tags: ol-concourse-github-issues-src/.git/ref
 
   - name: build-and-publish-pypi-image
     public: true
     plan:
-      - get: ol-concourse
+      - get: ol-concourse-pypi-src
         trigger: true
       - task: generate-requirements
         config:
@@ -239,15 +290,16 @@ jobs:
               repository: ghcr.io/astral-sh/uv
               tag: 0.7-python3.13
           inputs:
-            - name: ol-concourse
+            - name: ol-concourse-pypi-src
           outputs:
-            - name: ol-concourse
+            - name: build-context
           run:
             path: /bin/sh
             args:
               - -exc
               - |
-                cd ol-concourse
+                cp -a ol-concourse-pypi-src/. build-context/
+                cd build-context
                 uv export --package ol-concourse-pypi --no-dev --no-emit-workspace \
                   --no-hashes -o resources/pypi/requirements.txt
       - task: build-image
@@ -259,23 +311,23 @@ jobs:
             source:
               repository: concourse/oci-build-task
           inputs:
-            - name: ol-concourse
+            - name: build-context
           outputs:
             - name: image
           run:
             path: build
           params:
-            CONTEXT: ol-concourse/resources/pypi
-            DOCKERFILE: ol-concourse/resources/pypi/Dockerfile
+            CONTEXT: build-context/resources/pypi
+            DOCKERFILE: build-context/resources/pypi/Dockerfile
       - put: concourse-pypi-resource
         params:
           image: image/image.tar
-          additional_tags: ol-concourse/.git/ref
+          additional_tags: ol-concourse-pypi-src/.git/ref
 
   - name: build-and-publish-npm-image
     public: true
     plan:
-      - get: ol-concourse
+      - get: ol-concourse-npm-src
         trigger: true
       - task: generate-requirements
         config:
@@ -286,15 +338,16 @@ jobs:
               repository: ghcr.io/astral-sh/uv
               tag: 0.7-python3.13
           inputs:
-            - name: ol-concourse
+            - name: ol-concourse-npm-src
           outputs:
-            - name: ol-concourse
+            - name: build-context
           run:
             path: /bin/sh
             args:
               - -exc
               - |
-                cd ol-concourse
+                cp -a ol-concourse-npm-src/. build-context/
+                cd build-context
                 uv export --package ol-concourse-npm --no-dev --no-emit-workspace \
                   --no-hashes -o resources/npm/requirements.txt
       - task: build-image
@@ -306,15 +359,15 @@ jobs:
             source:
               repository: concourse/oci-build-task
           inputs:
-            - name: ol-concourse
+            - name: build-context
           outputs:
             - name: image
           run:
             path: build
           params:
-            CONTEXT: ol-concourse/resources/npm
-            DOCKERFILE: ol-concourse/resources/npm/Dockerfile
+            CONTEXT: build-context/resources/npm
+            DOCKERFILE: build-context/resources/npm/Dockerfile
       - put: concourse-npm-resource
         params:
           image: image/image.tar
-          additional_tags: ol-concourse/.git/ref
+          additional_tags: ol-concourse-npm-src/.git/ref
