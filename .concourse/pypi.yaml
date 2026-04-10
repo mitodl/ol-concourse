@@ -43,7 +43,7 @@ jobs:
           outputs:
             - name: dist
           run:
-            path: uv
+            path: /uv
             args:
               - build
               - --directory
