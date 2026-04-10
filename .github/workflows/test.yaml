@@ -1,0 +1,42 @@
+---
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  pytest:
+    name: pytest (${{ matrix.resource.dir }}, py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+        resource:
+          - name: ol-concourse-github-issues
+            dir: github-issues
+          - name: ol-concourse-npm
+            dir: npm
+          - name: ol-concourse-packer
+            dir: packer
+          - name: ol-concourse-pulumi
+            dir: pulumi
+          - name: ol-concourse-pypi
+            dir: pypi
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Run tests
+        run: >-
+          uv run --package ${{ matrix.resource.name }}
+          pytest resources/${{ matrix.resource.dir }}/tests/ -v

@@ -3,7 +3,7 @@ resource_types:
   - name: pypi
     type: registry-image
     source:
-      repository: cfplatformeng/concourse-pypi-resource
+      repository: mitodl/concourse-pypi-resource
 
 resources:
   - name: ol-concourse

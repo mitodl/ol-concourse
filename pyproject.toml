@@ -17,6 +17,7 @@ dev = [
     "mypy>=1.0",
     "pytest>=8.0.0,<9",
     "pytest-mock>=3.14.0,<4",
+    "semver>=3.0.4",
 ]
 
 [tool.ruff]
@@ -39,6 +40,9 @@ fixable = ["I", "D", "B", "E", "F", "UP", "C4", "Q", "RET", "PIE", "SIM", "W", "
 
 [tool.ruff.lint.flake8-quotes]
 inline-quotes = "double"
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S101", "S105"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "pep257"

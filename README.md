@@ -10,6 +10,8 @@ MIT Open Learning Concourse CI/CD monorepo containing Concourse resource types a
 | [`resources/packer`](./resources/packer/) | Concourse resource for running Packer builds | — |
 | [`resources/pulumi`](./resources/pulumi/) | Concourse resource for running Pulumi deployments | — |
 | [`resources/github-issues`](./resources/github-issues/) | Concourse resource for managing GitHub Issues | — |
+| [`resources/pypi`](./resources/pypi/) | Concourse resource for PyPI package publishing and version tracking | — |
+| [`resources/npm`](./resources/npm/) | Concourse resource for NPM package publishing and version tracking | — |
 
 ## Docker Images
 
@@ -19,6 +21,8 @@ MIT Open Learning Concourse CI/CD monorepo containing Concourse resource types a
 | `mitodl/concourse-pulumi-resource` | `resources/pulumi/Dockerfile` |
 | `mitodl/concourse-pulumi-resource-provisioner` | `resources/pulumi/Dockerfile.mitol_provision` |
 | `mitodl/concourse-github-issues-resource` | `resources/github-issues/Dockerfile` |
+| `mitodl/concourse-pypi-resource` | `resources/pypi/Dockerfile` |
+| `mitodl/concourse-npm-resource` | `resources/npm/Dockerfile` |
 
 ## Development
 
@@ -33,6 +37,8 @@ uv run pre-commit run --all-files
 
 # Run tests for a specific package
 uv run --package ol-concourse-github-issues pytest resources/github-issues/tests/
+uv run --package ol-concourse-pypi pytest resources/pypi/tests/
+uv run --package ol-concourse-npm pytest resources/npm/tests/
 ```
 
 ## License

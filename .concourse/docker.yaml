@@ -43,6 +43,24 @@ resources:
       username: ((dockerhub.username))
       password: ((dockerhub.password))
 
+  - name: concourse-pypi-resource
+    type: registry-image
+    icon: docker
+    source:
+      tag: latest
+      repository: mitodl/concourse-pypi-resource
+      username: ((dockerhub.username))
+      password: ((dockerhub.password))
+
+  - name: concourse-npm-resource
+    type: registry-image
+    icon: docker
+    source:
+      tag: latest
+      repository: mitodl/concourse-npm-resource
+      username: ((dockerhub.username))
+      password: ((dockerhub.password))
+
 jobs:
   - name: build-and-publish-packer-image
     public: true
@@ -209,6 +227,104 @@ jobs:
             CONTEXT: ol-concourse/resources/github-issues
             DOCKERFILE: ol-concourse/resources/github-issues/Dockerfile
       - put: concourse-github-issues-resource
+        params:
+          image: image/image.tar
+          additional_tags: ol-concourse/.git/ref
+
+  - name: build-and-publish-pypi-image
+    public: true
+    plan:
+      - get: ol-concourse
+        trigger: true
+        params:
+          include_submodules: false
+      - task: generate-requirements
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: ghcr.io/astral-sh/uv
+              tag: 0.7-python3.13
+          inputs:
+            - name: ol-concourse
+          outputs:
+            - name: ol-concourse
+          run:
+            path: /bin/sh
+            args:
+              - -exc
+              - |
+                cd ol-concourse
+                uv export --package ol-concourse-pypi --no-dev --no-emit-workspace \
+                  --no-hashes -o resources/pypi/requirements.txt
+      - task: build-image
+        privileged: true
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: concourse/oci-build-task
+          inputs:
+            - name: ol-concourse
+          outputs:
+            - name: image
+          run:
+            path: build
+          params:
+            CONTEXT: ol-concourse/resources/pypi
+            DOCKERFILE: ol-concourse/resources/pypi/Dockerfile
+      - put: concourse-pypi-resource
+        params:
+          image: image/image.tar
+          additional_tags: ol-concourse/.git/ref
+
+  - name: build-and-publish-npm-image
+    public: true
+    plan:
+      - get: ol-concourse
+        trigger: true
+        params:
+          include_submodules: false
+      - task: generate-requirements
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: ghcr.io/astral-sh/uv
+              tag: 0.7-python3.13
+          inputs:
+            - name: ol-concourse
+          outputs:
+            - name: ol-concourse
+          run:
+            path: /bin/sh
+            args:
+              - -exc
+              - |
+                cd ol-concourse
+                uv export --package ol-concourse-npm --no-dev --no-emit-workspace \
+                  --no-hashes -o resources/npm/requirements.txt
+      - task: build-image
+        privileged: true
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: concourse/oci-build-task
+          inputs:
+            - name: ol-concourse
+          outputs:
+            - name: image
+          run:
+            path: build
+          params:
+            CONTEXT: ol-concourse/resources/npm
+            DOCKERFILE: ol-concourse/resources/npm/Dockerfile
+      - put: concourse-npm-resource
         params:
           image: image/image.tar
           additional_tags: ol-concourse/.git/ref
