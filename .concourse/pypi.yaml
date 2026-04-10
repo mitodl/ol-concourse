@@ -37,7 +37,7 @@ jobs:
             type: registry-image
             source:
               repository: ghcr.io/astral-sh/uv
-              tag: python3.13
+              tag: python3.13-bookworm
           inputs:
             - name: ol-concourse
           outputs:
