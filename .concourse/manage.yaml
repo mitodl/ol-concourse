@@ -11,6 +11,14 @@ resources:
     branch: main
 
 jobs:
+- name: set-self
+  public: true
+  plan:
+  - get: ol-concourse
+    trigger: true
+  - set_pipeline: self
+    file: ol-concourse/.concourse/manage.yaml
+
 - name: set-docker-pipeline
   public: true
   plan:
