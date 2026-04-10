@@ -51,6 +51,9 @@ RUN python3 -m concoursetools . -r concourse.py
 RUN pip freeze | sort | grep -iE '^pulumi(verse)?[-_]' | \
     sed -E 's/pulumi(verse)?[-_](.*?)==(.*)/resource \2 \3/' | \
     sed 's/_/-/' | \
-    xargs -n 3 pulumi plugin install --non-interactive
+    while read -r type name version; do \
+        pulumi plugin install --non-interactive "$type" "$name" "$version" || \
+            echo "WARNING: Skipping plugin install for $name@$version (see error above)" >&2; \
+    done
 
 ENTRYPOINT ["python3"]
