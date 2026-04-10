@@ -43,13 +43,11 @@ jobs:
           outputs:
             - name: dist
           run:
-            path: /usr/local/bin/uv
+            path: /bin/sh
             args:
-              - build
-              - --directory
-              - ol-concourse/pipeline_lib
-              - --out-dir
-              - dist/
+              - -exc
+              - |
+                uv build --directory ol-concourse/pipeline_lib --out-dir "$(pwd)/dist/"
       - put: ol-concourse-pypi
         params:
           glob: dist/ol_concourse-*.tar.gz
