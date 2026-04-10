@@ -48,7 +48,7 @@ COPY io_utils.py ./io_utils.py
 RUN python3 -m concoursetools . -r concourse.py
 
 # Automatically install Pulumi plugins for all pulumi packages present in the venv
-RUN pip freeze | sort | grep -i pulumi | grep -v 'pulumi==' | \
+RUN pip freeze | sort | grep -iE '^pulumi(verse)?[-_]' | \
     sed -E 's/pulumi(verse)?[-_](.*?)==(.*)/resource \2 \3/' | \
     sed 's/_/-/' | \
     xargs -n 3 pulumi plugin install --non-interactive
