@@ -37,7 +37,7 @@ jobs:
             type: registry-image
             source:
               repository: ghcr.io/astral-sh/uv
-              tag: 0.7-python3.13
+              tag: latest
           inputs:
             - name: ol-concourse
           outputs:
@@ -47,8 +47,7 @@ jobs:
             args:
               - -exc
               - |
-                cd ol-concourse
-                uv build --package ol-concourse --out-dir ../dist/
+                uv build --directory ol-concourse/pipeline_lib --out-dir ../dist/
       - put: ol-concourse-pypi
         params:
           glob: dist/ol_concourse-*.tar.gz
