@@ -216,7 +216,6 @@ jobs:
           params:
             CONTEXT: build-context/resources/pulumi
             DOCKERFILE: build-context/resources/pulumi/Dockerfile.mitol_provision
-            OUTPUT_OCI: image-provisioner/image.tar
       - put: concourse-pulumi-resource
         params:
           image: image/image.tar
