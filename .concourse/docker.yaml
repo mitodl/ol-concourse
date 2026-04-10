@@ -67,8 +67,6 @@ jobs:
     plan:
       - get: ol-concourse
         trigger: true
-        params:
-          include_submodules: false
       - task: generate-requirements
         config:
           platform: linux
@@ -116,8 +114,6 @@ jobs:
     plan:
       - get: ol-concourse
         trigger: true
-        params:
-          include_submodules: false
       - task: generate-requirements
         config:
           platform: linux
@@ -187,8 +183,6 @@ jobs:
     plan:
       - get: ol-concourse
         trigger: true
-        params:
-          include_submodules: false
       - task: generate-requirements
         config:
           platform: linux
@@ -236,8 +230,6 @@ jobs:
     plan:
       - get: ol-concourse
         trigger: true
-        params:
-          include_submodules: false
       - task: generate-requirements
         config:
           platform: linux
@@ -285,8 +277,6 @@ jobs:
     plan:
       - get: ol-concourse
         trigger: true
-        params:
-          include_submodules: false
       - task: generate-requirements
         config:
           platform: linux
