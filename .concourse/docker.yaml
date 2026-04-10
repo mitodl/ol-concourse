@@ -122,7 +122,7 @@ jobs:
             type: registry-image
             source:
               repository: ghcr.io/astral-sh/uv
-              tag: 0.7-python3.13
+              tag: python3.13-bookworm
           inputs:
             - name: ol-concourse-packer-src
           outputs:
@@ -170,7 +170,7 @@ jobs:
             type: registry-image
             source:
               repository: ghcr.io/astral-sh/uv
-              tag: 0.7-python3.13
+              tag: python3.13-bookworm
           inputs:
             - name: ol-concourse-pulumi-src
           outputs:
@@ -240,7 +240,7 @@ jobs:
             type: registry-image
             source:
               repository: ghcr.io/astral-sh/uv
-              tag: 0.7-python3.13
+              tag: python3.13-bookworm
           inputs:
             - name: ol-concourse-github-issues-src
           outputs:
@@ -288,7 +288,7 @@ jobs:
             type: registry-image
             source:
               repository: ghcr.io/astral-sh/uv
-              tag: 0.7-python3.13
+              tag: python3.13-bookworm
           inputs:
             - name: ol-concourse-pypi-src
           outputs:
@@ -336,7 +336,7 @@ jobs:
             type: registry-image
             source:
               repository: ghcr.io/astral-sh/uv
-              tag: 0.7-python3.13
+              tag: python3.13-bookworm
           inputs:
             - name: ol-concourse-npm-src
           outputs:
