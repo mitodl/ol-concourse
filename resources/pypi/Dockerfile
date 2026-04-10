@@ -9,6 +9,6 @@ RUN python3 -m pip install --upgrade pip && \
 
 WORKDIR /opt/resource/
 COPY concourse.py ./concourse.py
-RUN python3 -m concoursetools . -r concourse.py
+RUN python3 -m concoursetools assets . -r concourse.py
 
 ENTRYPOINT ["python3"]

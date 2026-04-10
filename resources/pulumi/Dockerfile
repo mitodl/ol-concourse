@@ -24,6 +24,6 @@ ENV PATH="/app/.venv/bin:$PATH"
 # Copy the resource module and generate Concourse asset scripts under /opt/resource/
 WORKDIR /opt/resource/
 COPY concourse.py ./concourse.py
-RUN python3 -m concoursetools . -r concourse.py
+RUN python3 -m concoursetools assets . -r concourse.py
 
 ENTRYPOINT ["python3"]

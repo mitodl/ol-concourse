@@ -47,7 +47,7 @@ RUN pip install dist/*.whl
 COPY concourse.py ./concourse.py
 COPY pulumi_utils.py ./pulumi_utils.py
 COPY io_utils.py ./io_utils.py
-RUN python3 -m concoursetools . -r concourse.py
+RUN python3 -m concoursetools assets . -r concourse.py
 
 # Automatically install Pulumi plugins for all pulumi packages present in the venv
 RUN pip freeze | sort | grep -iE '^pulumi(verse)?[-_]' | \

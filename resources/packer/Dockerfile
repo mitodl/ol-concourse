@@ -30,6 +30,6 @@ COPY io_utils.py ./io_utils.py
 
 # Install Packer Amazon plugin and generate concoursetools asset scripts
 RUN packer plugins install github.com/hashicorp/amazon
-RUN python3 -m concoursetools . -r concourse.py
+RUN python3 -m concoursetools assets . -r concourse.py
 
 ENTRYPOINT ["python3"]
