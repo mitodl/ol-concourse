@@ -19,9 +19,9 @@ COPY --from=packer-download /usr/local/bin/packer /usr/local/bin/packer
 # Install OpenSSH for Packer SSH communicator
 RUN apk add --no-cache openssh-client
 
-COPY requirements.txt requirements.txt
+COPY dist/ dist/
 RUN python3 -m pip install --upgrade pip && \
-    pip install -r requirements.txt --no-deps
+    pip install dist/*.whl
 
 WORKDIR /opt/resource/
 COPY concourse.py ./concourse.py

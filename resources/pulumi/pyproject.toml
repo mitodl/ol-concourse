@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "ol-concourse-pulumi"
 version = "0.2.0"
@@ -13,6 +17,10 @@ dependencies = [
 dev = [
     "pytest>=8.0.0,<9",
 ]
+
+[tool.hatch.build.targets.wheel]
+sources = ["."]
+include = ["concourse.py", "io_utils.py", "main.py", "pulumi_utils.py"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

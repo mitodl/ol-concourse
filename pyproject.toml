@@ -1,10 +1,5 @@
-[project]
-name = "ol-concourse"
-version = "0.0.0"
-description = "MIT Open Learning Concourse CI/CD monorepo — resources and pipeline tooling"
-requires-python = ">=3.13"
-# This is a workspace root; no runtime dependencies here.
-dependencies = []
+[tool.uv]
+package = false
 
 [tool.uv.workspace]
 members = ["pipeline_lib", "resources/*"]

@@ -14,9 +14,9 @@ ENV PATH="/root/.pulumi/bin:$PATH"
 
 # Build the Python environment
 WORKDIR /app
-COPY pyproject.toml uv.lock ./
+COPY dist/ ./dist/
 RUN uv venv --relocatable /app/.venv && \
-    uv sync --frozen --no-dev
+    uv pip install dist/*.whl
 
 ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="/app/.venv/bin:$PATH"

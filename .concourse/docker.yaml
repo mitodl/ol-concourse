@@ -134,8 +134,7 @@ jobs:
               - |
                 cp -a ol-concourse-packer-src/. build-context/
                 cd build-context
-                uv export --package ol-concourse-packer --no-dev --no-emit-workspace \
-                  --no-hashes -o resources/packer/requirements.txt
+                uv build --package ol-concourse-packer --out-dir resources/packer/dist/
       - task: build-image
         privileged: true
         config:
@@ -182,8 +181,7 @@ jobs:
               - |
                 cp -a ol-concourse-pulumi-src/. build-context/
                 cd build-context
-                uv export --package ol-concourse-pulumi --no-dev --no-emit-workspace \
-                  --no-hashes -o resources/pulumi/requirements.txt
+                uv build --package ol-concourse-pulumi --out-dir resources/pulumi/dist/
       - task: build-image
         privileged: true
         config:
@@ -252,8 +250,7 @@ jobs:
               - |
                 cp -a ol-concourse-github-issues-src/. build-context/
                 cd build-context
-                uv export --package ol-concourse-github-issues --no-dev --no-emit-workspace \
-                  --no-hashes -o resources/github-issues/requirements.txt
+                uv build --package ol-concourse-github-issues --out-dir resources/github-issues/dist/
       - task: build-image
         privileged: true
         config:
@@ -300,8 +297,7 @@ jobs:
               - |
                 cp -a ol-concourse-pypi-src/. build-context/
                 cd build-context
-                uv export --package ol-concourse-pypi --no-dev --no-emit-workspace \
-                  --no-hashes -o resources/pypi/requirements.txt
+                uv build --package ol-concourse-pypi --out-dir resources/pypi/dist/
       - task: build-image
         privileged: true
         config:
@@ -348,8 +344,7 @@ jobs:
               - |
                 cp -a ol-concourse-npm-src/. build-context/
                 cd build-context
-                uv export --package ol-concourse-npm --no-dev --no-emit-workspace \
-                  --no-hashes -o resources/npm/requirements.txt
+                uv build --package ol-concourse-npm --out-dir resources/npm/dist/
       - task: build-image
         privileged: true
         config:
