@@ -21,8 +21,8 @@ resources:
     icon: language-python
     source:
       name: ol-concourse
-      username: ((pypi.username))
-      password: ((pypi.password))
+      username: ((pypi_creds.username))
+      password: ((pypi_creds.password))
 
 jobs:
   - name: publish-ol-concourse-lib
