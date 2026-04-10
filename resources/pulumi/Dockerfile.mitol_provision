@@ -38,9 +38,9 @@ RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o aws
 
 WORKDIR /opt/resource/
 
-COPY requirements.txt requirements.txt
+COPY dist/ dist/
 RUN python3 -m pip install --upgrade pip && \
-    pip install -r requirements.txt --no-deps
+    pip install dist/*.whl
 
 COPY concourse.py ./concourse.py
 COPY pulumi_utils.py ./pulumi_utils.py
