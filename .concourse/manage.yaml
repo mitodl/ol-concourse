@@ -1,0 +1,19 @@
+---
+# Self-managing pipeline: keeps the docker image build pipeline in sync with
+# .concourse/docker.yaml whenever the ol-concourse repository changes.
+resources:
+- name: ol-concourse
+  type: git
+  icon: github
+  source:
+    uri: https://github.com/mitodl/ol-concourse
+    branch: main
+
+jobs:
+- name: set-docker-pipeline
+  public: true
+  plan:
+  - get: ol-concourse
+    trigger: true
+  - set_pipeline: docker
+    file: ol-concourse/.concourse/docker.yaml
