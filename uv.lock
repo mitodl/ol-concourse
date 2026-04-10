@@ -678,17 +678,16 @@ dependencies = [
     { name = "concoursetools" },
 ]
 
-[package.optional-dependencies]
+[package.dev-dependencies]
 dev = [
     { name = "pytest" },
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "concoursetools", specifier = ">=0.8.0,<0.9" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0,<9" },
-]
-provides-extras = ["dev"]
+requires-dist = [{ name = "concoursetools", specifier = ">=0.8.0,<0.9" }]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.0.0,<9" }]
 
 [[package]]
 name = "ol-concourse-pulumi"

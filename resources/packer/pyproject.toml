@@ -9,7 +9,7 @@ license = "BSD-3-Clause"
 # No external Python runtime deps — stdlib + concoursetools only
 dependencies = ["concoursetools>=0.8.0,<0.9"]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=8.0.0,<9",
 ]
