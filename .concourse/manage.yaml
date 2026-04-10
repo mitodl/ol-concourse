@@ -1,6 +1,7 @@
 ---
-# Self-managing pipeline: keeps the docker image build pipeline in sync with
-# .concourse/docker.yaml whenever the ol-concourse repository changes.
+# Self-managing pipeline: keeps the docker image build and PyPI publishing
+# pipelines in sync with their respective .concourse/*.yaml files whenever
+# the ol-concourse repository changes.
 resources:
 - name: ol-concourse
   type: git
@@ -17,3 +18,11 @@ jobs:
     trigger: true
   - set_pipeline: docker
     file: ol-concourse/.concourse/docker.yaml
+
+- name: set-pypi-pipeline
+  public: true
+  plan:
+  - get: ol-concourse
+    trigger: true
+  - set_pipeline: pypi
+    file: ol-concourse/.concourse/pypi.yaml
