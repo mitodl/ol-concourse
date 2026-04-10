@@ -152,7 +152,7 @@ class PyPIResource(ConcourseResource):
         sources_dir: Path,
         build_metadata: BuildMetadata,
         *,
-        glob: str,
+        glob: str = "dist/*",
     ) -> tuple[PyPIVersion, dict[str, str]]:
         """Upload distribution files matching glob to PyPI using twine."""
         matched = sorted(str(p) for p in Path(sources_dir).glob(glob))
