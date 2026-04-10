@@ -20,6 +20,9 @@ COPY --from=infra /opt/ol-infrastructure/README.md /opt/ol-infrastructure/
 COPY --from=infra /opt/ol-infrastructure/sdks /opt/ol-infrastructure/sdks
 RUN uv sync --frozen --project /opt/ol-infrastructure
 
+ENV VIRTUAL_ENV=/opt/ol-infrastructure/.venv
+ENV PATH="/opt/ol-infrastructure/.venv/bin:$PATH"
+
 ARG PULUMI_VERSION=latest
 RUN curl -fsSL https://get.pulumi.com -o pulumi.sh && \
     /bin/sh pulumi.sh --install-root /usr/local --version "${PULUMI_VERSION}" --silent && \
@@ -39,8 +42,7 @@ RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o aws
 WORKDIR /opt/resource/
 
 COPY dist/ dist/
-RUN python3 -m pip install --upgrade pip && \
-    pip install dist/*.whl
+RUN pip install dist/*.whl
 
 COPY concourse.py ./concourse.py
 COPY pulumi_utils.py ./pulumi_utils.py
