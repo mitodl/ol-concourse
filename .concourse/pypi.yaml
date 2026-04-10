@@ -37,13 +37,13 @@ jobs:
             type: registry-image
             source:
               repository: ghcr.io/astral-sh/uv
-              tag: latest
+              tag: python3.13
           inputs:
             - name: ol-concourse
           outputs:
             - name: dist
           run:
-            path: /uv
+            path: /usr/local/bin/uv
             args:
               - build
               - --directory
