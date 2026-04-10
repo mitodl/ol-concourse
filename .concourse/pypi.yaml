@@ -16,11 +16,11 @@ resources:
         - pipeline_lib/pyproject.toml
         - pipeline_lib/src/**
 
-  - name: ol-concourse-lib-pypi
+  - name: ol-concourse-pypi
     type: pypi
     icon: language-python
     source:
-      name: ol-concourse-lib
+      name: ol-concourse
       username: ((pypi.username))
       password: ((pypi.password))
 
@@ -48,7 +48,7 @@ jobs:
               - -exc
               - |
                 cd ol-concourse
-                uv build --package ol-concourse-lib --out-dir ../dist/
-      - put: ol-concourse-lib-pypi
+                uv build --package ol-concourse --out-dir ../dist/
+      - put: ol-concourse-pypi
         params:
-          glob: dist/ol_concourse_lib-*.tar.gz
+          glob: dist/ol_concourse-*.tar.gz
