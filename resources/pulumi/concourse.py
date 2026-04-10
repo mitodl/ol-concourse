@@ -35,6 +35,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         source_dir: str = ".",
         env_pulumi: dict[str, str] | None = None,
         env_os: dict[str, str] | None = None,
+        action: str | None = None,  # accepted for backwards compatibility; use put params instead
     ) -> None:
         super().__init__(PulumiVersion)
         self.stack_name = stack_name
@@ -42,6 +43,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         self.source_dir = source_dir
         self.env_pulumi: dict[str, str] = env_pulumi or {}
         self.env_os: dict[str, str] = env_os or {}
+        self.action = action
 
     # ------------------------------------------------------------------
     # check
@@ -124,7 +126,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         sources_dir: Path,
         build_metadata: BuildMetadata,
         *,
-        action: str,
+        action: str | None = None,
         stack_name: str | None = None,
         project_name: str | None = None,
         source_dir: str | None = None,
@@ -139,9 +141,10 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
 
         sources_dir is the job working directory containing all fetched inputs.
         """
-        if action not in ("create", "update", "destroy"):
+        effective_action = action or self.action
+        if effective_action not in ("create", "update", "destroy"):
             raise ValueError(
-                f"Invalid action '{action}'. Must be one of: create, update, destroy"
+                f"Invalid action '{effective_action}'. Must be one of: create, update, destroy"
             )
 
         effective = self._resolve_params(
@@ -164,11 +167,11 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         cfg = stack_config or {}
 
         metadata: dict[str, str] = {
-            "action": action,
+            "action": effective_action,
             "stack": effective["stack_name"],
         }
 
-        if action == "destroy":
+        if effective_action == "destroy":
             version_id = pulumi_utils.destroy_stack(
                 stack_name=effective["stack_name"],
                 project_name=effective["project_name"],
@@ -179,7 +182,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
 
         elif preview:
             preview_file = work_dir / f"{effective['stack_name']}_preview.json"
-            if action == "create":
+            if effective_action == "create":
                 pulumi_utils.create_stack(
                     stack_name=effective["stack_name"],
                     project_name=effective["project_name"],
@@ -206,7 +209,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
             metadata["changes"] = json.dumps(preview_data.get("change_summary", {}))
 
         else:
-            if action == "create":
+            if effective_action == "create":
                 version_id = pulumi_utils.create_stack(
                     stack_name=effective["stack_name"],
                     project_name=effective["project_name"],
