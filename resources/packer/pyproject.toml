@@ -11,7 +11,7 @@ dependencies = ["concoursetools>=0.8.0,<0.9"]
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0.0,<9",
+    "pytest>=9.0.2,<10",
 ]
 
 [build-system]
