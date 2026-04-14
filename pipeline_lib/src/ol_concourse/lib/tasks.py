@@ -1,5 +1,95 @@
+"""Task factory functions for ol-concourse pipeline DSL."""
+
 from ol_concourse.lib.constants import REGISTRY_IMAGE
-from ol_concourse.lib.models.pipeline import Command, Identifier, TaskConfig, TaskStep
+from ol_concourse.lib.models.pipeline import (
+    AnonymousResource,
+    Command,
+    Identifier,
+    Input,
+    Output,
+    TaskConfig,
+    TaskStep,
+)
+
+# Default image for pipeline_lib task steps. Bundles ol-concourse, bumpver, and git.
+# Pinned to latest; update this constant when a new image is published.
+TASK_IMAGE = AnonymousResource(
+    type=REGISTRY_IMAGE,
+    source={"repository": "ghcr.io/mitodl/ol-concourse-task", "tag": "latest"},
+)
+
+
+def bump_version_task(
+    version_file: str = "release/version",
+    repository: str = "app-source",
+    git_user: str = "CI",
+    git_email: str = "odl-devops@mit.edu",
+    image: AnonymousResource | None = None,
+) -> TaskStep:
+    """Generate a TaskStep that runs bumpver to update version strings in-place.
+
+    Reads the target version from ``version_file``, then runs
+    ``bumpver update --set-version <version> --no-commit --no-fetch`` inside
+    ``repository``.  The modified files remain in the workspace for a subsequent
+    ``put: release`` step to commit onto the release branch.
+
+    :param version_file: Workspace-relative path to the file containing the
+        version string, in ``input-name/relative/path`` form (default:
+        ``release/version``).  The leading path component must be the name of a
+        Concourse input resource in the build plan.
+    :param repository: Name of the Concourse input/output resource directory
+        containing the application source and its ``[bumpver]`` config in
+        ``pyproject.toml`` or ``setup.cfg`` (default: ``app-source``).
+    :param git_user: Git committer name used when bumpver writes version files
+        (default: ``CI``).
+    :param git_email: Git committer email (default: ``odl-devops@mit.edu``).
+    :param image: Container image for the task.  Defaults to
+        ``ghcr.io/mitodl/ol-concourse-task:latest`` via :data:`TASK_IMAGE`.
+
+    :raises ValueError: If ``version_file`` is not in ``input-name/path`` form
+        (i.e. has no ``/``, or starts with ``/``, ``./``, or ``../``).
+
+    :returns: A configured Concourse
+        :class:`~ol_concourse.lib.models.pipeline.TaskStep`.
+    """
+    if (
+        "/" not in version_file
+        or version_file.startswith(("/", "./", "../"))
+    ):
+        msg = (
+            f"version_file must be workspace-relative in 'input-name/path' form "
+            f"(e.g. 'release/version'), got: {version_file!r}"
+        )
+        raise ValueError(msg)
+
+    version_input = version_file.split("/")[0]
+
+    return TaskStep(
+        task=Identifier("bump-version"),
+        privileged=False,
+        config=TaskConfig(
+            platform="linux",
+            image_resource=image or TASK_IMAGE,
+            inputs=[
+                Input(name=Identifier(version_input)),
+                Input(name=Identifier(repository)),
+            ],
+            outputs=[
+                Output(name=Identifier(repository)),
+            ],
+            run=Command(
+                path="bash",
+                args=[
+                    "-ec",
+                    f"""VERSION=$(cat {version_file})
+git -C {repository} config user.email "{git_email}"
+git -C {repository} config user.name "{git_user}"
+cd {repository}
+bumpver update --set-version "$VERSION" --no-commit --no-fetch""",
+                ],
+            ),
+        ),
+    )
 
 
 # Generates a TaskStep to perform an instance refresh from a given set
@@ -9,6 +99,14 @@ def instance_refresh_task(
     filters: str,
     queries: str,
 ) -> TaskStep:
+    """Generate a TaskStep that triggers an EC2 Auto Scaling instance refresh.
+
+    :param filters: AWS CLI filter expression passed to
+        ``describe-auto-scaling-groups --filters``.
+    :param queries: JMESPath query expression that resolves to a single ASG name.
+    :returns: A configured Concourse
+        :class:`~ol_concourse.lib.models.pipeline.TaskStep`.
+    """
     return TaskStep(
         task=Identifier("instance-refresh"),
         privileged=False,
@@ -40,6 +138,19 @@ def block_for_instance_refresh_task(
     queries: str,
     check_freq: int = 10,
 ) -> TaskStep:
+    """Generate a TaskStep that blocks until the latest EC2 instance refresh completes.
+
+    Polls ``describe-instance-refreshes`` every ``check_freq`` seconds until the
+    refresh leaves ``InProgress``, ``Pending``, or ``Canceling`` state.  If no
+    refresh is found the task exits immediately.
+
+    :param filters: AWS CLI filter expression passed to
+        ``describe-auto-scaling-groups --filters``.
+    :param queries: JMESPath query that resolves to a single ASG name.
+    :param check_freq: Polling interval in seconds (default: ``10``).
+    :returns: A configured Concourse
+        :class:`~ol_concourse.lib.models.pipeline.TaskStep`.
+    """
     return TaskStep(
         task=Identifier("block-for-instance-refresh"),
         privileged=False,

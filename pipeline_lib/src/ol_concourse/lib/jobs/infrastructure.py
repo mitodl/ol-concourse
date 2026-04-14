@@ -145,12 +145,12 @@ def packer_jobs(  # noqa: PLR0913
     )
 
 
-def pulumi_jobs_chain(  # noqa: PLR0913, C901, PLR0912
+def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
     pulumi_code: Resource,
     stack_names: list[str],
     project_name: str,
     project_source_path: Path,
-    enable_github_issue_resource: bool = True,  # noqa: FBT001, FBT002
+    enable_github_issue_resource: bool = True,
     custom_dependencies: dict[int, list[GetStep]] | None = None,
     dependencies: list[GetStep] | None = None,
     additional_post_steps: dict[int, list[GetStep | PutStep | TaskStep]] | None = None,

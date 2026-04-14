@@ -1,3 +1,5 @@
+"""Resource factory functions for the ol-concourse pipeline DSL."""
+
 from typing import Any, Literal
 
 from ol_concourse.lib.models.pipeline import Duration, Identifier, Resource
@@ -11,10 +13,22 @@ def git_repo(  # noqa: PLR0913
     check_every: str = "60s",
     paths: list[str] | None = None,
     depth: int | None = None,
-    fetch_tags: bool = False,  # noqa: FBT001, FBT002
+    fetch_tags: bool = False,
     tag_regex: str | None = None,
     **kwargs,
 ) -> Resource:
+    """Generate a git resource for the given repository.
+
+    :param name: Resource name used across pipeline steps.
+    :param uri: Git repository URI (SSH or HTTPS).
+    :param branch: Branch to track (default: ``main``).
+    :param check_every: How often Concourse polls for new versions (default: ``60s``).
+    :param paths: Restrict change detection to these paths.
+    :param depth: Shallow clone depth.
+    :param fetch_tags: Whether to fetch git tags.
+    :param tag_regex: Filter tags by regex when ``fetch_tags`` is true.
+    :returns: A configured Concourse git resource.
+    """
     return Resource(
         name=name,
         type="git",
@@ -39,6 +53,15 @@ def ssh_git_repo(
     branch: str = "main",
     paths: list[str] | None = None,
 ) -> Resource:
+    """Generate a git resource authenticated with an SSH private key.
+
+    :param name: Resource name used across pipeline steps.
+    :param uri: Git repository SSH URI.
+    :param private_key: PEM-encoded SSH private key for authentication.
+    :param branch: Branch to track (default: ``main``).
+    :param paths: Restrict change detection to these paths.
+    :returns: A configured Concourse git resource.
+    """
     return Resource(
         name=name,
         type="git",
@@ -177,6 +200,13 @@ def amazon_ami(
     filters: dict[str, str | bool],
     region: str = "us-east-1",
 ) -> Resource:
+    """Generate an Amazon AMI resource for the given filters.
+
+    :param name: Resource name used across pipeline steps.
+    :param filters: AWS ``describe-images`` filter key-value pairs.
+    :param region: AWS region to search (default: ``us-east-1``).
+    :returns: A configured Concourse amazon-ami resource.
+    """
     return Resource(
         name=name,
         type="amazon-ami",
@@ -192,6 +222,13 @@ def amazon_ami(
 def pulumi_provisioner(
     name: Identifier, project_name: str, project_path: str
 ) -> Resource:
+    """Generate a Pulumi provisioner resource for the given project.
+
+    :param name: Resource name used across pipeline steps.
+    :param project_name: Pulumi project name.
+    :param project_path: Path to the Pulumi project directory within the workspace.
+    :returns: A configured Concourse pulumi-provisioner resource.
+    """
     return Resource(
         name=name,
         type="pulumi-provisioner",
@@ -212,6 +249,15 @@ def pypi(
     password: str = "((pypi_creds.password))",  # noqa: S107
     check_every: str = "24h",
 ) -> Resource:
+    """Generate a PyPI resource for the given package.
+
+    :param name: Resource name used across pipeline steps.
+    :param package_name: PyPI package name to watch/publish.
+    :param username: PyPI upload username (default: ``((pypi_creds.username))``).
+    :param password: PyPI upload password (default: ``((pypi_creds.password))``).
+    :param check_every: How often to check for new versions (default: ``24h``).
+    :returns: A configured Concourse pypi resource.
+    """
     return Resource(
         name=name,
         type="pypi",
@@ -235,6 +281,15 @@ def schedule(
     stop: str | None = None,
     days: list[str] | None = None,
 ) -> Resource:
+    """Generate a time/schedule resource for triggering pipeline jobs on a schedule.
+
+    :param name: Resource name used across pipeline steps.
+    :param interval: Trigger interval (e.g. ``"1h"``).
+    :param start: Start of the daily window in ``HH:MM`` format.
+    :param stop: End of the daily window in ``HH:MM`` format.
+    :param days: Days of the week to allow triggers (e.g. ``["Monday", "Tuesday"]``).
+    :returns: A configured Concourse time resource.
+    """
     return Resource(
         name=name,
         type="time",
@@ -254,12 +309,26 @@ def registry_image(  # noqa: PLR0913
     image_tag: str | None = "latest",
     variant: str | None = None,
     tag_regex: str | None = None,
-    sort_by_creation: bool | None = None,  # noqa: FBT001
+    sort_by_creation: bool | None = None,
     username=None,
     password=None,
     check_every: str | None = None,
     ecr_region: str | None = None,
 ) -> Resource:
+    """Generate a registry-image resource for the given container image.
+
+    :param name: Resource name used across pipeline steps.
+    :param image_repository: OCI image repository (e.g. ``ghcr.io/mitodl/myapp``).
+    :param image_tag: Tag to track (default: ``latest``).
+    :param variant: Platform variant (e.g. ``linux/arm64``).
+    :param tag_regex: Filter tags by regex instead of tracking a fixed tag.
+    :param sort_by_creation: When using ``tag_regex``, sort by image creation time.
+    :param username: Registry username for private images.
+    :param password: Registry password for private images.
+    :param check_every: Override how often Concourse checks for new image versions.
+    :param ecr_region: AWS region for ECR authentication.
+    :returns: A configured Concourse registry-image resource.
+    """
     image_source: dict[str, Any] = {"repository": image_repository, "tag": image_tag}
     if username and password:
         image_source["username"] = username
@@ -281,8 +350,13 @@ def registry_image(  # noqa: PLR0913
 
 
 # https://github.com/arbourd/concourse-slack-alert-resource
-# We use only a very basic implementation of this notification framework
 def slack_notification(name: Identifier, url: str) -> Resource:
+    """Generate a Slack notification resource for the given webhook URL.
+
+    :param name: Resource name used across pipeline steps.
+    :param url: Slack incoming webhook URL.
+    :returns: A configured Concourse slack-notification resource.
+    """
     return Resource(
         name=name, type="slack-notification", source={"url": url, "disabled": False}
     )
@@ -294,6 +368,14 @@ def s3_object(
     object_path: str | None = None,
     object_regex: str | None = None,
 ):
+    """Generate an S3 resource for the given bucket and object.
+
+    :param name: Resource name used across pipeline steps.
+    :param bucket: S3 bucket name.
+    :param object_path: Fixed versioned file path within the bucket.
+    :param object_regex: Regex to match object keys (use instead of ``object_path``).
+    :returns: A configured Concourse s3 resource.
+    """
     return Resource(
         name=name,
         type="s3",
@@ -318,10 +400,27 @@ def git_semver(  # noqa: PLR0913
     password: str | None = None,
     git_user: str | None = None,
     depth: int | None = None,
-    skip_ssl_verification: bool = False,  # noqa: FBT001, FBT002
+    skip_ssl_verification: bool = False,
     commit_message: str | None = None,
     initial_version: str = "0.0.0",
 ) -> Resource:
+    """Generate a semver resource backed by a git repository.
+
+    :param name: Resource name used across pipeline steps.
+    :param uri: Git repository URI.
+    :param branch: Branch where the version file lives.
+    :param file: Path to the version file within the repository.
+    :param private_key: SSH private key for git authentication.
+    :param username: Git HTTP username.
+    :param password: Git HTTP password.
+    :param git_user: Git committer identity string (e.g. ``"Bot <bot@example.com>"``).
+    :param depth: Shallow clone depth.
+    :param skip_ssl_verification: Skip TLS verification for self-signed certs.
+    :param commit_message: Template for version-bump commit messages.
+    :param initial_version: Seed version when the file does not yet exist
+        (default: ``0.0.0``).
+    :returns: A configured Concourse semver resource using the git driver.
+    """
     return Resource(
         name=name,
         type="semver",

@@ -1,3 +1,5 @@
+"""Notification helper functions for the ol-concourse pipeline DSL."""
+
 from ol_concourse.lib.models.pipeline import PutStep, Resource
 
 

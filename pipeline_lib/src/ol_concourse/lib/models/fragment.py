@@ -1,9 +1,17 @@
+"""Pydantic models for composing and assembling Concourse pipeline fragments."""
+
 from pydantic import BaseModel, Field, field_validator
 
 from ol_concourse.lib.models.pipeline import Job, Pipeline, Resource, ResourceType
 
 
 class PipelineFragment(BaseModel):
+    """A composable fragment of a Concourse pipeline (resources, resource types, jobs).
+
+    Fragments can be combined with :meth:`combine_fragments` to produce a full
+    :class:`~ol_concourse.lib.models.pipeline.Pipeline` via :meth:`to_pipeline`.
+    """
+
     resource_types: list[ResourceType] = Field(default_factory=list)
     resources: list[Resource] = Field(default_factory=list)
     jobs: list[Job] = Field(default_factory=list)
@@ -70,6 +78,13 @@ class PipelineFragment(BaseModel):
 
     @classmethod
     def combine_fragments(cls, *fragments: "PipelineFragment") -> "PipelineFragment":
+        """Merge multiple :class:`PipelineFragment` instances into one.
+
+        Resource types and resources are deduplicated by name via field validators.
+
+        :param fragments: One or more fragments to merge.
+        :returns: A new :class:`PipelineFragment` containing all resources and jobs.
+        """
         return cls(
             resource_types=[
                 resource_type
@@ -83,6 +98,11 @@ class PipelineFragment(BaseModel):
         )
 
     def to_pipeline(self) -> Pipeline:
+        """Convert this fragment into a complete Concourse Pipeline.
+
+        :returns: A :class:`~ol_concourse.lib.models.pipeline.Pipeline` containing this
+            fragment's resource types, resources, and jobs.
+        """
         return Pipeline(
             resource_types=self.resource_types,
             resources=self.resources,

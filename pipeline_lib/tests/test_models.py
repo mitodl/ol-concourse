@@ -3,7 +3,6 @@
 from ol_concourse.lib.constants import GH_ISSUES_DEFAULT_REPOSITORY, REGISTRY_IMAGE
 from ol_concourse.lib.models.fragment import PipelineFragment
 from ol_concourse.lib.models.pipeline import (
-    GetStep,
     Identifier,
     Job,
     Pipeline,
