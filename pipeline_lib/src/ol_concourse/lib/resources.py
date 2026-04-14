@@ -133,6 +133,7 @@ def github_issues(  # noqa: PLR0913
     assignees: list[str] | None = None,
     issue_title_template: str | None = None,
     issue_body_template: str | None = None,
+    skip_if_labeled: list[str] | None = None,
     poll_frequency: Duration = Duration("60m"),
 ) -> Resource:
     """Generate a github-issue resource for the given owner/repository.
@@ -144,6 +145,9 @@ def github_issues(  # noqa: PLR0913
         the rate limit for checking versions.
     :param issue_prefix: A string tobe used to match an issue in the repository for
      the workflow to detect or act upon.
+    :param skip_if_labeled: Optional list of label names. Issues closed with any of
+        these labels will be skipped by ``check`` (not emitted as new versions).
+        Use this to allow release abandonment without triggering a production deploy.
 
     :returns: A configured Concourse issue object that can be used in a pipeline.
 
@@ -158,6 +162,7 @@ def github_issues(  # noqa: PLR0913
         "issue_title_template": issue_title_template,
         "labels": labels,
         "repository": repository,
+        "skip_if_labeled": skip_if_labeled,
     }
     if gh_host:
         issue_config["gh_host"] = gh_host
@@ -439,4 +444,78 @@ def git_semver(  # noqa: PLR0913
             "skip_ssl_verification": skip_ssl_verification,
             "commit_message": commit_message,
         },
+    )
+
+
+def release_resource(  # noqa: PLR0913
+    name: Identifier,
+    uri: str,
+    branch: str = "main",
+    private_key: str | None = None,
+    access_token: str | None = None,
+    repository: str | None = None,
+    git_user_name: str = "Concourse CI",
+    git_user_email: str = "concourse@example.com",
+    changelog_style: Literal["cumulative", "per_release"] | None = None,
+    changelog_file: str = "CHANGELOG.md",
+    changelog_dir: str = "releases",
+    webhook_token: str | None = None,
+) -> Resource:
+    """Generate a release resource for the given git repository.
+
+    The resource handles the full release lifecycle: version detection,
+    release branch/tag creation, commit checklist and changelog generation,
+    and release branch merging.
+
+    :param name: Resource name used across pipeline steps.
+    :param uri: Git repository URI (SSH or HTTPS).
+    :param branch: Branch to track for unreleased commits (default: ``main``).
+    :param private_key: SSH private key for git operations.
+    :param access_token: GitHub token; enables PR number/title enrichment in
+        ``in`` output files.
+    :param repository: ``owner/repo`` string; required when ``access_token``
+        is set.
+    :param git_user_name: Git committer name written to release commits.
+    :param git_user_email: Git committer email written to release commits.
+    :param changelog_style: ``"cumulative"`` (prepend to a single file) or
+        ``"per_release"`` (write a per-version file).  ``None`` disables
+        changelog management.
+    :param changelog_file: Filename for cumulative changelog (default:
+        ``CHANGELOG.md``).
+    :param changelog_dir: Directory for per-release files (default:
+        ``releases``).
+    :param webhook_token: Concourse webhook token; used by the Slack release
+        bot to trigger ``check`` explicitly.  Defaults ``check_every`` to
+        ``never`` so the resource is not polled.
+
+    :returns: A configured Concourse resource object.
+    :rtype: Resource
+    """
+    source: dict[str, Any] = {
+        "uri": uri,
+        "branch": branch,
+        "git_user_name": git_user_name,
+        "git_user_email": git_user_email,
+        "changelog_file": changelog_file,
+        "changelog_dir": changelog_dir,
+    }
+    if private_key is not None:
+        source["private_key"] = private_key
+    if access_token is not None:
+        source["access_token"] = access_token
+    if repository is not None:
+        source["repository"] = repository
+    if changelog_style is not None:
+        source["changelog_style"] = changelog_style
+    if webhook_token is not None:
+        source["webhook_token"] = webhook_token
+
+    return Resource(
+        name=name,
+        type="release",
+        icon="tag",
+        # Default to never polling; the Slack release bot triggers check via webhook.
+        check_every="never",
+        webhook_token=webhook_token,
+        source=source,
     )

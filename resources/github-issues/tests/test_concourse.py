@@ -516,3 +516,162 @@ def test_publish_new_version_comments_on_existing(mock_github):
     assert version.issue_title == expected_title
     assert version.issue_state == "open"
     assert metadata == {}
+
+
+# ---------------------------------------------------------------------------
+# skip_if_labeled (issue #15)
+# ---------------------------------------------------------------------------
+
+
+def test_get_matching_issues_skips_labeled(mock_github):
+    """Issues with a label in skip_if_labeled are excluded from results."""
+    mock_gh_instance, mock_repo = mock_github
+    skip_label_issue = create_mock_issue(
+        number=5,
+        title="[bot] Issue 5",
+        state="open",
+        created_at=T_MINUS_1,
+        labels=["deployed"],
+    )
+    normal_issue = create_mock_issue(
+        number=6,
+        title="[bot] Issue 6",
+        state="open",
+        created_at=T_MINUS_1,
+        labels=[],
+    )
+    mock_repo.get_issues.return_value = [skip_label_issue, normal_issue]
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_prefix="[bot]",
+        skip_if_labeled=["deployed"],
+    )
+
+    results = resource.get_matching_issues()
+
+    assert len(results) == 1
+    assert results[0].number == 6
+
+
+def test_get_matching_issues_no_skip_when_label_absent(mock_github):
+    """Issues are kept when they do not carry any skip label."""
+    mock_gh_instance, mock_repo = mock_github
+    issue = create_mock_issue(
+        number=7,
+        title="[bot] Issue 7",
+        state="open",
+        created_at=T_MINUS_1,
+        labels=["other-label"],
+    )
+    mock_repo.get_issues.return_value = [issue]
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_prefix="[bot]",
+        skip_if_labeled=["deployed"],
+    )
+
+    results = resource.get_matching_issues()
+
+    assert len(results) == 1
+    assert results[0].number == 7
+
+
+def test_skip_if_labeled_defaults_to_empty(mock_github):
+    """skip_if_labeled defaults to empty list — all issues pass through."""
+    mock_gh_instance, mock_repo = mock_github
+    issue = create_mock_issue(
+        number=8,
+        title="[bot] Issue 8",
+        state="open",
+        created_at=T_MINUS_1,
+        labels=["anything"],
+    )
+    mock_repo.get_issues.return_value = [issue]
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_prefix="[bot]",
+    )
+
+    results = resource.get_matching_issues()
+    assert len(results) == 1
+
+
+# ---------------------------------------------------------------------------
+# body_file (issue #14)
+# ---------------------------------------------------------------------------
+
+
+def test_publish_new_version_body_file_creates_with_file_contents(
+    mock_github, tmp_path
+):
+    """When body_file is set, issue body is read from the workspace file."""
+    mock_gh_instance, mock_repo = mock_github
+    mock_gh_instance.search_issues.return_value = []  # No existing issue
+    expected_body = "Release notes from file.\n"
+    body_path = tmp_path / "checklist.md"
+    body_path.write_text(expected_body)
+
+    created_issue = create_mock_issue(
+        number=20, title="Release 2026.04.14.1", state="open", created_at=NOW
+    )
+    mock_repo.create_issue.return_value = created_issue
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_title_template="Release {BUILD_PIPELINE_NAME}",
+    )
+    build_meta = mock_build_metadata(pipeline_name="2026.04.14.1")
+
+    version, metadata = resource.publish_new_version(
+        sources_dir=tmp_path,
+        build_metadata=build_meta,
+        body_file="checklist.md",
+    )
+
+    mock_repo.create_issue.assert_called_once()
+    _, kwargs = mock_repo.create_issue.call_args
+    assert kwargs["body"] == expected_body
+    assert version.issue_number == 20
+
+
+def test_publish_new_version_body_file_comments_with_file_contents(
+    mock_github, tmp_path
+):
+    """body_file is also used for comment body when issue already exists."""
+    mock_gh_instance, mock_repo = mock_github
+    expected_body = "Updated release notes.\n"
+    body_path = tmp_path / "notes.md"
+    body_path.write_text(expected_body)
+
+    existing_issue = create_mock_issue(
+        number=19, title="Release test-pipeline", state="open", created_at=T_MINUS_1
+    )
+    existing_issue.create_comment = MagicMock()
+    mock_gh_instance.search_issues.return_value = [existing_issue]
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_title_template="Release {BUILD_PIPELINE_NAME}",
+    )
+    build_meta = mock_build_metadata(pipeline_name="test-pipeline")
+
+    resource.publish_new_version(
+        sources_dir=tmp_path,
+        build_metadata=build_meta,
+        body_file="notes.md",
+    )
+
+    existing_issue.create_comment.assert_called_once_with(expected_body)

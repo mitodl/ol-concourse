@@ -90,6 +90,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         Closing this issue will trigger the next job in the pipeline {BUILD_PIPELINE_NAME}.
         """
         ),
+        skip_if_labeled: Optional[list[str]] = None,
     ):
         super().__init__(ConcourseGithubIssuesVersion)
         if auth_method == "token":
@@ -114,6 +115,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         self.issue_title_template = issue_title_template
         self.issue_body_template = issue_body_template
         self.limit_old_versions = limit_old_versions
+        self.skip_if_labeled: list[str] = skip_if_labeled or []
 
     def auth_token(self, access_token):
         return Auth.Token(access_token)
@@ -172,13 +174,18 @@ class ConcourseGithubIssuesResource(ConcourseResource):
 
         matching_issues = []
         for issue in all_pipeline_issues:
-            if issue.title.startswith(self.issue_prefix or ""):
-                matching_issues.append(issue)
-                if (
-                    self.limit_old_versions
-                    and len(matching_issues) == self.limit_old_versions
-                ):
-                    break
+            if not issue.title.startswith(self.issue_prefix or ""):
+                continue
+            if self.skip_if_labeled:
+                issue_label_names = {lbl.name for lbl in issue.labels}
+                if issue_label_names.intersection(self.skip_if_labeled):
+                    continue
+            matching_issues.append(issue)
+            if (
+                self.limit_old_versions
+                and len(matching_issues) == self.limit_old_versions
+            ):
+                break
         # Sort by number ascending to process oldest first if limited
         matching_issues.sort(key=lambda issue: issue.number)
         return matching_issues
@@ -240,7 +247,17 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         self.tombstone_version(version, build_metadata)
         return version, {}
 
-    def get_issue_body_from_build(self, build_metadata: BuildMetadata) -> str:
+    def get_issue_body_from_build(
+        self,
+        build_metadata: BuildMetadata,
+        body_file: Optional[str] = None,
+        sources_dir: Optional[Path] = None,
+    ) -> str:
+        if body_file is not None:
+            if sources_dir is None:
+                msg = "sources_dir is required when body_file is provided"
+                raise ValueError(msg)
+            return Path(sources_dir / body_file).read_text()
         return self.issue_body_template.format(**build_metadata_dict(build_metadata))
 
     def get_title_from_build(self, build_metadata: BuildMetadata) -> str:
@@ -252,9 +269,14 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         build_metadata: BuildMetadata,
         assignees: Optional[list[str]] = None,
         labels: Optional[list[str]] = None,
+        body_file: Optional[str] = None,
     ) -> Tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
         # Assume that: title is enough uniqueness to discern whether the issue
         # already exists
+
+        issue_body = self.get_issue_body_from_build(
+            build_metadata, body_file=body_file, sources_dir=sources_dir
+        )
 
         # Use GitHub Search API for efficiency instead of listing all issues
         candidate_issue_title = self.get_title_from_build(build_metadata)
@@ -275,13 +297,12 @@ class ConcourseGithubIssuesResource(ConcourseResource):
                 title=candidate_issue_title,
                 assignees=assignees or [],
                 labels=labels or [],  # Pass list of strings
-                body=self.get_issue_body_from_build(build_metadata),
+                body=issue_body,
             )
             print(f"created issue: {working_issue=}")
         else:
             working_issue = already_exists[0]
-            comment_body = self.get_issue_body_from_build(build_metadata)
-            print(f"about to comment on {working_issue=} with {comment_body=}")
-            working_issue.create_comment(comment_body)
+            print(f"about to comment on {working_issue=} with {issue_body=}")
+            working_issue.create_comment(issue_body)
 
         return self._to_version(working_issue), {}
