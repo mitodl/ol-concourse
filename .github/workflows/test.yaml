@@ -28,6 +28,8 @@ jobs:
             test_path: resources/pulumi/tests/
           - name: ol-concourse-pypi
             test_path: resources/pypi/tests/
+          - name: ol-concourse-github-deployments
+            test_path: resources/github-deployments/tests/
 
     permissions:
       contents: read

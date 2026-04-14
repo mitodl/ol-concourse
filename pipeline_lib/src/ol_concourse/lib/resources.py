@@ -182,6 +182,44 @@ def github_issues(  # noqa: PLR0913
     )
 
 
+def github_deployment(
+    name: Identifier,
+    repository: str,
+    environment: str,
+    access_token: str = "((github.access_token))",  # noqa: S107
+    gh_host: str | None = None,
+) -> Resource:
+    """Generate a github-deployments resource for the given repository and environment.
+
+    The resource is intended to be used as a ``put``-only resource with
+    ``check_every: never``.  Use :func:`github_deployment_resource_type
+    <ol_concourse.lib.resource_types.github_deployments_resource>` to register
+    the custom resource type in the same pipeline.
+
+    :param name: Resource name used across pipeline steps.
+    :param repository: GitHub repository in ``owner/repo`` form.
+    :param environment: Deployment environment name (e.g. ``RC``, ``Production``).
+    :param access_token: GitHub personal access token with ``repo_deployments``
+        scope (default: ``((github.access_token))``).
+    :param gh_host: GitHub API base URL; override for GitHub Enterprise.
+    :returns: A configured Concourse github-deployments resource.
+    """
+    source: dict = {
+        "repository": repository,
+        "environment": environment,
+        "access_token": access_token,
+    }
+    if gh_host:
+        source["gh_host"] = gh_host
+    return Resource(
+        name=name,
+        type="github-deployments",
+        icon="rocket-launch",
+        check_every="never",
+        source=source,
+    )
+
+
 def hashicorp_release(name: Identifier, project: str) -> Resource:
     """Generate a hashicorp-release resource for the given application.  # noqa: DAR201
 
