@@ -6,7 +6,7 @@ Usage example::
       - name: github-deployments
         type: registry-image
         source:
-          repository: ghcr.io/mitodl/ol-concourse-github-deployments
+          repository: mitodl/concourse-github-deployments-resource
           tag: latest
 
     resources:
@@ -115,13 +115,15 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
         )
 
     def _latest_status(self, deployment):
-        """Return the most recent DeploymentStatus for the given deployment, or None."""
-        statuses = sorted(
-            deployment.get_statuses(),
-            key=lambda s: s.id,
-            reverse=True,
-        )
-        return statuses[0] if statuses else None
+        """Return the most recent DeploymentStatus for the given deployment, or None.
+
+        The GitHub API returns statuses with the most recent first, so we
+        simply take the first element rather than fetching and sorting all of them.
+        """
+        try:
+            return deployment.get_statuses()[0]
+        except IndexError:
+            return None
 
     def fetch_new_versions(
         self, previous_version: GithubDeploymentVersion | None = None

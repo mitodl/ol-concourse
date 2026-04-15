@@ -9,7 +9,7 @@ resource_types:
   - name: github-deployments
     type: registry-image
     source:
-      repository: ghcr.io/mitodl/ol-concourse-github-deployments
+      repository: mitodl/concourse-github-deployments-resource
       tag: latest
 
 resources:
@@ -121,7 +121,7 @@ A GitHub personal access token with the `repo_deployments` scope is required. Fo
 ## Docker Image
 
 ```
-ghcr.io/mitodl/ol-concourse-github-deployments:latest
+mitodl/concourse-github-deployments-resource:latest
 ```
 
 ## License

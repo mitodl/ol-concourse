@@ -44,7 +44,7 @@ def make_mock_deployment(
     environment: str = "RC",
     description: str = "RC deploy",
     created_at: datetime = NOW,
-    statuses: list | None = None,
+    statuses: list[MagicMock] | None = None,
 ) -> MagicMock:
     dep = MagicMock()
     dep.id = dep_id
@@ -235,11 +235,11 @@ def test_download_version_no_statuses(mock_github, tmp_path):
 
 def test_download_version_picks_latest_status_by_id(mock_github, tmp_path):
     _, mock_repo = mock_github
-    # Statuses returned in arbitrary order; latest by id should win
+    # GitHub API returns statuses newest-first; implementation takes the first element
     statuses = [
         make_mock_status(3, "success"),
-        make_mock_status(1, "pending"),
         make_mock_status(2, "in_progress"),
+        make_mock_status(1, "pending"),
     ]
     dep = make_mock_deployment(55, statuses=statuses)
     mock_repo.get_deployment.return_value = dep

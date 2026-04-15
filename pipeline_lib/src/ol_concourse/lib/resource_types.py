@@ -26,7 +26,7 @@ def github_deployments_resource() -> ResourceType:
     """Generate the ``github-deployments`` custom resource type.
 
     :returns: A :class:`ResourceType` for the GitHub Deployments resource
-        hosted at ``ghcr.io/mitodl/ol-concourse-github-deployments``.
+        hosted on Docker Hub as ``mitodl/concourse-github-deployments-resource``.
     """
     return ResourceType(
         name=Identifier("github-deployments"),

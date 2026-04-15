@@ -192,7 +192,7 @@ def github_deployment(
     """Generate a github-deployments resource for the given repository and environment.
 
     The resource is intended to be used as a ``put``-only resource with
-    ``check_every: never``.  Use :func:`github_deployment_resource_type
+    ``check_every: never``.  Use :func:`github_deployments_resource
     <ol_concourse.lib.resource_types.github_deployments_resource>` to register
     the custom resource type in the same pipeline.
 
@@ -204,7 +204,7 @@ def github_deployment(
     :param gh_host: GitHub API base URL; override for GitHub Enterprise.
     :returns: A configured Concourse github-deployments resource.
     """
-    source: dict = {
+    source: dict[str, Any] = {
         "repository": repository,
         "environment": environment,
         "access_token": access_token,
