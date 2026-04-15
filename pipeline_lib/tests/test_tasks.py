@@ -65,8 +65,15 @@ class TestBumpVersionTask:
     def test_shell_script_configures_git_identity(self):
         step = bump_version_task(git_user="Bot", git_email="bot@example.com")
         script = step.config.run.args[1]
-        assert 'user.email "bot@example.com"' in script
-        assert 'user.name "Bot"' in script
+        # shlex.quote leaves safe characters unquoted; verify the values appear
+        assert "user.email bot@example.com" in script
+        assert "user.name Bot" in script
+
+    def test_shell_script_quotes_special_chars(self):
+        """Values with spaces/metacharacters are safely quoted by shlex.quote."""
+        step = bump_version_task(git_user="CI Bot", git_email="ci@example.com")
+        script = step.config.run.args[1]
+        assert "user.name 'CI Bot'" in script
 
     def test_shell_script_runs_in_repository_dir(self):
         step = bump_version_task(repository="app-src")
@@ -88,3 +95,21 @@ class TestBumpVersionTask:
     def test_invalid_version_file_parent_relative(self):
         with pytest.raises(ValueError, match="input-name/path"):
             bump_version_task(version_file="../release/version")
+
+    def test_no_duplicate_inputs_when_version_file_in_repo_dir(self):
+        """When version_file lives inside the repo input, emit only one input."""
+        step = bump_version_task(
+            version_file="app-source/version", repository="app-source"
+        )
+        input_names = [str(inp.name) for inp in step.config.inputs]
+        assert input_names.count("app-source") == 1
+
+    def test_two_inputs_when_version_file_in_separate_dir(self):
+        """When version_file is in a different input, both inputs are emitted."""
+        step = bump_version_task(
+            version_file="release/version", repository="app-source"
+        )
+        input_names = [str(inp.name) for inp in step.config.inputs]
+        assert "release" in input_names
+        assert "app-source" in input_names
+        assert len(input_names) == 2

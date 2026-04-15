@@ -29,6 +29,9 @@ jobs:
           - name: ol-concourse-pypi
             test_path: resources/pypi/tests/
 
+    permissions:
+      contents: read
+
     steps:
       - uses: actions/checkout@v4
 

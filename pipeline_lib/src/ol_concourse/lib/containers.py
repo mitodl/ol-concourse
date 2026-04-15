@@ -1,12 +1,12 @@
 """Task factory functions for container image builds."""
 
-from ol_concourse.lib.jobs.infrastructure import Output
 from ol_concourse.lib.models.pipeline import (
     AnonymousResource,
     Cache,
     Command,
     Identifier,
     Input,
+    Output,
     TaskConfig,
     TaskStep,
 )

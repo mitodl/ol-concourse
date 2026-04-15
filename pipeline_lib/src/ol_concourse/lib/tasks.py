@@ -1,5 +1,7 @@
 """Task factory functions for ol-concourse pipeline DSL."""
 
+import shlex
+
 from ol_concourse.lib.constants import REGISTRY_IMAGE
 from ol_concourse.lib.models.pipeline import (
     AnonymousResource,
@@ -12,7 +14,9 @@ from ol_concourse.lib.models.pipeline import (
 )
 
 # Default image for pipeline_lib task steps. Bundles ol-concourse, bumpver, and git.
-# Pinned to latest; update this constant when a new image is published.
+# Tag is kept as "latest" until a versioned release of the task image is published.
+# Once the first image is built and pushed, pin this to a specific digest or tag
+# (e.g. "2026.04.15") to ensure reproducible pipeline behavior.
 TASK_IMAGE = AnonymousResource(
     type=REGISTRY_IMAGE,
     source={"repository": "ghcr.io/mitodl/ol-concourse-task", "tag": "latest"},
@@ -62,7 +66,17 @@ def bump_version_task(
         )
         raise ValueError(msg)
 
+    version_file = version_file.strip()
     version_input = version_file.split("/")[0]
+    # Normalize repository name via Identifier so the input/output names and the
+    # shell script refer to exactly the same directory.
+    repo_id = str(Identifier(repository))
+
+    # De-duplicate: when version_file lives inside the repo input, don't emit
+    # the same input name twice (Concourse treats duplicate input names as invalid).
+    inputs = [Input(name=Identifier(version_input))]
+    if version_input != repo_id:
+        inputs.append(Input(name=Identifier(repo_id)))
 
     return TaskStep(
         task=Identifier("bump-version"),
@@ -70,21 +84,18 @@ def bump_version_task(
         config=TaskConfig(
             platform="linux",
             image_resource=image or TASK_IMAGE,
-            inputs=[
-                Input(name=Identifier(version_input)),
-                Input(name=Identifier(repository)),
-            ],
+            inputs=inputs,
             outputs=[
-                Output(name=Identifier(repository)),
+                Output(name=Identifier(repo_id)),
             ],
             run=Command(
                 path="bash",
                 args=[
                     "-ec",
-                    f"""VERSION=$(cat {version_file})
-git -C {repository} config user.email "{git_email}"
-git -C {repository} config user.name "{git_user}"
-cd {repository}
+                    f"""VERSION=$(cat {shlex.quote(version_file)})
+git -C {shlex.quote(repo_id)} config user.email {shlex.quote(git_email)}
+git -C {shlex.quote(repo_id)} config user.name {shlex.quote(git_user)}
+cd {shlex.quote(repo_id)}
 bumpver update --set-version "$VERSION" --no-commit --no-fetch""",
                 ],
             ),
