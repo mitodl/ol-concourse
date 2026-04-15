@@ -36,9 +36,10 @@ from github import Auth, Github
 
 VERSION_PATTERN = re.compile(r"^(\d{4})\.(\d{2})\.(\d{2})\.(\d+)$")
 
-# Minimum clone depth.  Increase if the previous release tag is older than
-# this many commits — a full clone is the safest option for very busy repos.
-_CLONE_DEPTH = 200
+# Default minimum clone depth.  Configurable via the ``clone_depth`` source
+# param.  Increase if the previous release tag is more than this many commits
+# back — a full clone (``clone_depth: 0``) is the safest option for busy repos.
+_DEFAULT_CLONE_DEPTH = 200
 
 CHANGELOG_HEADER = """\
 # Changelog
@@ -106,6 +107,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         changelog_style: Literal["cumulative", "per_release"] | None = None,
         changelog_file: str = "CHANGELOG.md",
         changelog_dir: str = "releases",
+        clone_depth: int = _DEFAULT_CLONE_DEPTH,
     ) -> None:
         """Initialize the release resource with git and GitHub configuration."""
         super().__init__(ReleaseVersion)
@@ -119,6 +121,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         self.changelog_style = changelog_style
         self.changelog_file = changelog_file
         self.changelog_dir = changelog_dir
+        self.clone_depth = clone_depth
 
     # ------------------------------------------------------------------
     # check
@@ -138,7 +141,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             tempfile.TemporaryDirectory() as tmpdir,
         ):
             repo_path = Path(tmpdir) / "repo"
-            _clone(self.uri, repo_path, env=env)
+            _clone(self.uri, repo_path, env=env, depth=self.clone_depth)
             return self._compute_versions(repo_path, env=env)
 
     def _compute_versions(self, repo_path: Path, env: dict) -> list[ReleaseVersion]:
@@ -214,7 +217,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             tempfile.TemporaryDirectory() as tmpdir,
         ):
             repo_path = Path(tmpdir) / "repo"
-            _clone(self.uri, repo_path, env=env)
+            _clone(self.uri, repo_path, env=env, depth=self.clone_depth)
             commits = self._collect_commits(repo_path, version, env=env)
 
         destination_dir.mkdir(parents=True, exist_ok=True)
@@ -312,7 +315,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 repo_path, self.git_user_name, self.git_user_email, env=env
             )
             if self.access_token:
-                _configure_credential_url(repo_path, self.access_token, env=env)
+                _configure_https_auth(repo_path, self.access_token, env=env)
 
             if action == "create":
                 head_sha = self._create_release(
@@ -354,6 +357,16 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
         _run(["git", "fetch", "origin", self.branch, "--tags"], cwd=repo_path, env=env)
 
+        # Ensure we are on the correct branch and up-to-date with the remote
+        # before capturing the pre-bump SHA; avoids tagging the wrong commit
+        # if the workspace is in a detached-HEAD state.
+        _run(["git", "checkout", self.branch], cwd=repo_path, env=env)
+        _run(
+            ["git", "reset", "--hard", f"origin/{self.branch}"],
+            cwd=repo_path,
+            env=env,
+        )
+
         # The tag marks the last commit of the source that was cut for this
         # release — the HEAD of the tracked branch before any release machinery
         # runs.  This matches what was built and pushed to the container registry.
@@ -383,10 +396,12 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         )
         commits = self._collect_commits_range(repo_path, since_ref, until_ref, env=env)
 
-        # Stage version-bump changes and changelog in one commit.
+        # Stage only already-tracked modified files (from bump_version_task).
+        # Using `git add -u` instead of `git add -A` avoids accidentally
+        # staging untracked build artefacts or temporary files.
         staged_any = False
         if _run(["git", "status", "--porcelain"], cwd=repo_path, env=env).strip():
-            _run(["git", "add", "-A"], cwd=repo_path, env=env)
+            _run(["git", "add", "-u"], cwd=repo_path, env=env)
             staged_any = True
 
         if self.changelog_style:
@@ -521,7 +536,7 @@ def _git_ssh_env(private_key: str | None) -> Iterator[dict]:
     try:
         env = {
             **base_env,
-            "GIT_SSH_COMMAND": f"ssh -i {key_file} -o StrictHostKeyChecking=no",
+            "GIT_SSH_COMMAND": f"ssh -i {key_file} -o StrictHostKeyChecking=accept-new",
         }
         yield env
     finally:
@@ -533,11 +548,15 @@ def _run(
     *,
     cwd: Path | None = None,
     env: dict | None = None,
+    redact: str | None = None,
 ) -> str:
     """Run a subprocess command and return stdout as a string.
 
     Raises subprocess.CalledProcessError on non-zero exit, with stderr
     included in the error message.
+
+    *redact* — if provided, this value is replaced with ``***`` in the
+    CalledProcessError message so that secrets do not leak via exceptions.
     """
     result = subprocess.run(  # noqa: S603
         cmd,
@@ -547,30 +566,40 @@ def _run(
         text=True,
     )
     if result.returncode != 0:
+        stdout = result.stdout
+        stderr = result.stderr
+        if redact:
+            stdout = stdout.replace(redact, "***")
+            stderr = stderr.replace(redact, "***")
         raise subprocess.CalledProcessError(
-            result.returncode, cmd, result.stdout, result.stderr
+            result.returncode, cmd, stdout, stderr
         )
     return result.stdout
 
 
-def _clone(uri: str, target: Path, *, env: dict) -> None:
+def _clone(
+    uri: str, target: Path, *, env: dict, depth: int = _DEFAULT_CLONE_DEPTH
+) -> None:
     """Shallow-clone uri into target, fetching all tags.
 
-    Uses _CLONE_DEPTH.  For repositories where the previous release tag is
-    more than _CLONE_DEPTH commits back, a full clone is more reliable.
+    *depth* defaults to ``_DEFAULT_CLONE_DEPTH``.  Pass ``depth=0`` for a
+    full clone, which is more reliable when the previous release tag is older
+    than the shallow history.
     """
+    depth_args = [f"--depth={depth}"] if depth > 0 else []
     _run(
         [
             "git",
             "clone",
-            f"--depth={_CLONE_DEPTH}",
+            *depth_args,
             "--no-single-branch",
             uri,
             str(target),
         ],
         env=env,
     )
-    _run(["git", "fetch", "--tags", f"--depth={_CLONE_DEPTH}"], cwd=target, env=env)
+    tag_depth_args = [f"--depth={depth}"] if depth > 0 else []
+    _run(["git", "fetch", "--tags", *tag_depth_args], cwd=target, env=env)
 
 
 def _get_release_tags(repo_path: Path, *, env: dict) -> list[str]:
@@ -604,30 +633,32 @@ def _configure_git_identity(
     _run(["git", "config", "user.email", email], cwd=repo_path, env=env)
 
 
-def _configure_credential_url(repo_path: Path, access_token: str, *, env: dict) -> None:
-    """Rewrite the origin remote URL to embed the access token for HTTPS auth."""
+def _configure_https_auth(repo_path: Path, access_token: str, *, env: dict) -> None:
+    """Configure git HTTPS authentication via http.extraheader.
+
+    Uses ``http.extraheader`` rather than embedding the token in the remote
+    URL so that the credential never appears in ``git remote -v``, process
+    listings, or CalledProcessError messages.
+
+    Only applied when the remote URL is HTTPS; SSH remotes are authenticated
+    via the private key passed through ``_git_ssh_env``.
+    """
     current_url = _run(
         ["git", "remote", "get-url", "origin"], cwd=repo_path, env=env
     ).strip()
-
-    if current_url.startswith("git@"):
-        # git@github.com:org/repo.git → https://x-access-token:TOKEN@github.com/org/repo.git
-        new_url = re.sub(
-            r"git@([^:]+):(.+)",
-            rf"https://x-access-token:{access_token}@\1/\2",
-            current_url,
-        )
-    elif current_url.startswith("https://"):
-        # Strip any existing credentials then re-insert
-        new_url = re.sub(
-            r"https://([^@/]+@)?",
-            f"https://x-access-token:{access_token}@",
-            current_url,
-        )
-    else:
-        return  # Unknown scheme — leave unchanged
-
-    _run(["git", "remote", "set-url", "origin", new_url], cwd=repo_path, env=env)
+    if not current_url.startswith("https://"):
+        return  # SSH remote — auth is handled by _git_ssh_env private key
+    _run(
+        [
+            "git",
+            "config",
+            "--local",
+            "http.extraheader",
+            f"Authorization: token {access_token}",
+        ],
+        cwd=repo_path,
+        env=env,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -636,12 +667,17 @@ def _configure_credential_url(repo_path: Path, access_token: str, *, env: dict) 
 
 
 def _enrich_with_github(
-    commits: list[dict], access_token: str, repository: str
+    commits: list[dict], access_token: str, repository: str, *, max_commits: int = 50
 ) -> list[dict]:
-    """Query the GitHub API to fill in pr_number and pr_title for each commit."""
+    """Query the GitHub API to fill in pr_number and pr_title for each commit.
+
+    Only the first *max_commits* entries are queried to avoid exhausting the
+    GitHub API rate limit on repositories with many commits since the last
+    release.  Commits beyond the cap retain ``pr_number=None``.
+    """
     gh = Github(auth=Auth.Token(access_token))
     repo = gh.get_repo(repository)
-    for commit in commits:
+    for commit in commits[:max_commits]:
         try:
             pulls = list(repo.get_commit(commit["sha"]).get_pulls())
             if pulls:

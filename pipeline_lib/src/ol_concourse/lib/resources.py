@@ -507,8 +507,7 @@ def release_resource(  # noqa: PLR0913
         source["repository"] = repository
     if changelog_style is not None:
         source["changelog_style"] = changelog_style
-    if webhook_token is not None:
-        source["webhook_token"] = webhook_token
+    # webhook_token is set on the Resource object only (not in source)
 
     return Resource(
         name=name,

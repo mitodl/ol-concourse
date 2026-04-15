@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -85,7 +85,7 @@ def test_parse_version_tuple(tag, expected):
 
 
 def test_compute_next_version_no_tags():
-    today = date.today().strftime("%Y.%m.%d")
+    today = datetime.now(tz=UTC).date().strftime("%Y.%m.%d")
     assert _compute_next_version([]) == f"{today}.1"
 
 
@@ -277,7 +277,8 @@ def test_fetch_new_versions_no_tags(mock_tmpdir, mock_run, tmp_path):
     resource = make_resource()
 
     with patch("concourse.datetime") as mock_dt:
-        mock_dt.now.return_value.date.return_value = date(2026, 4, 14)
+        fixed_date = datetime(2026, 4, 14, tzinfo=UTC).date()
+        mock_dt.now.return_value.date.return_value = fixed_date
         versions = resource.fetch_new_versions(None)
     assert versions[0].head_sha == head_sha
     assert versions[0].since == ""
@@ -343,7 +344,8 @@ def test_fetch_new_versions_new_commits(mock_tmpdir, mock_run, tmp_path, monkeyp
     resource = make_resource()
 
     with patch("concourse.datetime") as mock_dt:
-        mock_dt.now.return_value.date.return_value = date(2026, 4, 14)
+        fixed_date = datetime(2026, 4, 14, tzinfo=UTC).date()
+        mock_dt.now.return_value.date.return_value = fixed_date
         versions = resource.fetch_new_versions(None)
 
     assert len(versions) == 1
@@ -471,6 +473,8 @@ def test_publish_new_version_create(mock_run, tmp_path):
             "",  # git config user.name
             "",  # git config user.email
             "",  # git fetch origin main --tags
+            "",  # git checkout main  (new: ensure correct branch)
+            "",  # git reset --hard origin/main  (new: sync with remote)
             pre_bump_sha,  # git rev-parse HEAD (pre-bump)
             "",  # git checkout -b release/2026.04.14.1
             "",  # git status --porcelain (empty — no dirty files)
