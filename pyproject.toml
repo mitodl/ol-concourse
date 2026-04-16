@@ -10,7 +10,7 @@ dev = [
     "pre-commit>=4.0.0,<5",
     "ruff>=0.14.0",
     "mypy>=1.0",
-    "pytest>=8.0.0,<9",
+    "pytest>=9.0.3,<10",
     "pytest-mock>=3.14.0,<4",
     "semver>=3.0.4",
 ]
