@@ -9,6 +9,7 @@ resolution-markers = [
 [manifest]
 members = [
     "ol-concourse",
+    "ol-concourse-github-deployments",
     "ol-concourse-github-issues",
     "ol-concourse-npm",
     "ol-concourse-packer",
@@ -609,6 +610,33 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [{ name = "pydantic", specifier = ">=2,<3" }]
+
+[[package]]
+name = "ol-concourse-github-deployments"
+version = "0.1.0"
+source = { editable = "resources/github-deployments" }
+dependencies = [
+    { name = "concoursetools" },
+    { name = "pygithub" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-mock" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "concoursetools", specifier = ">=0.8.0,<0.9" },
+    { name = "pygithub", specifier = ">=2.0.0,<3" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8.0.0,<9" },
+    { name = "pytest-mock", specifier = ">=3.14.0,<4" },
+]
 
 [[package]]
 name = "ol-concourse-github-issues"

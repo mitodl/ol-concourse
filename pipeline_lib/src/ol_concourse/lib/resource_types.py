@@ -22,6 +22,21 @@ def github_issues_resource() -> ResourceType:
     )
 
 
+def github_deployments_resource() -> ResourceType:
+    """Generate the ``github-deployments`` custom resource type.
+
+    :returns: A :class:`ResourceType` for the GitHub Deployments resource
+        hosted on Docker Hub as ``mitodl/concourse-github-deployments-resource``.
+    """
+    return ResourceType(
+        name=Identifier("github-deployments"),
+        type=REGISTRY_IMAGE,
+        source=RegistryImage(
+            repository="mitodl/concourse-github-deployments-resource"
+        ),
+    )
+
+
 def hashicorp_resource() -> ResourceType:
     """Return the ResourceType definition for the Hashicorp release resource."""
     return ResourceType(
