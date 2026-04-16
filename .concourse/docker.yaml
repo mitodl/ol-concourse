@@ -109,6 +109,26 @@ resources:
       username: ((dockerhub.username))
       password: ((dockerhub.password))
 
+  - name: ol-concourse-task-src
+    type: git
+    icon: github
+    source:
+      uri: https://github.com/mitodl/ol-concourse
+      branch: main
+      paths:
+        - pipeline_lib
+        - uv.lock
+        - pyproject.toml
+
+  - name: ol-concourse-task-image
+    type: registry-image
+    icon: docker
+    source:
+      tag: latest
+      repository: mitodl/ol-concourse-dsl
+      username: ((dockerhub.username))
+      password: ((dockerhub.password))
+
 jobs:
   - name: build-and-publish-packer-image
     public: true
@@ -365,3 +385,50 @@ jobs:
         params:
           image: image/image.tar
           additional_tags: ol-concourse-npm-src/.git/ref
+
+  - name: build-and-publish-task-image
+    public: true
+    plan:
+      - get: ol-concourse-task-src
+        trigger: true
+      - task: generate-requirements
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: ghcr.io/astral-sh/uv
+              tag: python3.13-bookworm
+          inputs:
+            - name: ol-concourse-task-src
+          outputs:
+            - name: build-context
+          run:
+            path: /bin/sh
+            args:
+              - -exc
+              - |
+                cp -a ol-concourse-task-src/. build-context/
+                cd build-context
+                uv build --package ol-concourse --out-dir pipeline_lib/dist/
+      - task: build-image
+        privileged: true
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: concourse/oci-build-task
+          inputs:
+            - name: build-context
+          outputs:
+            - name: image
+          run:
+            path: build
+          params:
+            CONTEXT: build-context/pipeline_lib
+            DOCKERFILE: build-context/pipeline_lib/Dockerfile
+      - put: ol-concourse-task-image
+        params:
+          image: image/image.tar
+          additional_tags: ol-concourse-task-src/.git/ref

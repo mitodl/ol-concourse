@@ -1,8 +1,11 @@
+"""ResourceType factory functions for the ol-concourse pipeline DSL."""
+
 from ol_concourse.lib.constants import REGISTRY_IMAGE
 from ol_concourse.lib.models.pipeline import Identifier, RegistryImage, ResourceType
 
 
 def semver_resource() -> ResourceType:
+    """Return the ResourceType definition for the Concourse semver resource."""
     return ResourceType(
         name=Identifier("semver"),
         type=REGISTRY_IMAGE,
@@ -11,6 +14,7 @@ def semver_resource() -> ResourceType:
 
 
 def github_issues_resource() -> ResourceType:
+    """Return the ResourceType definition for ``mitodl/ol-concourse-github-issues``."""
     return ResourceType(
         name=Identifier("github-issues"),
         type=REGISTRY_IMAGE,
@@ -19,6 +23,7 @@ def github_issues_resource() -> ResourceType:
 
 
 def hashicorp_resource() -> ResourceType:
+    """Return the ResourceType definition for the Hashicorp release resource."""
     return ResourceType(
         name=Identifier("hashicorp-release"),
         type=REGISTRY_IMAGE,
@@ -27,6 +32,7 @@ def hashicorp_resource() -> ResourceType:
 
 
 def rclone() -> ResourceType:
+    """Return the ResourceType definition for the rclone sync resource."""
     return ResourceType(
         name=Identifier("rclone"),
         type=REGISTRY_IMAGE,
@@ -35,6 +41,7 @@ def rclone() -> ResourceType:
 
 
 def packer_validate() -> ResourceType:
+    """Return the ResourceType definition for the Packer validation resource."""
     return ResourceType(
         name=Identifier("packer-validator"),
         type=REGISTRY_IMAGE,
@@ -43,6 +50,7 @@ def packer_validate() -> ResourceType:
 
 
 def packer_build() -> ResourceType:
+    """Return the ResourceType definition for the Packer image builder resource."""
     return ResourceType(
         name=Identifier("packer-builder"),
         type=REGISTRY_IMAGE,
@@ -51,6 +59,7 @@ def packer_build() -> ResourceType:
 
 
 def ami_resource() -> ResourceType:
+    """Return the ResourceType definition for the Amazon AMI resource."""
     return ResourceType(
         name=Identifier("amazon-ami"),
         type=REGISTRY_IMAGE,
@@ -59,6 +68,7 @@ def ami_resource() -> ResourceType:
 
 
 def s3_sync() -> ResourceType:
+    """Return the ResourceType definition for the S3 sync resource."""
     return ResourceType(
         name=Identifier("s3-sync"),
         type=REGISTRY_IMAGE,
@@ -67,6 +77,7 @@ def s3_sync() -> ResourceType:
 
 
 def pypi_resource() -> ResourceType:
+    """Return the ResourceType definition for the PyPI publish resource."""
     return ResourceType(
         name=Identifier("pypi"),
         type=REGISTRY_IMAGE,
@@ -75,6 +86,7 @@ def pypi_resource() -> ResourceType:
 
 
 def pulumi_provisioner_resource() -> ResourceType:
+    """Return the ResourceType definition for the Pulumi provisioner resource."""
     return ResourceType(
         name=Identifier("pulumi-provisioner"),
         type=REGISTRY_IMAGE,
@@ -83,8 +95,8 @@ def pulumi_provisioner_resource() -> ResourceType:
 
 
 # https://github.com/arbourd/concourse-slack-alert-resource
-# We use only a very basic implementation of this notification framework
 def slack_notification_resource() -> ResourceType:
+    """Return the ResourceType definition for the Slack alert notification resource."""
     return ResourceType(
         name=Identifier("slack-notification"),
         type=REGISTRY_IMAGE,

@@ -37,7 +37,8 @@ fixable = ["I", "D", "B", "E", "F", "UP", "C4", "Q", "RET", "PIE", "SIM", "W", "
 inline-quotes = "double"
 
 [tool.ruff.lint.per-file-ignores]
-"**/tests/**" = ["S101", "S105"]
+"**/tests/**" = ["S101", "S105", "D101", "D102", "D103", "PLR2004"]
+"**/models/pipeline.py" = ["D"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "pep257"

@@ -1,10 +1,12 @@
-from ol_concourse.lib.jobs.infrastructure import Output
+"""Task factory functions for container image builds."""
+
 from ol_concourse.lib.models.pipeline import (
     AnonymousResource,
     Cache,
     Command,
     Identifier,
     Input,
+    Output,
     TaskConfig,
     TaskStep,
 )
@@ -15,6 +17,17 @@ def container_build_task(
     build_parameters: dict[str, str] | None,
     build_args: list[str] | None = None,
 ) -> TaskStep:
+    """Generate a privileged TaskStep that builds a container image with
+    ``oci-build-task``.
+
+    :param inputs: Concourse input resources to make available in the build context.
+    :param build_parameters: Environment variables passed to the build task as
+        ``params`` (e.g. ``CONTEXT``, ``DOCKERFILE``).
+    :param build_args: Additional arguments forwarded to the ``build`` command.
+    :returns: A privileged Concourse
+        :class:`~ol_concourse.lib.models.pipeline.TaskStep` whose ``image`` output
+        contains the built OCI image tarball.
+    """
     return TaskStep(
         task=Identifier("build-container-image"),
         privileged=True,

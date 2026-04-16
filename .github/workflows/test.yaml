@@ -9,23 +9,28 @@ on:
 
 jobs:
   pytest:
-    name: pytest (${{ matrix.resource.dir }}, py${{ matrix.python-version }})
+    name: pytest (${{ matrix.package.name }}, py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.13", "3.14"]
-        resource:
+        package:
+          - name: ol-concourse
+            test_path: pipeline_lib/tests/
           - name: ol-concourse-github-issues
-            dir: github-issues
+            test_path: resources/github-issues/tests/
           - name: ol-concourse-npm
-            dir: npm
+            test_path: resources/npm/tests/
           - name: ol-concourse-packer
-            dir: packer
+            test_path: resources/packer/tests/
           - name: ol-concourse-pulumi
-            dir: pulumi
+            test_path: resources/pulumi/tests/
           - name: ol-concourse-pypi
-            dir: pypi
+            test_path: resources/pypi/tests/
+
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -38,5 +43,5 @@ jobs:
 
       - name: Run tests
         run: >-
-          uv run --package ${{ matrix.resource.name }}
-          pytest resources/${{ matrix.resource.dir }}/tests/ -v
+          uv run --package ${{ matrix.package.name }}
+          pytest ${{ matrix.package.test_path }} -v
