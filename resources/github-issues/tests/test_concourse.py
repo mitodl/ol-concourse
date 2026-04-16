@@ -1,3 +1,5 @@
+"""Tests for the github-issues Concourse resource."""
+
 from github.GithubObject import NotSet
 import pytest
 from unittest.mock import MagicMock, patch
@@ -15,7 +17,7 @@ from github.Issue import Issue
 
 # Helper function to create mock BuildMetadata objects
 def mock_build_metadata(**kwargs) -> BuildMetadata:
-    """Creates a BuildMetadata object with default values, allowing overrides."""
+    """Create a BuildMetadata object with default values, allowing overrides."""
     defaults = {
         "BUILD_ID": "12345",
         "BUILD_NAME": "42",
@@ -41,7 +43,7 @@ def mock_build_metadata(**kwargs) -> BuildMetadata:
 
 
 # Helper function to create mock Issue objects
-def create_mock_issue(
+def create_mock_issue(  # noqa: PLR0913
     number: int,
     title: str,
     state: str,
@@ -69,7 +71,7 @@ def create_mock_issue(
 
 
 # Sample datetimes for consistent testing
-NOW = datetime.now()
+NOW = datetime.now()  # noqa: DTZ005
 T_MINUS_1 = NOW - timedelta(days=1)
 T_MINUS_2 = NOW - timedelta(days=2)
 T_MINUS_3 = NOW - timedelta(days=3)
@@ -110,7 +112,9 @@ MOCK_ISSUES_DATA = [
     },
 ]
 
-MOCK_ISSUES = [create_mock_issue(**data) for data in MOCK_ISSUES_DATA]  # type: ignore [arg-type]
+MOCK_ISSUES = [  # type: ignore [arg-type]
+    create_mock_issue(**data) for data in MOCK_ISSUES_DATA
+]
 
 
 @pytest.fixture
@@ -184,7 +188,7 @@ def test_fetch_new_versions_with_previous_closed(mock_github):
 
     # API should be called with 'since' = closed_at + 1s
     # Replicate the resource logic: parse the string format which drops microseconds
-    parsed_closed_at = datetime.strptime(
+    parsed_closed_at = datetime.strptime(  # noqa: DTZ007
         previous_version.issue_closed_at,  # type: ignore [arg-type]
         ISO_8601_FORMAT,
     )
@@ -231,7 +235,7 @@ def test_fetch_new_versions_with_previous_open(mock_github):
 
     # API should be called with 'since' = created_at + 1s
     # Replicate the resource logic: parse the string format which drops microseconds
-    parsed_created_at = datetime.strptime(
+    parsed_created_at = datetime.strptime(  # noqa: DTZ007
         previous_version.issue_created_at, ISO_8601_FORMAT
     )
     expected_since = parsed_created_at + timedelta(seconds=1)
@@ -275,15 +279,13 @@ def test_fetch_new_versions_with_prefix_and_previous(mock_github):
         issue_url="http://example.com/issue/1",
     )
     # Replicate the resource logic: parse the string format which drops microseconds
-    parsed_closed_at = datetime.strptime(
+    parsed_closed_at = datetime.strptime(  # noqa: DTZ007
         previous_version.issue_closed_at,  # type: ignore [arg-type]
         ISO_8601_FORMAT,
     )
     expected_since = parsed_closed_at + timedelta(seconds=1)
 
-    # Mock API returns issue #2 (closed, no prefix) and potentially others
-    # if they existed and matched the 'since' criteria.
-    # In our MOCK_ISSUES, only #2 is closed after #1.
+    # Mock API returns issue #2
     api_call_issues = [
         issue
         for issue in MOCK_ISSUES
@@ -325,8 +327,8 @@ def test_fetch_new_versions_limit_old(mock_github):
         for i in range(5, 10)  # Issues 5, 6, 7, 8, 9
     ] + MOCK_ISSUES  # Add existing mocks
 
-    # Sort by closed_at ascending for predictable API return order (PyGithub usually sorts descending)
-    # But our internal logic sorts by number ascending after filtering.
+    # Sort by closed_at descending to simulate typical GitHub API order
+    # (our internal logic sorts by number ascending after filtering).
     api_call_issues = sorted(
         [issue for issue in more_mock_issues if issue.state == "closed"],
         key=lambda i: i.closed_at,
@@ -371,7 +373,6 @@ def test_download_version_tombstones(mock_open, mock_github, tmp_path):
     resource = ConcourseGithubIssuesResource(
         repository="test/repo", access_token="dummy_token", issue_state="closed"
     )
-    # wrapper = SimpleTestResourceWrapper(resource) # Wrapper not needed for download test
 
     version_to_download = ConcourseGithubIssuesVersion(
         issue_number=5,
@@ -402,9 +403,8 @@ def test_download_version_tombstones(mock_open, mock_github, tmp_path):
     )
     mock_issue.edit.assert_called_once_with(title=expected_tombstone_title)
     # Check file writing
-    # expected_file_path = Path(dest_dir) / "gh_issue.json" # This path wasn't used, just verify open call
     mock_open.assert_called_once_with("w")
-    # Check that the file handle's write method was called (actual content check is tricky with mock_open)
+    # Verify the file handle's write method was called
     mock_open.return_value.__enter__.return_value.write.assert_called_once()
 
     # Check return values
@@ -428,12 +428,14 @@ def test_publish_new_version_creates_new_issue(mock_github):
         repository="test/repo",
         access_token="dummy_token",
         issue_state="open",  # Important for publish logic
-        issue_title_template="[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed",
+        issue_title_template=(
+            "[bot] Pipeline {BUILD_PIPELINE_NAME}"
+            " task {BUILD_JOB_NAME} completed"
+        ),
         issue_body_template="Build {BUILD_NAME} finished.",
         assignees=["user1"],
         labels=["bot-created"],
     )
-    # wrapper = SimpleTestResourceWrapper(resource) # Wrapper not needed for publish tests
     build_meta = mock_build_metadata(
         pipeline_name="my-pipeline", job_name="my-job", build_name="b123"
     )
@@ -486,10 +488,12 @@ def test_publish_new_version_comments_on_existing(mock_github):
         repository="test/repo",
         access_token="dummy_token",
         issue_state="open",
-        issue_title_template="[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed",
+        issue_title_template=(
+            "[bot] Pipeline {BUILD_PIPELINE_NAME}"
+            " task {BUILD_JOB_NAME} completed"
+        ),
         issue_body_template="Build {BUILD_NAME} finished.",
     )
-    # wrapper = SimpleTestResourceWrapper(resource) # Wrapper not needed for publish tests
     build_meta = mock_build_metadata(
         pipeline_name="my-pipeline", job_name="my-job", build_name="b456"
     )
@@ -516,3 +520,162 @@ def test_publish_new_version_comments_on_existing(mock_github):
     assert version.issue_title == expected_title
     assert version.issue_state == "open"
     assert metadata == {}
+
+
+# ---------------------------------------------------------------------------
+# skip_if_labeled (issue #15)
+# ---------------------------------------------------------------------------
+
+
+def test_get_matching_issues_skips_labeled(mock_github):
+    """Issues with a label in skip_if_labeled are excluded from results."""
+    mock_gh_instance, mock_repo = mock_github
+    skip_label_issue = create_mock_issue(
+        number=5,
+        title="[bot] Issue 5",
+        state="open",
+        created_at=T_MINUS_1,
+        labels=["deployed"],
+    )
+    normal_issue = create_mock_issue(
+        number=6,
+        title="[bot] Issue 6",
+        state="open",
+        created_at=T_MINUS_1,
+        labels=[],
+    )
+    mock_repo.get_issues.return_value = [skip_label_issue, normal_issue]
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_prefix="[bot]",
+        skip_if_labeled=["deployed"],
+    )
+
+    results = resource.get_matching_issues()
+
+    assert len(results) == 1
+    assert results[0].number == 6
+
+
+def test_get_matching_issues_no_skip_when_label_absent(mock_github):
+    """Issues are kept when they do not carry any skip label."""
+    mock_gh_instance, mock_repo = mock_github
+    issue = create_mock_issue(
+        number=7,
+        title="[bot] Issue 7",
+        state="open",
+        created_at=T_MINUS_1,
+        labels=["other-label"],
+    )
+    mock_repo.get_issues.return_value = [issue]
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_prefix="[bot]",
+        skip_if_labeled=["deployed"],
+    )
+
+    results = resource.get_matching_issues()
+
+    assert len(results) == 1
+    assert results[0].number == 7
+
+
+def test_skip_if_labeled_defaults_to_empty(mock_github):
+    """skip_if_labeled defaults to empty list — all issues pass through."""
+    mock_gh_instance, mock_repo = mock_github
+    issue = create_mock_issue(
+        number=8,
+        title="[bot] Issue 8",
+        state="open",
+        created_at=T_MINUS_1,
+        labels=["anything"],
+    )
+    mock_repo.get_issues.return_value = [issue]
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_prefix="[bot]",
+    )
+
+    results = resource.get_matching_issues()
+    assert len(results) == 1
+
+
+# ---------------------------------------------------------------------------
+# body_file (issue #14)
+# ---------------------------------------------------------------------------
+
+
+def test_publish_new_version_body_file_creates_with_file_contents(
+    mock_github, tmp_path
+):
+    """When body_file is set, issue body is read from the workspace file."""
+    mock_gh_instance, mock_repo = mock_github
+    mock_gh_instance.search_issues.return_value = []  # No existing issue
+    expected_body = "Release notes from file.\n"
+    body_path = tmp_path / "checklist.md"
+    body_path.write_text(expected_body)
+
+    created_issue = create_mock_issue(
+        number=20, title="Release 2026.04.14.1", state="open", created_at=NOW
+    )
+    mock_repo.create_issue.return_value = created_issue
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_title_template="Release {BUILD_PIPELINE_NAME}",
+    )
+    build_meta = mock_build_metadata(pipeline_name="2026.04.14.1")
+
+    version, metadata = resource.publish_new_version(
+        sources_dir=tmp_path,
+        build_metadata=build_meta,
+        body_file="checklist.md",
+    )
+
+    mock_repo.create_issue.assert_called_once()
+    _, kwargs = mock_repo.create_issue.call_args
+    assert kwargs["body"] == expected_body
+    assert version.issue_number == 20
+
+
+def test_publish_new_version_body_file_comments_with_file_contents(
+    mock_github, tmp_path
+):
+    """body_file is also used for comment body when issue already exists."""
+    mock_gh_instance, mock_repo = mock_github
+    expected_body = "Updated release notes.\n"
+    body_path = tmp_path / "notes.md"
+    body_path.write_text(expected_body)
+
+    existing_issue = create_mock_issue(
+        number=19, title="Release test-pipeline", state="open", created_at=T_MINUS_1
+    )
+    existing_issue.create_comment = MagicMock()
+    mock_gh_instance.search_issues.return_value = [existing_issue]
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_title_template="Release {BUILD_PIPELINE_NAME}",
+    )
+    build_meta = mock_build_metadata(pipeline_name="test-pipeline")
+
+    resource.publish_new_version(
+        sources_dir=tmp_path,
+        build_metadata=build_meta,
+        body_file="notes.md",
+    )
+
+    existing_issue.create_comment.assert_called_once_with(expected_body)

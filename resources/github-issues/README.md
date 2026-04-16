@@ -21,11 +21,13 @@ resources:
     issue_state: closed             # "open" or "closed" (default: "closed")
     issue_prefix: "[bot]"           # optional: filter issues by title prefix
     labels: [pipeline-workflow]     # optional: filter by labels
+    skip_if_labeled: [skip-ci]      # optional: skip issues that have any of these labels
 ```
 
 ## `check` — Fetch versions
 
 Returns issues matching the configured `issue_state` and `issue_prefix`.
+Issues that carry any label listed in `skip_if_labeled` are excluded from results.
 
 ## `in` — Download version
 
@@ -38,6 +40,7 @@ Marks the issue as consumed by prefixing the title with `[CONSUMED #<build_numbe
 |-----------|----------|-------------|
 | `assignees` | No | List of GitHub usernames to assign |
 | `labels` | No | List of label names to apply |
+| `body_file` | No | Path to a file whose contents are used as the issue body, overriding `issue_body_template` |
 
 The issue title and body are generated from configurable templates:
 - `issue_title_template` — default: `[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed`

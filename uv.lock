@@ -14,6 +14,7 @@ members = [
     "ol-concourse-packer",
     "ol-concourse-pulumi",
     "ol-concourse-pypi",
+    "ol-concourse-release",
 ]
 
 [manifest.dependency-groups]
@@ -740,6 +741,33 @@ dev = [
     { name = "pytest", specifier = ">=8.0.0,<9" },
     { name = "pytest-mock", specifier = ">=3.14.0,<4" },
     { name = "responses", specifier = ">=0.25.0" },
+]
+
+[[package]]
+name = "ol-concourse-release"
+version = "0.1.0"
+source = { editable = "resources/release" }
+dependencies = [
+    { name = "concoursetools" },
+    { name = "pygithub" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-mock" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "concoursetools", specifier = ">=0.8.0,<0.9" },
+    { name = "pygithub", specifier = ">=2.0.0,<3" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8.0.0,<9" },
+    { name = "pytest-mock", specifier = ">=3.14.0,<4" },
 ]
 
 [[package]]
