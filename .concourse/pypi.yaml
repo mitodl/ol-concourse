@@ -50,4 +50,4 @@ jobs:
                 uv build --directory ol-concourse/pipeline_lib --out-dir "$(pwd)/dist/"
       - put: ol-concourse-pypi
         params:
-          glob: dist/*
+          glob: dist/ol_concourse-*
