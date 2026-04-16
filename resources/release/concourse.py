@@ -416,7 +416,11 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             )
 
         _run(["git", "push", "origin", branch_name], cwd=repo_path, env=env)
-        _run(["git", "tag", version, pre_bump_sha], cwd=repo_path, env=env)
+        _run(
+            ["git", "tag", "-a", version, "-m", f"Release {version}", pre_bump_sha],
+            cwd=repo_path,
+            env=env,
+        )
         _run(
             ["git", "push", "origin", f"refs/tags/{version}"],
             cwd=repo_path,
@@ -658,6 +662,7 @@ def _configure_https_auth(repo_path: Path, access_token: str, *, env: dict) -> N
         ],
         cwd=repo_path,
         env=env,
+        redact=access_token,
     )
 
 
@@ -781,12 +786,20 @@ def _update_cumulative_changelog(changelog_path: Path, entry: str) -> None:
         existing = changelog_path.read_text()
         # Insert the new entry after the header (two blank lines after the last
         # header paragraph) and before the first existing ## version entry.
-        header_end = existing.find("\n## ")
-        if header_end == -1:
-            # No existing version entries — append after header
-            new_content = existing.rstrip("\n") + "\n\n" + entry
+        # Check for a version header at the very start of the file too, since
+        # find("\n## ") would return -1 for headerless changelogs that begin
+        # directly with a version entry.
+        if existing.startswith("## "):
+            new_content = entry + "\n\n" + existing
         else:
-            new_content = existing[:header_end] + "\n\n" + entry + existing[header_end:]
+            header_end = existing.find("\n## ")
+            if header_end == -1:
+                # No existing version entries — append after header
+                new_content = existing.rstrip("\n") + "\n\n" + entry
+            else:
+                new_content = (
+                    existing[:header_end] + "\n\n" + entry + existing[header_end:]
+                )
     else:
         new_content = CHANGELOG_HEADER + "\n" + entry
 

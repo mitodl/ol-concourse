@@ -1,19 +1,11 @@
-"""
-resources:
-  - name: my-concourse-github-issues
-    type: concourse-github-issues
-    source:
-      github_auth_token: ((github.auth_token))
-      project_key: concourse
-      repo: "mitodl/my-project"
+"""Concourse resource for managing GitHub Issues as pipeline gate signals."""
 
-"""
 from pathlib import Path
 import textwrap
 import json
 import sys
 from datetime import datetime, timedelta
-from typing import Literal, Optional, Tuple
+from typing import Literal
 from concoursetools import BuildMetadata, ConcourseResource
 from concoursetools.version import Version, SortableVersionMixin
 from github import Github, Auth, Consts, GithubException
@@ -24,28 +16,32 @@ ISO_8601_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
 
 def build_metadata_dict(build_metadata: BuildMetadata) -> dict[str, str]:
-    return dict(
-        BUILD_URL=build_metadata.build_url(),
-        BUILD_ID=build_metadata.BUILD_ID,
-        BUILD_TEAM_NAME=build_metadata.BUILD_TEAM_NAME,
-        BUILD_NAME=build_metadata.BUILD_NAME,
-        BUILD_JOB_NAME=build_metadata.BUILD_JOB_NAME,
-        BUILD_PIPELINE_NAME=build_metadata.BUILD_PIPELINE_NAME,
-        BUILD_PIPELINE_INSTANCE_VARS=build_metadata.BUILD_PIPELINE_INSTANCE_VARS,
-        ATC_EXTERNAL_URL=build_metadata.ATC_EXTERNAL_URL,
-    )
+    """Return a flat dict of Concourse build metadata for template formatting."""
+    return {
+        "BUILD_URL": build_metadata.build_url(),
+        "BUILD_ID": build_metadata.BUILD_ID,
+        "BUILD_TEAM_NAME": build_metadata.BUILD_TEAM_NAME,
+        "BUILD_NAME": build_metadata.BUILD_NAME,
+        "BUILD_JOB_NAME": build_metadata.BUILD_JOB_NAME,
+        "BUILD_PIPELINE_NAME": build_metadata.BUILD_PIPELINE_NAME,
+        "BUILD_PIPELINE_INSTANCE_VARS": build_metadata.BUILD_PIPELINE_INSTANCE_VARS,
+        "ATC_EXTERNAL_URL": build_metadata.ATC_EXTERNAL_URL,
+    }
 
 
 class ConcourseGithubIssuesVersion(Version, SortableVersionMixin):
-    def __init__(
+    """Concourse version representing a single GitHub Issue."""
+
+    def __init__(  # noqa: PLR0913
         self,
         issue_created_at: str,
-        issue_closed_at: Optional[str],
+        issue_closed_at: str | None,
         issue_number: int,
         issue_state: Literal["open", "closed"],
         issue_title: str,
         issue_url: str,
     ):
+        """Initialize a version from GitHub Issue fields."""
         self.issue_created_at = issue_created_at
         self.issue_number = issue_number
         self.issue_state = issue_state
@@ -54,11 +50,12 @@ class ConcourseGithubIssuesVersion(Version, SortableVersionMixin):
         self.issue_closed_at = issue_closed_at
 
     def __lt__(self, other: "ConcourseGithubIssuesVersion"):
+        """Return True if this version is older than *other*."""
         if self.issue_state == other.issue_state == "closed":
-            return datetime.strptime(
+            return datetime.strptime(  # noqa: DTZ007
                 self.issue_closed_at,  # type: ignore[arg-type]
                 ISO_8601_FORMAT,
-            ) < datetime.strptime(
+            ) < datetime.strptime(  # noqa: DTZ007
                 other.issue_closed_at,  # type: ignore[arg-type]
                 ISO_8601_FORMAT,
             )
@@ -67,31 +64,37 @@ class ConcourseGithubIssuesVersion(Version, SortableVersionMixin):
 
 
 class ConcourseGithubIssuesResource(ConcourseResource):
-    def __init__(
+    """Concourse resource that uses GitHub Issues as pipeline gate signals."""
+
+    def __init__(  # noqa: PLR0913
         self,
         /,
         repository: str,
         gh_host: str = Consts.DEFAULT_BASE_URL,
-        access_token: Optional[str] = None,
-        app_id: Optional[int] = None,
-        app_installation_id: Optional[int] = None,
-        assignees: Optional[list[str]] = None,
-        issue_prefix: Optional[str] = None,
-        labels: Optional[list[str]] = None,
-        private_ssh_key: Optional[str] = None,
-        limit_old_versions: Optional[int] = None,
+        access_token: str | None = None,
+        app_id: int | None = None,
+        app_installation_id: int | None = None,
+        assignees: list[str] | None = None,
+        issue_prefix: str | None = None,
+        labels: list[str] | None = None,
+        private_ssh_key: str | None = None,
+        limit_old_versions: int | None = None,
         auth_method: Literal["token", "app"] = "token",
         issue_state: Literal["open", "closed"] = "closed",
-        issue_title_template: str = "[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed",
+        issue_title_template: str = (
+            "[bot] Pipeline {BUILD_PIPELINE_NAME}"
+            " task {BUILD_JOB_NAME} completed"
+        ),
         issue_body_template: str = textwrap.dedent(
             """\
         The task {BUILD_JOB_NAME} in pipeline {BUILD_PIPELINE_NAME} has completed build number {BUILD_NAME}.
         Please refer to [the build log]({BUILD_URL}) for details of what changes this includes.
         Closing this issue will trigger the next job in the pipeline {BUILD_PIPELINE_NAME}.
-        """
+        """  # noqa: E501
         ),
-        skip_if_labeled: Optional[list[str]] = None,
+        skip_if_labeled: list[str] | None = None,
     ):
+        """Initialize with GitHub API credentials and issue configuration."""
         super().__init__(ConcourseGithubIssuesVersion)
         if auth_method == "token":
             auth = self.auth_token(access_token)
@@ -118,9 +121,11 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         self.skip_if_labeled: list[str] = skip_if_labeled or []
 
     def auth_token(self, access_token):
+        """Return a token-based GitHub Auth object."""
         return Auth.Token(access_token)
 
     def auth_app(self, app_id, app_installation_id, private_ssh_key):
+        """Return an app installation-based GitHub Auth object."""
         return Auth.AppAuth(app_id, private_ssh_key).get_installation_auth(
             app_installation_id
         )
@@ -144,9 +149,10 @@ class ConcourseGithubIssuesResource(ConcourseResource):
 
     def get_all_issues(
         self,
-        issue_state: Optional[Literal["open", "closed"]] = None,
-        since: Optional[datetime] = None,
+        issue_state: Literal["open", "closed"] | None = None,
+        since: datetime | None = None,
     ) -> list[Issue]:
+        """Return all issues from the repository matching the configured filters."""
         if not issue_state:
             issue_state = self.issue_state
         # Pass NotSet if since is None, as PyGithub expects this sentinel value
@@ -158,6 +164,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
     def get_exact_title_match(
         self, title: str, state: Literal["open", "closed"]
     ) -> list[Issue]:
+        """Return issues whose title exactly matches *title* and are in *state*."""
         all_pipeline_issues = self.get_all_issues(issue_state=state)
 
         unsorted = [
@@ -169,7 +176,8 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         sorted_issues = sorted(unsorted, key=lambda issue: issue.number, reverse=True)
         return sorted_issues
 
-    def get_matching_issues(self, since: Optional[datetime] = None) -> list[Issue]:
+    def get_matching_issues(self, since: datetime | None = None) -> list[Issue]:
+        """Return issues matching the configured prefix and skip-label filters."""
         all_pipeline_issues = self.get_all_issues(since=since)
 
         matching_issues = []
@@ -191,12 +199,12 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         return matching_issues
 
     def fetch_new_versions(
-        self, previous_version: Optional[ConcourseGithubIssuesVersion] = None
+        self, previous_version: ConcourseGithubIssuesVersion | None = None
     ) -> set[ConcourseGithubIssuesVersion]:
         """Fetch new versions since the previous one."""
-        since_datetime: Optional[datetime] = None
+        since_datetime: datetime | None = None
         if previous_version:
-            timestamp_str: Optional[str] = None
+            timestamp_str: str | None = None
             if self.issue_state == "closed":
                 timestamp_str = previous_version.issue_closed_at
             elif self.issue_state == "open":
@@ -206,13 +214,13 @@ class ConcourseGithubIssuesResource(ConcourseResource):
                 try:
                     # Add a small buffer (1 second) to avoid potential clock skew issues
                     # or fetching the exact same event again.
-                    since_datetime = datetime.strptime(
+                    since_datetime = datetime.strptime(  # noqa: DTZ007
                         timestamp_str, ISO_8601_FORMAT
                     ) + timedelta(seconds=1)
                 except ValueError:
                     # Handle cases where the timestamp might be invalid
-                    print(f"Warning: Could not parse timestamp {timestamp_str}")
-                    pass  # Proceed without 'since' if parsing fails
+                    print(f"Warning: Could not parse timestamp {timestamp_str}")  # noqa: T201
+                    # Proceed without 'since' if parsing fails
 
         matching_issues = self.get_matching_issues(since=since_datetime)
         versions = {self._to_version(issue) for issue in matching_issues}
@@ -224,6 +232,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
     def tombstone_version(
         self, version: ConcourseGithubIssuesVersion, build_metadata: BuildMetadata
     ):
+        """Rename the issue with a CONSUMED prefix so it is not re-triggered."""
         current_title = self.get_title_from_build(build_metadata)
         job_number = build_metadata.BUILD_NAME
         new_title = f"[CONSUMED #{job_number}]" + current_title
@@ -239,7 +248,8 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         version: ConcourseGithubIssuesVersion,
         destination_dir: str,
         build_metadata: BuildMetadata,
-    ) -> Tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
+    ) -> tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
+        """Write issue metadata to disk and tombstone the issue."""
         with Path(destination_dir).joinpath("gh_issue.json").open("w") as issue_file:
             issue_file.write(json.dumps(version.to_flat_dict() or {}))
         # We've triggered a deploy and consumed this issue. Set a tombstone in the title
@@ -250,27 +260,38 @@ class ConcourseGithubIssuesResource(ConcourseResource):
     def get_issue_body_from_build(
         self,
         build_metadata: BuildMetadata,
-        body_file: Optional[str] = None,
-        sources_dir: Optional[Path] = None,
+        body_file: str | None = None,
+        sources_dir: Path | None = None,
     ) -> str:
+        """Return the issue body from a workspace file or by rendering the template."""
         if body_file is not None:
             if sources_dir is None:
                 msg = "sources_dir is required when body_file is provided"
                 raise ValueError(msg)
-            return Path(sources_dir / body_file).read_text()
+            body_path = Path(body_file)
+            if body_path.is_absolute():
+                msg = "body_file must be a relative path"
+                raise ValueError(msg)
+            resolved = (sources_dir / body_path).resolve()
+            if not resolved.is_relative_to(sources_dir.resolve()):
+                msg = "body_file must be within the workspace sources directory"
+                raise ValueError(msg)
+            return resolved.read_text()
         return self.issue_body_template.format(**build_metadata_dict(build_metadata))
 
     def get_title_from_build(self, build_metadata: BuildMetadata) -> str:
+        """Return the issue title rendered from the configured template."""
         return self.issue_title_template.format(**build_metadata_dict(build_metadata))
 
     def publish_new_version(
         self,
         sources_dir,
         build_metadata: BuildMetadata,
-        assignees: Optional[list[str]] = None,
-        labels: Optional[list[str]] = None,
-        body_file: Optional[str] = None,
-    ) -> Tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
+        assignees: list[str] | None = None,
+        labels: list[str] | None = None,
+        body_file: str | None = None,
+    ) -> tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
+        """Create or comment on a GitHub Issue and return its version."""
         # Assume that: title is enough uniqueness to discern whether the issue
         # already exists
 
@@ -289,7 +310,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         already_exists = list(search_results)  # Evaluate the PaginatedList
 
         if len(already_exists) > 1:
-            print("Warning: There are multiple matches for the desired issue title!")
+            print("Warning: There are multiple matches for the desired issue title!")  # noqa: T201
 
         if not already_exists:
             # Pass label names (strings) directly, avoid fetching Label objects
@@ -299,10 +320,10 @@ class ConcourseGithubIssuesResource(ConcourseResource):
                 labels=labels or [],  # Pass list of strings
                 body=issue_body,
             )
-            print(f"created issue: {working_issue=}")
+            print(f"created issue: {working_issue=}")  # noqa: T201
         else:
             working_issue = already_exists[0]
-            print(f"about to comment on {working_issue=} with {issue_body=}")
+            print(f"about to comment on {working_issue=} with {issue_body=}")  # noqa: T201
             working_issue.create_comment(issue_body)
 
         return self._to_version(working_issue), {}
