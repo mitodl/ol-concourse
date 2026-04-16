@@ -66,6 +66,17 @@ resources:
         - uv.lock
         - pyproject.toml
 
+  - name: ol-concourse-release-src
+    type: git
+    icon: github
+    source:
+      uri: https://github.com/mitodl/ol-concourse
+      branch: main
+      paths:
+        - resources/release
+        - uv.lock
+        - pyproject.toml
+
   - name: concourse-packer-resource
     type: registry-image
     icon: docker
@@ -146,6 +157,15 @@ resources:
     source:
       tag: latest
       repository: mitodl/concourse-github-deployments-resource
+      username: ((dockerhub.username))
+      password: ((dockerhub.password))
+
+  - name: concourse-release-resource
+    type: registry-image
+    icon: docker
+    source:
+      tag: latest
+      repository: mitodl/concourse-release-resource
       username: ((dockerhub.username))
       password: ((dockerhub.password))
 
@@ -499,3 +519,50 @@ jobs:
         params:
           image: image/image.tar
           additional_tags: ol-concourse-github-deployments-src/.git/ref
+
+  - name: build-and-publish-release-image
+    public: true
+    plan:
+      - get: ol-concourse-release-src
+        trigger: true
+      - task: generate-requirements
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: ghcr.io/astral-sh/uv
+              tag: python3.13-bookworm
+          inputs:
+            - name: ol-concourse-release-src
+          outputs:
+            - name: build-context
+          run:
+            path: /bin/sh
+            args:
+              - -exc
+              - |
+                cp -a ol-concourse-release-src/. build-context/
+                cd build-context
+                uv build --package ol-concourse-release --out-dir resources/release/dist/
+      - task: build-image
+        privileged: true
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: concourse/oci-build-task
+          inputs:
+            - name: build-context
+          outputs:
+            - name: image
+          run:
+            path: build
+          params:
+            CONTEXT: build-context/resources/release
+            DOCKERFILE: build-context/resources/release/Dockerfile
+      - put: concourse-release-resource
+        params:
+          image: image/image.tar
+          additional_tags: ol-concourse-release-src/.git/ref

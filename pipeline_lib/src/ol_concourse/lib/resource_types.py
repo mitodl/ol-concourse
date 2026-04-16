@@ -37,6 +37,24 @@ def github_deployments_resource() -> ResourceType:
     )
 
 
+def release_resource_type() -> ResourceType:
+    """Generate the ``release`` custom resource type.
+
+    The resource handles the full release lifecycle: version detection via
+    ``check``, release branch/tag creation and checklist generation via ``in``
+    and ``out``.  Pair with :func:`~ol_concourse.lib.resources.release_resource`
+    to create a matching resource instance.
+
+    :returns: A :class:`ResourceType` for the release resource hosted on
+        Docker Hub as ``mitodl/concourse-release-resource``.
+    """
+    return ResourceType(
+        name=Identifier("release"),
+        type=REGISTRY_IMAGE,
+        source=RegistryImage(repository="mitodl/concourse-release-resource"),
+    )
+
+
 def hashicorp_resource() -> ResourceType:
     """Return the ResourceType definition for the Hashicorp release resource."""
     return ResourceType(

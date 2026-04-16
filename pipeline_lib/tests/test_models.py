@@ -10,6 +10,11 @@ from ol_concourse.lib.models.pipeline import (
     ResourceType,
 )
 from ol_concourse.lib.models.resource import Git
+from ol_concourse.lib.resource_types import (
+    github_deployments_resource,
+    github_issues_resource,
+    release_resource_type,
+)
 
 
 class TestConstants:
@@ -99,3 +104,39 @@ class TestPipelineSerialization:
         pipeline = Pipeline(jobs=[job])
         json_output = pipeline.model_dump_json()
         assert "my-job" in json_output
+
+
+class TestResourceTypes:
+    def test_github_issues_resource_type_name(self):
+        rt = github_issues_resource()
+        assert str(rt.name) == "github-issues"
+
+    def test_github_issues_resource_type_is_registry_image(self):
+        rt = github_issues_resource()
+        assert rt.type == REGISTRY_IMAGE
+
+    def test_github_deployments_resource_type_name(self):
+        rt = github_deployments_resource()
+        assert str(rt.name) == "github-deployments"
+
+    def test_github_deployments_resource_type_repository(self):
+        rt = github_deployments_resource()
+        assert rt.source.repository == "mitodl/concourse-github-deployments-resource"
+
+    def test_release_resource_type_name(self):
+        rt = release_resource_type()
+        assert str(rt.name) == "release"
+
+    def test_release_resource_type_is_registry_image(self):
+        rt = release_resource_type()
+        assert rt.type == REGISTRY_IMAGE
+
+    def test_release_resource_type_repository(self):
+        rt = release_resource_type()
+        assert rt.source.repository == "mitodl/concourse-release-resource"
+
+    def test_release_resource_type_returns_new_instance_each_call(self):
+        rt1 = release_resource_type()
+        rt2 = release_resource_type()
+        assert rt1 is not rt2
+        assert rt1 == rt2

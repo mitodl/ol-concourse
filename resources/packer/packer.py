@@ -89,7 +89,7 @@ def _print_parsed_packer_machine_readable_output_line(parsed_line: dict) -> None
             # split on \\n
             item_lines = item.split("\\n")
             for item_line in item_lines:
-                b_log(
+                _log(
                     _format_packer_machine_readable_output_line(
                         parsed_line["timestamp"],
                         parsed_line["target"],

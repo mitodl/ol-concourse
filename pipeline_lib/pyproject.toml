@@ -1,6 +1,6 @@
 [project]
 name = "ol-concourse"
-version = "0.6.0"
+version = "0.7.0"
 description = "Python DSL for programmatically building Concourse CI/CD pipelines"
 authors = [{ name = "MIT Open Learning", email = "odl-devops@mit.edu" }]
 requires-python = ">=3.13"

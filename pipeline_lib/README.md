@@ -53,7 +53,7 @@ print(yaml.dump(json.loads(pipeline.model_dump_json())))
 | Module | Functions |
 |--------|-----------|
 | `ol_concourse.lib.resources` | `git_repo`, `registry_image`, `github_issues`, `schedule`, `s3_object`, … |
-| `ol_concourse.lib.resource_types` | `packer_build`, `packer_validate`, `pulumi_provisioner_resource`, `github_issues_resource`, … |
+| `ol_concourse.lib.resource_types` | `packer_build`, `packer_validate`, `pulumi_provisioner_resource`, `github_issues_resource`, `github_deployments_resource`, `release_resource_type`, … |
 | `ol_concourse.lib.jobs.infrastructure` | `packer_jobs`, `pulumi_jobs_chain`, `pulumi_job` |
 | `ol_concourse.lib.containers` | `container_build_task` |
 | `ol_concourse.lib.notifications` | `notification` (Slack) |
