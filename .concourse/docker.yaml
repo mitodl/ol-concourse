@@ -125,9 +125,9 @@ resources:
     icon: docker
     source:
       tag: latest
-      repository: ghcr.io/mitodl/ol-concourse-task
-      username: ((ghcr.username))
-      password: ((ghcr.password))
+      repository: mitodl/ol-concourse-dsl
+      username: ((dockerhub.username))
+      password: ((dockerhub.password))
 
 jobs:
   - name: build-and-publish-packer-image
