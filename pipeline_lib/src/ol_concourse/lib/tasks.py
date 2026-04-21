@@ -13,7 +13,7 @@ from ol_concourse.lib.models.pipeline import (
     TaskStep,
 )
 
-# Default image for pipeline_lib task steps. Bundles ol-concourse, bumpver, and git.
+# Default image for pipeline_lib task steps. Bundles ol-concourse, bump-my-version, and git.
 # Tag is kept as "latest" until a versioned release of the task image is published.
 # Once the first image is built and pushed, pin this to a specific digest or tag
 # (e.g. "2026.04.15") to ensure reproducible pipeline behavior.
@@ -30,10 +30,10 @@ def bump_version_task(
     git_email: str = "odl-devops@mit.edu",
     image: AnonymousResource | None = None,
 ) -> TaskStep:
-    """Generate a TaskStep that runs bumpver to update version strings in-place.
+    """Generate a TaskStep that runs bump-my-version to update version strings in-place.
 
     Reads the target version from ``version_file``, then runs
-    ``bumpver update --set-version <version> --no-commit --no-fetch`` inside
+    ``bump-my-version bump --new-version <version> --no-commit`` inside
     ``repository``.  The modified files remain in the workspace for a subsequent
     ``put: release`` step to commit onto the release branch.
 
@@ -42,9 +42,9 @@ def bump_version_task(
         ``release/version``).  The leading path component must be the name of a
         Concourse input resource in the build plan.
     :param repository: Name of the Concourse input/output resource directory
-        containing the application source and its ``[bumpver]`` config in
-        ``pyproject.toml`` or ``setup.cfg`` (default: ``app-source``).
-    :param git_user: Git committer name used when bumpver writes version files
+        containing the application source and its ``[tool.bumpversion]`` config in
+        ``pyproject.toml`` (default: ``app-source``).
+    :param git_user: Git committer name used when bump-my-version writes version files
         (default: ``CI``).
     :param git_email: Git committer email (default: ``odl-devops@mit.edu``).
     :param image: Container image for the task.  Defaults to
@@ -96,7 +96,7 @@ def bump_version_task(
 git -C {shlex.quote(repo_id)} config user.email {shlex.quote(git_email)}
 git -C {shlex.quote(repo_id)} config user.name {shlex.quote(git_user)}
 cd {shlex.quote(repo_id)}
-bumpver update --set-version "$VERSION" --no-commit --no-fetch""",
+bump-my-version bump --new-version "$VERSION" --no-commit --allow-dirty""",
                 ],
             ),
         ),
