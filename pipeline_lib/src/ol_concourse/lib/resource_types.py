@@ -18,7 +18,7 @@ def github_issues_resource() -> ResourceType:
     return ResourceType(
         name=Identifier("github-issues"),
         type=REGISTRY_IMAGE,
-        source=RegistryImage(repository="mitodl/ol-concourse-github-issues"),
+        source=RegistryImage(repository="mitodl/concourse-github-issues-resource"),
     )
 
 
