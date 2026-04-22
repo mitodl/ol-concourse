@@ -127,10 +127,6 @@ def mock_github():
             "test/repo"
         )  # Set the full_name attribute for search queries
         mock_gh_instance.get_repo.return_value = mock_repo
-        # Set a default rate limit mock to avoid errors
-        mock_rate_limit = MagicMock()
-        mock_rate_limit.resources.core.remaining = 5000
-        mock_gh_instance.get_rate_limit.return_value = mock_rate_limit
         yield mock_gh_instance, mock_repo
 
 

@@ -3,13 +3,11 @@
 from pathlib import Path
 import textwrap
 import json
-import sys
 from datetime import datetime, timedelta
 from typing import Literal
 from concoursetools import BuildMetadata, ConcourseResource
 from concoursetools.version import Version, SortableVersionMixin
-from github import Github, Auth, Consts, GithubException
-from requests.exceptions import RequestException
+from github import Github, Auth, Consts
 from github.GithubObject import NotSet
 from github.Issue import Issue
 
@@ -102,17 +100,6 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         else:
             auth = self.auth_app(app_id, app_installation_id, private_ssh_key)
         self.gh = Github(base_url=gh_host, auth=auth, per_page=100)
-        try:
-            curr_limit = self.gh.get_rate_limit()
-            if curr_limit.resources.core.remaining == 0:
-                sys.exit(1)
-        except GithubException:
-            # Rate limiting is not enabled
-            curr_limit = None
-        except RequestException:
-            # Network error during rate limit check; proceed without rate limit enforcement
-            curr_limit = None
-
         self.repo = self.gh.get_repo(repository)
         self.issue_state = issue_state
         self.issue_prefix = issue_prefix
