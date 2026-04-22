@@ -53,9 +53,9 @@ class TestBumpVersionTask:
     def test_shell_script_contains_bumpver_invocation(self):
         step = bump_version_task(version_file="release/version", repository="src")
         script = step.config.run.args[1]
-        assert "bumpver update --set-version" in script
+        assert 'bump-my-version bump --new-version "$VERSION"' in script
         assert "--no-commit" in script
-        assert "--no-fetch" in script
+        assert "--allow-dirty" in script
 
     def test_shell_script_reads_version_from_file(self):
         step = bump_version_task(version_file="release/version")
