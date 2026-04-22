@@ -92,6 +92,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         """  # noqa: E501
         ),
         skip_if_labeled: list[str] | None = None,
+        timeout: int = 30,
     ):
         """Initialize with GitHub API credentials and issue configuration."""
         super().__init__(ConcourseGithubIssuesVersion)
@@ -99,7 +100,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             auth = self.auth_token(access_token)
         else:
             auth = self.auth_app(app_id, app_installation_id, private_ssh_key)
-        self.gh = Github(base_url=gh_host, auth=auth, per_page=100)
+        self.gh = Github(base_url=gh_host, auth=auth, per_page=100, timeout=timeout)
         self.repo = self.gh.get_repo(repository)
         self.issue_state = issue_state
         self.issue_prefix = issue_prefix

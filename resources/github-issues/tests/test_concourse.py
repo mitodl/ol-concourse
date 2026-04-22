@@ -675,3 +675,28 @@ def test_publish_new_version_body_file_comments_with_file_contents(
     )
 
     existing_issue.create_comment.assert_called_once_with(expected_body)
+
+
+def test_timeout_default(mock_github):
+    """Github is instantiated with the 30-second default timeout."""
+    with patch("concourse.Github") as MockGithub:
+        MockGithub.return_value.get_repo.return_value = MagicMock()
+        ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+        )
+        _, kwargs = MockGithub.call_args
+        assert kwargs["timeout"] == 30  # noqa: PLR2004
+
+
+def test_timeout_configurable(mock_github):
+    """Github is instantiated with the caller-supplied timeout."""
+    with patch("concourse.Github") as MockGithub:
+        MockGithub.return_value.get_repo.return_value = MagicMock()
+        ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            timeout=60,
+        )
+        _, kwargs = MockGithub.call_args
+        assert kwargs["timeout"] == 60  # noqa: PLR2004
