@@ -602,7 +602,7 @@ wheels = [
 
 [[package]]
 name = "ol-concourse"
-version = "0.7.0"
+version = "0.8.0"
 source = { editable = "pipeline_lib" }
 dependencies = [
     { name = "pydantic" },
