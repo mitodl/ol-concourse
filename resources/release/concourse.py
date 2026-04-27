@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 from concoursetools import BuildMetadata, ConcourseResource, TypedVersion
 from github import Auth, Github
 
-VERSION_PATTERN = re.compile(r"^(\d{4})\.(\d{2})\.(\d{2})\.(\d+)$")
+VERSION_PATTERN = re.compile(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})\.(\d+)$")
 
 # Default minimum clone depth.  Configurable via the ``clone_depth`` source
 # param.  Increase if the previous release tag is more than this many commits
@@ -72,9 +72,9 @@ class ReleaseVersion(TypedVersion):
     to trigger the full pipeline.  They are not used for version ordering.
     """
 
-    version: str  # YYYY.MM.DD.N
+    version: str  # YYYY.M.D.N (no leading zeros — PEP 440 compliant)
     head_sha: str  # full SHA of HEAD at check time
-    since: str  # previous tag (YYYY.MM.DD.N or empty string when no prior tags)
+    since: str  # previous tag (YYYY.M.D.N or empty string when no prior tags)
     commit_count: str  # number of commits since last release tag
     authors: str  # comma-separated sorted author email list
 
@@ -88,7 +88,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
     """Concourse resource for git release orchestration.
 
     Implements:
-    - check: Detect unreleased commits and compute the next YYYY.MM.DD.N version.
+    - check: Detect unreleased commits and compute the next YYYY.M.D.N version.
     - in:    Write version, commits.json, checklist.md, and changelog_entry.md.
     - out:   Create the release branch/tag and optional changelog file (action=create),
              or merge the release branch back to main (action=finish).
@@ -708,13 +708,14 @@ def _parse_version_tuple(tag: str) -> tuple[int, int, int, int]:
 
 
 def _compute_next_version(existing_tags: list[str]) -> str:
-    """Compute the next YYYY.MM.DD.N version string.
+    """Compute the next YYYY.M.D.N version string.
 
     Increments the patch counter N for today's date.  Resets to 1 when the
-    date component changes.
+    date component changes.  Month and day are not zero-padded to comply with
+    PEP 440 (required by uv and other modern Python tooling).
     """
     today = datetime.now(tz=UTC).date()
-    prefix = today.strftime("%Y.%m.%d")
+    prefix = f"{today.year}.{today.month}.{today.day}"
     max_n = 0
     for tag in existing_tags:
         m = VERSION_PATTERN.match(tag)

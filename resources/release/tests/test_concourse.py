@@ -38,9 +38,9 @@ def make_resource(**kwargs) -> ReleaseResource:
 
 def make_version(**kwargs) -> ReleaseVersion:
     defaults = {
-        "version": "2026.04.14.1",
+        "version": "2026.4.14.1",
         "head_sha": "abc1234" * 5,
-        "since": "2026.04.10.1",
+        "since": "2026.4.10.1",
         "commit_count": "3",
         "authors": "alice@example.com,bob@example.com",
     }
@@ -69,8 +69,9 @@ def make_commits(n: int = 2) -> list[dict]:
 @pytest.mark.parametrize(
     "tag, expected",
     [
-        ("2026.04.14.1", (2026, 4, 14, 1)),
-        ("2026.04.14.10", (2026, 4, 14, 10)),
+        ("2026.4.14.1", (2026, 4, 14, 1)),
+        ("2026.4.14.10", (2026, 4, 14, 10)),
+        ("2026.1.5.1", (2026, 1, 5, 1)),
         ("not-a-version", (0, 0, 0, 0)),
         ("", (0, 0, 0, 0)),
     ],
@@ -85,7 +86,8 @@ def test_parse_version_tuple(tag, expected):
 
 
 def test_compute_next_version_no_tags():
-    today = datetime.now(tz=UTC).date().strftime("%Y.%m.%d")
+    d = datetime.now(tz=UTC).date()
+    today = f"{d.year}.{d.month}.{d.day}"
     assert _compute_next_version([]) == f"{today}.1"
 
 
@@ -98,24 +100,24 @@ def test_compute_next_version_increments_n(monkeypatch):
     monkeypatch.setattr(
         "concourse.datetime", _fake_datetime(datetime(2026, 4, 14, tzinfo=UTC))
     )
-    tags = ["2026.04.14.1", "2026.04.14.2"]
-    assert _compute_next_version(tags) == "2026.04.14.3"
+    tags = ["2026.4.14.1", "2026.4.14.2"]
+    assert _compute_next_version(tags) == "2026.4.14.3"
 
 
 def test_compute_next_version_new_day_resets_to_one(monkeypatch):
     monkeypatch.setattr(
         "concourse.datetime", _fake_datetime(datetime(2026, 4, 15, tzinfo=UTC))
     )
-    tags = ["2026.04.14.1", "2026.04.14.2"]
-    assert _compute_next_version(tags) == "2026.04.15.1"
+    tags = ["2026.4.14.1", "2026.4.14.2"]
+    assert _compute_next_version(tags) == "2026.4.15.1"
 
 
 def test_compute_next_version_ignores_other_date_tags(monkeypatch):
     monkeypatch.setattr(
         "concourse.datetime", _fake_datetime(datetime(2026, 4, 14, tzinfo=UTC))
     )
-    tags = ["2026.04.13.5", "2026.04.14.3"]
-    assert _compute_next_version(tags) == "2026.04.14.4"
+    tags = ["2026.4.13.5", "2026.4.14.3"]
+    assert _compute_next_version(tags) == "2026.4.14.4"
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +135,8 @@ def test_build_checklist_with_prs():
             "pr_title": "Fix the bug",
         }
     ]
-    result = _build_checklist("2026.04.14.1", commits)
-    assert "## Release 2026.04.14.1" in result
+    result = _build_checklist("2026.4.14.1", commits)
+    assert "## Release 2026.4.14.1" in result
     assert "- [ ] **Fix the bug** (#42) by dev@example.com" in result
     assert "Closing this issue will trigger the production deployment" in result
 
@@ -149,13 +151,13 @@ def test_build_checklist_without_prs():
             "pr_title": None,
         }
     ]
-    result = _build_checklist("2026.04.14.1", commits)
+    result = _build_checklist("2026.4.14.1", commits)
     assert "- [ ] `abc1234` Fix bug by dev@example.com" in result
 
 
 def test_build_checklist_empty_commits():
-    result = _build_checklist("2026.04.14.1", [])
-    assert "## Release 2026.04.14.1" in result
+    result = _build_checklist("2026.4.14.1", [])
+    assert "## Release 2026.4.14.1" in result
     assert "### Changes" in result
 
 
@@ -182,8 +184,8 @@ def test_build_changelog_entry_format():
         },
     ]
     today = datetime.now(tz=UTC).strftime("%Y-%m-%d")
-    result = _build_changelog_entry("2026.04.14.1", commits)
-    assert f"## [2026.04.14.1] - {today}" in result
+    result = _build_changelog_entry("2026.4.14.1", commits)
+    assert f"## [2026.4.14.1] - {today}" in result
     assert "### Changes" in result
     assert "- **Fix the bug** (#42) by dev@example.com" in result
     assert "- `def5678` No PR commit by other@example.com" in result
@@ -196,7 +198,7 @@ def test_build_changelog_entry_format():
 
 def test_update_cumulative_changelog_creates_new_file(tmp_path):
     changelog = tmp_path / "CHANGELOG.md"
-    entry = "## [2026.04.14.1] - 2026-04-14\n\n### Changes\n\n- Fix thing\n"
+    entry = "## [2026.4.14.1] - 2026-04-14\n\n### Changes\n\n- Fix thing\n"
     _update_cumulative_changelog(changelog, entry)
     content = changelog.read_text()
     assert CHANGELOG_HEADER in content
@@ -205,22 +207,22 @@ def test_update_cumulative_changelog_creates_new_file(tmp_path):
 
 def test_update_cumulative_changelog_prepends_to_existing(tmp_path):
     changelog = tmp_path / "CHANGELOG.md"
-    old_entry = "## [2026.04.10.1] - 2026-04-10\n\n### Changes\n\n- Old fix\n"
+    old_entry = "## [2026.4.10.1] - 2026-04-10\n\n### Changes\n\n- Old fix\n"
     changelog.write_text(CHANGELOG_HEADER + "\n" + old_entry)
 
-    new_entry = "## [2026.04.14.1] - 2026-04-14\n\n### Changes\n\n- New fix\n"
+    new_entry = "## [2026.4.14.1] - 2026-04-14\n\n### Changes\n\n- New fix\n"
     _update_cumulative_changelog(changelog, new_entry)
 
     content = changelog.read_text()
-    new_pos = content.index("2026.04.14.1")
-    old_pos = content.index("2026.04.10.1")
+    new_pos = content.index("2026.4.14.1")
+    old_pos = content.index("2026.4.10.1")
     assert new_pos < old_pos, "New entry should appear before old entry"
 
 
 def test_update_cumulative_changelog_header_only_file(tmp_path):
     changelog = tmp_path / "CHANGELOG.md"
     changelog.write_text(CHANGELOG_HEADER)
-    entry = "## [2026.04.14.1] - 2026-04-14\n\n### Changes\n\n- Fix\n"
+    entry = "## [2026.4.14.1] - 2026-04-14\n\n### Changes\n\n- Fix\n"
     _update_cumulative_changelog(changelog, entry)
     content = changelog.read_text()
     assert CHANGELOG_HEADER in content
@@ -294,7 +296,7 @@ def test_fetch_new_versions_head_equals_tag(mock_tmpdir, mock_run, tmp_path):
     outputs = [
         "",
         "",
-        "2026.04.10.1\n2026.04.14.1",
+        "2026.4.10.1\n2026.4.14.1",
         head_sha,
         head_sha,
         "dev@example.com",
@@ -312,7 +314,7 @@ def test_fetch_new_versions_head_equals_tag(mock_tmpdir, mock_run, tmp_path):
     versions = resource.fetch_new_versions(None)
 
     assert len(versions) == 1
-    assert versions[0].version == "2026.04.14.1"
+    assert versions[0].version == "2026.4.14.1"
     assert versions[0].head_sha == head_sha
 
 
@@ -327,7 +329,7 @@ def test_fetch_new_versions_new_commits(mock_tmpdir, mock_run, tmp_path, monkeyp
     outputs = [
         "",
         "",
-        "2026.04.14.1",
+        "2026.4.14.1",
         head_sha,
         tag_sha,
         "dev@example.com\nalice@example.com",
@@ -349,8 +351,8 @@ def test_fetch_new_versions_new_commits(mock_tmpdir, mock_run, tmp_path, monkeyp
         versions = resource.fetch_new_versions(None)
 
     assert len(versions) == 1
-    assert versions[0].version == "2026.04.14.2"
-    assert versions[0].since == "2026.04.14.1"
+    assert versions[0].version == "2026.4.14.2"
+    assert versions[0].since == "2026.4.14.1"
     assert versions[0].head_sha == head_sha
     assert versions[0].commit_count == "2"
 
@@ -441,7 +443,7 @@ def test_download_version_no_since_uses_head_sha(mock_tmpdir, mock_run, tmp_path
 def test_publish_new_version_invalid_action(mock_run, tmp_path):
     version_file = tmp_path / "release" / "version"
     version_file.parent.mkdir()
-    version_file.write_text("2026.04.14.1")
+    version_file.write_text("2026.4.14.1")
 
     resource = make_resource()
     with pytest.raises(ValueError, match="Invalid action"):
@@ -457,7 +459,7 @@ def test_publish_new_version_invalid_action(mock_run, tmp_path):
 @patch("concourse._run")
 def test_publish_new_version_create(mock_run, tmp_path):
     """Create action: sets up branch, commits, pushes, tags."""
-    version_str = "2026.04.14.1"
+    version_str = "2026.4.14.1"
 
     # Set up workspace
     version_file = tmp_path / "release" / "version"
@@ -476,13 +478,13 @@ def test_publish_new_version_create(mock_run, tmp_path):
             "",  # git checkout main  (new: ensure correct branch)
             "",  # git reset --hard origin/main  (new: sync with remote)
             pre_bump_sha,  # git rev-parse HEAD (pre-bump)
-            "",  # git checkout -b release/2026.04.14.1
+            "",  # git checkout -b release/2026.4.14.1
             "",  # git status --porcelain (empty — no dirty files)
             "",  # git tag --list (for prior tags in _collect_commits_range)
             "",  # git log (no commits in range)
-            "",  # git push origin release/2026.04.14.1
-            "",  # git tag 2026.04.14.1 <sha>
-            "",  # git push origin refs/tags/2026.04.14.1
+            "",  # git push origin release/2026.4.14.1
+            "",  # git tag 2026.4.14.1 <sha>
+            "",  # git push origin refs/tags/2026.4.14.1
         ]
     )
     mock_run.side_effect = lambda cmd, **kw: next(outputs, "")
@@ -511,7 +513,7 @@ def test_publish_new_version_create(mock_run, tmp_path):
 @patch("concourse._run")
 def test_publish_new_version_create_with_hotfix(mock_run, tmp_path):
     """Hotfix commit is cherry-picked before the release commit."""
-    version_str = "2026.04.14.1"
+    version_str = "2026.4.14.1"
     hotfix_sha = "hotfix12" * 5
 
     version_file = tmp_path / "release" / "version"
@@ -559,7 +561,7 @@ def test_publish_new_version_create_with_hotfix(mock_run, tmp_path):
 @patch("concourse._run")
 def test_publish_new_version_finish(mock_run, tmp_path):
     """Finish action: merges release branch into the configured branch."""
-    version_str = "2026.04.14.1"
+    version_str = "2026.4.14.1"
     version_file = tmp_path / "release" / "version"
     version_file.parent.mkdir()
     version_file.write_text(version_str)
@@ -600,7 +602,7 @@ def test_publish_new_version_finish_uses_configured_branch(mock_run, tmp_path):
     """Finish respects the source-level branch setting, not always 'main'."""
     version_file = tmp_path / "release" / "version"
     version_file.parent.mkdir()
-    version_file.write_text("2026.04.14.1")
+    version_file.write_text("2026.4.14.1")
     (tmp_path / "app-source").mkdir()
 
     mock_run.return_value = "mergesha1" * 5
@@ -628,7 +630,7 @@ def test_publish_new_version_finish_uses_configured_branch(mock_run, tmp_path):
 
 @patch("concourse._run")
 def test_create_writes_cumulative_changelog(mock_run, tmp_path):
-    version_str = "2026.04.14.1"
+    version_str = "2026.4.14.1"
     version_file = tmp_path / "release" / "version"
     version_file.parent.mkdir()
     version_file.write_text(version_str)
@@ -671,7 +673,7 @@ def test_create_writes_cumulative_changelog(mock_run, tmp_path):
 
 @patch("concourse._run")
 def test_create_writes_per_release_changelog(mock_run, tmp_path):
-    version_str = "2026.04.14.1"
+    version_str = "2026.4.14.1"
     version_file = tmp_path / "release" / "version"
     version_file.parent.mkdir()
     version_file.write_text(version_str)

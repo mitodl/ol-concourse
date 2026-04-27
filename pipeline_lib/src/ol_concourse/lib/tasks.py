@@ -33,7 +33,7 @@ def bump_version_task(
     """Generate a TaskStep that runs bump-my-version to update version strings in-place.
 
     Reads the target version from ``version_file``, then runs
-    ``bump-my-version bump --new-version <version> --no-commit`` inside
+    ``bump-my-version bump --new-version <version> --no-commit --allow-dirty`` inside
     ``repository``.  The modified files remain in the workspace for a subsequent
     ``put: release`` step to commit onto the release branch.
 
@@ -96,7 +96,7 @@ def bump_version_task(
 git -C {shlex.quote(repo_id)} config user.email {shlex.quote(git_email)}
 git -C {shlex.quote(repo_id)} config user.name {shlex.quote(git_user)}
 cd {shlex.quote(repo_id)}
-bump-my-version bump --new-version "$VERSION" --no-commit --allow-dirty""",
+bump-my-version bump --new-version "$VERSION" --no-commit --allow-dirty --verbose""",
                 ],
             ),
         ),
