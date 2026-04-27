@@ -50,7 +50,7 @@ class TestBumpVersionTask:
         assert "my-app" in input_names
         assert "my-app" in output_names
 
-    def test_shell_script_contains_bumpver_invocation(self):
+    def test_shell_script_contains_bump_my_version_invocation(self):
         step = bump_version_task(version_file="release/version", repository="src")
         script = step.config.run.args[1]
         assert 'bump-my-version bump --new-version "$VERSION"' in script

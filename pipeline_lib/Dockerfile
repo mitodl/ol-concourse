@@ -12,4 +12,4 @@ COPY dist/ dist/
 # If this ever changes, clean dist/ before building to prevent installing
 # unintended packages.
 RUN pip install --upgrade pip && \
-    pip install dist/*.whl "bump-my-version>=1.3.0"
+    pip install dist/*.whl "bump-my-version==1.3.0"

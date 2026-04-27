@@ -120,6 +120,14 @@ def test_compute_next_version_ignores_other_date_tags(monkeypatch):
     assert _compute_next_version(tags) == "2026.4.14.4"
 
 
+def test_compute_next_version_handles_mixed_zero_padded_tags(monkeypatch):
+    monkeypatch.setattr(
+        "concourse.datetime", _fake_datetime(datetime(2026, 4, 14, tzinfo=UTC))
+    )
+    tags = ["2026.04.14.1", "2026.4.14.2", "2026.04.14.3", "2026.4.13.9"]
+    assert _compute_next_version(tags) == "2026.4.14.4"
+
+
 # ---------------------------------------------------------------------------
 # _build_checklist
 # ---------------------------------------------------------------------------

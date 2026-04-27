@@ -719,7 +719,11 @@ def _compute_next_version(existing_tags: list[str]) -> str:
     max_n = 0
     for tag in existing_tags:
         m = VERSION_PATTERN.match(tag)
-        if m and tag.startswith(prefix):
+        if m and (int(m.group(1)), int(m.group(2)), int(m.group(3))) == (
+            today.year,
+            today.month,
+            today.day,
+        ):
             max_n = max(max_n, int(m.group(4)))
     return f"{prefix}.{max_n + 1}"
 
