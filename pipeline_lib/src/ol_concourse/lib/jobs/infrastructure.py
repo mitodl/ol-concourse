@@ -252,7 +252,9 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
             # trigger the current stack. This ensures that we are triggering on the
             # notification that the previous step has been deployed.
             get_gh_issues = GetStep(
-                get=Identifier(f"github-issues-{previous_stack.lower()}-trigger"),
+                get=Identifier(
+                    f"github-issues-{project_name.lower()}-{previous_stack.lower()}-trigger"
+                ),
                 trigger=True,
             )
             local_dependencies.append(get_gh_issues)
