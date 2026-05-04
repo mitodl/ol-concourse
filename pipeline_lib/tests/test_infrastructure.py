@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 from ol_concourse.lib.jobs.infrastructure import pulumi_jobs_chain
-from ol_concourse.lib.models.pipeline import Identifier, Resource
+from ol_concourse.lib.models.pipeline import Identifier, PutStep, Resource
 
 
 def _make_pulumi_code(name: str = "my-repo") -> Resource:
@@ -111,3 +111,62 @@ class TestPulumiJobsChainGitHubIssueNaming:
                 assert name in gets, (
                     f"Trigger resource '{name}' is defined but never used by any job"
                 )
+
+
+def _get_pulumi_put_step(fragment, job_index: int = 0) -> PutStep:
+    """Return the PutStep that invokes the pulumi-provisioner resource."""
+    job = fragment.jobs[job_index]
+    for step in job.plan:
+        if isinstance(step, PutStep) and str(step.put).startswith("pulumi-"):
+            return step
+    msg = f"No pulumi PutStep found in job {job_index}"
+    raise AssertionError(msg)
+
+
+class TestRefreshStack:
+    """refresh_stack param controls whether pulumi refresh is skipped."""
+
+    def test_refresh_stack_true_by_default(self):
+        """When refresh_stack is omitted, refresh_stack key is absent from params."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+        )
+        put = _get_pulumi_put_step(fragment)
+        assert "refresh_stack" not in (put.params or {}), (
+            "refresh_stack should be absent when default (True) is used"
+        )
+
+    def test_refresh_stack_false_injects_param(self):
+        """When refresh_stack=False, params must include refresh_stack: False."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI", "QA", "Production"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+            refresh_stack=False,
+        )
+        for i in range(len(fragment.jobs)):
+            put = _get_pulumi_put_step(fragment, i)
+            assert (put.params or {}).get("refresh_stack") is False, (
+                f"Job {i} missing refresh_stack=False in params"
+            )
+
+    def test_refresh_stack_true_explicit(self):
+        """When refresh_stack=True explicitly, refresh_stack key is absent."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+            refresh_stack=True,
+        )
+        put = _get_pulumi_put_step(fragment)
+        assert "refresh_stack" not in (put.params or {}), (
+            "refresh_stack should be absent when explicitly True"
+        )

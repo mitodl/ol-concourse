@@ -160,6 +160,7 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
     additional_env_vars: dict[str, str] | None = None,
     env_vars_from_files: dict[str, str] | None = None,
     slack_url_path: str | None = None,
+    refresh_stack: bool = True,
 ) -> PipelineFragment:
     """Create a chained sequence of jobs for running Pulumi tasks.
 
@@ -182,6 +183,9 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
     :param slack_url_path: A Vault secret path containing the Slack webhook URL. When
         provided, failure, error, and abort notifications are sent to that Slack
         channel.
+    :param refresh_stack: When ``False``, passes ``refresh_stack: false`` to the
+        pulumi-provisioner resource so that ``pulumi refresh`` is skipped before each
+        ``pulumi up``.  Defaults to ``True`` (refresh enabled).
     :type custom_dependencies: Dict[int, list[GetStep]]
 
     :returns: A `PipelineFragment` object that can be composed with other fragments to
@@ -277,6 +281,7 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
             additional_env_vars=additional_env_vars,
             env_vars_from_files=env_vars_from_files,
             slack_url_path=slack_url_path,
+            refresh_stack=refresh_stack,
         )
 
         default_github_issue_labels = [
@@ -325,6 +330,7 @@ def pulumi_job(  # noqa: PLR0913
     additional_env_vars: dict[str, str] | None = None,
     env_vars_from_files: dict[str, str] | None = None,
     slack_url_path: str | None = None,
+    refresh_stack: bool = True,
 ) -> PipelineFragment:
     """Create a job definition for running a Pulumi task.
 
@@ -341,6 +347,9 @@ def pulumi_job(  # noqa: PLR0913
     :param slack_url_path: A Vault secret path containing the Slack webhook URL. When
         provided, failure, error, and abort notifications are sent to that Slack
         channel.
+    :param refresh_stack: When ``False``, passes ``refresh_stack: false`` to the
+        pulumi-provisioner resource so that ``pulumi refresh`` is skipped before
+        ``pulumi up``.  Defaults to ``True`` (refresh enabled).
 
     :returns: A `PipelineFragment` object that can be composed with other fragments to
               build a full pipeline.
@@ -397,6 +406,7 @@ def pulumi_job(  # noqa: PLR0913
                     },
                     "stack_name": stack_name,
                     "env_vars_from_files": env_vars_from_files or {},
+                    **({"refresh_stack": False} if not refresh_stack else {}),
                 },
             ),
         ]
