@@ -188,7 +188,9 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
               build a full pipeline.
     """
     if enable_github_issue_resource and github_issue_repository is None:
-        msg = "github_issue_repository is required when enable_github_issue_resource=True"
+        msg = (
+            "github_issue_repository is required when enable_github_issue_resource=True"
+        )
         raise ValueError(msg)
 
     chain_fragment = PipelineFragment(resource_types=[github_issues_resource()])
@@ -198,7 +200,9 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
         if index + 1 < len(stack_names) and enable_github_issue_resource:
             gh_issues_trigger = github_issues(
                 auth_method="token",
-                name=Identifier(f"github-issues-{stack_name.lower()}-trigger"),
+                name=Identifier(
+                    f"github-issues-{project_name.lower()}-{stack_name.lower()}-trigger"
+                ),
                 repository=github_issue_repository,
                 issue_title_template=f"[bot] Pulumi {project_name} {stack_name} "
                 "deployed.",
@@ -210,7 +214,9 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
         if enable_github_issue_resource:
             gh_issues_post = github_issues(
                 auth_method="token",
-                name=Identifier(f"github-issues-{stack_name.lower()}-post"),
+                name=Identifier(
+                    f"github-issues-{project_name.lower()}-{stack_name.lower()}-post"
+                ),
                 repository=github_issue_repository,
                 issue_title_template=(
                     f"[bot] Pulumi {project_name} {stack_name} deployed."
