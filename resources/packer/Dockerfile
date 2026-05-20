@@ -1,6 +1,6 @@
 ARG PACKER_VERSION=1.13.1
 
-FROM python:3.14-alpine@sha256:dd4d2bd5b53d9b25a51da13addf2be586beebd5387e289e798e4083d94ca837a AS packer-download
+FROM python:3.14-alpine@sha256:5a824eb82cc75361f98611f3cfc5091ea33f10a6ccea4d4ebdabbc523b9a1614 AS packer-download
 ARG PACKER_VERSION
 RUN apk add --no-cache curl && \
     curl -fsSL "https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_amd64.zip" \
@@ -8,7 +8,7 @@ RUN apk add --no-cache curl && \
     unzip /tmp/packer.zip -d /usr/local/bin/ && \
     rm /tmp/packer.zip
 
-FROM python:3.14-alpine@sha256:dd4d2bd5b53d9b25a51da13addf2be586beebd5387e289e798e4083d94ca837a
+FROM python:3.14-alpine@sha256:5a824eb82cc75361f98611f3cfc5091ea33f10a6ccea4d4ebdabbc523b9a1614
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
