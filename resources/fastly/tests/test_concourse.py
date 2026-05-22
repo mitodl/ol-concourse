@@ -15,6 +15,7 @@ from concourse import FastlyResource, FastlyVersion
 
 API_TOKEN = "test-fastly-token-abc123"
 SERVICE_ID = "SU1Z0isxPaozGVKXdv0eY"
+DOMAIN = "www.example.com"
 
 
 def mock_build_metadata() -> BuildMetadata:
@@ -52,6 +53,12 @@ def resource() -> FastlyResource:
 
 
 @pytest.fixture
+def resource_by_domain() -> FastlyResource:
+    """Return a FastlyResource configured with a domain instead of a service ID."""
+    return FastlyResource(api_token=API_TOKEN, domain=DOMAIN)
+
+
+@pytest.fixture
 def resource_no_service() -> FastlyResource:
     """Return a FastlyResource with no default service ID."""
     return FastlyResource(api_token=API_TOKEN)
@@ -76,7 +83,7 @@ def test_fastly_version_hashable() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _resolve_service_id
+# _resolve_service_id / _get_service_id
 # ---------------------------------------------------------------------------
 
 
@@ -93,9 +100,39 @@ def test_resolve_service_id_override(resource: FastlyResource) -> None:
 def test_resolve_service_id_missing_raises(
     resource_no_service: FastlyResource,
 ) -> None:
-    """Raises ValueError when neither source nor override provides a service ID."""
-    with pytest.raises(ValueError, match="service_id must be set"):
+    """Raises ValueError when neither source, override, nor domain is set."""
+    with pytest.raises(ValueError, match="service_id or domain must be set"):
         resource_no_service._resolve_service_id(None)
+
+
+def test_get_service_id_prefers_override(resource_by_domain: FastlyResource) -> None:
+    """_get_service_id returns the step-level override even when domain is set."""
+    mock_client = MagicMock()
+    result = resource_by_domain._get_service_id("EXPLICIT_OVERRIDE", mock_client)
+    assert result == "EXPLICIT_OVERRIDE"
+
+
+def test_get_service_id_prefers_source_service_id() -> None:
+    """_get_service_id returns source service_id over domain when both are set."""
+    r = FastlyResource(api_token=API_TOKEN, service_id=SERVICE_ID, domain=DOMAIN)
+    mock_client = MagicMock()
+    result = r._get_service_id(None, mock_client)
+    assert result == SERVICE_ID
+
+
+def test_get_service_id_falls_back_to_domain_lookup(
+    resource_by_domain: FastlyResource,
+) -> None:
+    """_get_service_id calls domain lookup when no service_id is available."""
+    mock_client = MagicMock()
+    with patch.object(
+        resource_by_domain,
+        "_lookup_service_id_by_domain",
+        return_value=SERVICE_ID,
+    ) as mock_lookup:
+        result = resource_by_domain._get_service_id(None, mock_client)
+    mock_lookup.assert_called_once_with(mock_client, DOMAIN)
+    assert result == SERVICE_ID
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +171,7 @@ def test_check_new_version_returns_current(resource: FastlyResource) -> None:
 
 def test_check_requires_service_id(resource_no_service: FastlyResource) -> None:
     """Check raises ValueError when no service_id is configured."""
-    with pytest.raises(ValueError, match="service_id must be set"):
+    with pytest.raises(ValueError, match="service_id or domain must be set"):
         resource_no_service.fetch_new_versions(None)
 
 
@@ -464,7 +501,7 @@ def test_put_missing_service_id_raises(
     resource_no_service: FastlyResource, tmp_path: Path
 ) -> None:
     """Put without a service_id raises ValueError for service-requiring modes."""
-    with pytest.raises(ValueError, match="service_id must be set"):
+    with pytest.raises(ValueError, match="service_id or domain must be set"):
         resource_no_service.publish_new_version(
             tmp_path, mock_build_metadata(), mode="purge_all"
         )
@@ -591,3 +628,126 @@ def test_validate_vcl_name_dotdot_raises() -> None:
 
     with pytest.raises(ValueError, match="Unsafe VCL name"):
         _validate_vcl_name(".hidden")
+
+
+# ---------------------------------------------------------------------------
+# _lookup_service_id_by_domain
+# ---------------------------------------------------------------------------
+
+
+def _make_service(svc_id: str) -> MagicMock:
+    """Return a mock service list entry."""
+    s = MagicMock()
+    s.id = svc_id
+    return s
+
+
+def _make_domain_entry(name: str) -> MagicMock:
+    """Return a mock DomainResponse entry."""
+    d = MagicMock()
+    d.name = name
+    return d
+
+
+def test_lookup_service_id_by_domain_found(
+    resource_by_domain: FastlyResource,
+) -> None:
+    """Domain lookup returns the service ID when the domain is found."""
+    mock_svc = _make_service(SERVICE_ID)
+    mock_domain = _make_domain_entry(DOMAIN)
+
+    with (
+        patch("concourse.service_api.ServiceApi") as MockServiceApi,
+        patch("concourse.fastly.ApiClient"),
+        patch("concourse.fastly.Configuration"),
+    ):
+        MockServiceApi.return_value.list_services.return_value = [mock_svc]
+        MockServiceApi.return_value.list_service_domains.return_value = [mock_domain]
+        with resource_by_domain._api_client() as client:
+            result = resource_by_domain._lookup_service_id_by_domain(client, DOMAIN)
+
+    assert result == SERVICE_ID
+
+
+def test_lookup_service_id_by_domain_not_found(
+    resource_by_domain: FastlyResource,
+) -> None:
+    """Domain lookup raises ValueError when no service claims the domain."""
+    mock_svc = _make_service(SERVICE_ID)
+    mock_domain = _make_domain_entry("other.example.com")
+
+    with (
+        patch("concourse.service_api.ServiceApi") as MockServiceApi,
+        patch("concourse.fastly.ApiClient"),
+        patch("concourse.fastly.Configuration"),
+    ):
+        MockServiceApi.return_value.list_services.return_value = [mock_svc]
+        MockServiceApi.return_value.list_service_domains.return_value = [mock_domain]
+        with (
+            resource_by_domain._api_client() as client,
+            pytest.raises(ValueError, match="No Fastly service found"),
+        ):
+            resource_by_domain._lookup_service_id_by_domain(client, DOMAIN)
+
+
+def test_lookup_service_id_paginates(resource_by_domain: FastlyResource) -> None:
+    """Domain lookup fetches subsequent pages until the domain is found."""
+    page1 = [_make_service(f"SVC{i:03d}") for i in range(100)]
+    page2 = [_make_service("TARGET_SVC")]
+    target_domain = _make_domain_entry(DOMAIN)
+    other_domain = _make_domain_entry("other.example.com")
+
+    def list_services_side_effect(**kwargs: object) -> list[MagicMock]:
+        return page1 if kwargs.get("page") == 1 else page2
+
+    def list_service_domains_side_effect(svc_id: str) -> list[MagicMock]:
+        return [target_domain] if svc_id == "TARGET_SVC" else [other_domain]
+
+    with (
+        patch("concourse.service_api.ServiceApi") as MockServiceApi,
+        patch("concourse.fastly.ApiClient"),
+        patch("concourse.fastly.Configuration"),
+    ):
+        MockServiceApi.return_value.list_services.side_effect = (
+            list_services_side_effect
+        )
+        MockServiceApi.return_value.list_service_domains.side_effect = (
+            list_service_domains_side_effect
+        )
+        with resource_by_domain._api_client() as client:
+            result = resource_by_domain._lookup_service_id_by_domain(client, DOMAIN)
+
+    assert result == "TARGET_SVC"
+
+
+def test_check_uses_domain_lookup(resource_by_domain: FastlyResource) -> None:
+    """Check resolves the service ID via domain when service_id is not set."""
+    mock_ver = make_version_response(3, active=True)
+    with (
+        patch.object(
+            resource_by_domain, "_lookup_service_id_by_domain", return_value=SERVICE_ID
+        ),
+        patch.object(resource_by_domain, "_active_version", return_value=mock_ver),
+        patch.object(resource_by_domain, "_api_client"),
+    ):
+        versions = resource_by_domain.fetch_new_versions(None)
+    assert versions == [FastlyVersion(service_version="3")]
+
+
+def test_put_uses_domain_lookup(
+    resource_by_domain: FastlyResource, tmp_path: Path
+) -> None:
+    """Put resolves the service ID via domain for purge operations."""
+    purge_mock = _mock_purge_client()
+    with (
+        patch("concourse.purge_api.PurgeApi", return_value=purge_mock),
+        patch.object(
+            resource_by_domain, "_lookup_service_id_by_domain", return_value=SERVICE_ID
+        ),
+        patch("concourse.fastly.ApiClient"),
+        patch("concourse.fastly.Configuration"),
+    ):
+        resource_by_domain.publish_new_version(
+            tmp_path, mock_build_metadata(), mode="purge_all"
+        )
+    purge_mock.purge_all.assert_called_once_with(SERVICE_ID)

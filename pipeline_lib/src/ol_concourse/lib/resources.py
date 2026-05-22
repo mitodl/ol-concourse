@@ -561,7 +561,8 @@ def release_resource(  # noqa: PLR0913
 def fastly_service(
     name: Identifier,
     api_token: str = "((fastly.api_token))",  # noqa: S107
-    service_id: str = "((fastly.service_id))",
+    service_id: str = "",
+    domain: str = "",
     check_every: str = "1h",
 ) -> Resource:
     """Generate a Fastly resource for the given service.
@@ -570,28 +571,43 @@ def fastly_service(
     can download VCL content for downstream linting or auditing (``get``), and
     performs instant cache purges (``put``).
 
+    Either *service_id* or *domain* must be supplied; *service_id* takes
+    precedence when both are set.  When only *domain* is given, the resource
+    resolves the service ID at runtime by listing all services in the account
+    and matching on domain name.
+
     Pair with :func:`~ol_concourse.lib.resource_types.fastly_resource_type` to
     register the custom resource type in the same pipeline.
 
     :param name: Resource name used across pipeline steps.
     :param api_token: Fastly API token.  Needs ``purge_select`` scope for
-        purge-only pipelines or ``global`` scope when VCL fetching is used
-        (default: ``((fastly.api_token))``).
+        purge-only pipelines or ``global:read`` scope when VCL fetching is used
+        (default: ``((fastly.api_token))``).  Token must additionally have
+        ``global:read`` scope when *domain* lookup is used (to call
+        ``GET /service`` and ``GET /service/{id}/domain``).
     :param service_id: Alphanumeric Fastly service ID.  May be overridden per
         step via params when multiple environments share a single resource
-        definition (default: ``((fastly.service_id))``).
+        definition.  Takes precedence over *domain* when both are set.
+    :param domain: Hostname served by the target Fastly service (e.g.
+        ``"www.example.com"``).  Used to resolve the service ID automatically
+        when *service_id* is not supplied.
     :param check_every: How often Concourse polls for VCL version changes
         (default: ``1h``).  Set to ``"never"`` for purge-only pipelines where
         triggering on VCL activations is not desired.
     :returns: A configured Concourse fastly resource.
     """
+    if not service_id and not domain:
+        msg = "Either service_id or domain must be supplied to fastly_service()"
+        raise ValueError(msg)
+    source: dict[str, str] = {"api_token": api_token}
+    if service_id:
+        source["service_id"] = service_id
+    if domain:
+        source["domain"] = domain
     return Resource(
         name=name,
         type="fastly",
         icon="lightning-bolt",
         check_every=check_every,
-        source={
-            "api_token": api_token,
-            "service_id": service_id,
-        },
+        source=source,
     )

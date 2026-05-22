@@ -10,7 +10,16 @@ Example source configuration:
       type: fastly
       source:
         api_token: ((fastly.api_token))
-        service_id: ((fastly.service_id))
+        service_id: ((fastly.service_id))   # use service_id OR domain, not both
+
+  # Alternatively, identify the service by the domain it serves:
+
+  resources:
+    - name: my-fastly-service
+      type: fastly
+      source:
+        api_token: ((fastly.api_token))
+        domain: www.example.com
 
   resource_types:
     - name: fastly
@@ -81,13 +90,14 @@ if TYPE_CHECKING:
 
 import fastly
 from concoursetools import BuildMetadata, ConcourseResource, TypedVersion
-from fastly.api import purge_api, vcl_api, version_api
+from fastly.api import purge_api, service_api, vcl_api, version_api
 
 PurgeMode = Literal["purge_all", "surrogate_key", "surrogate_keys", "url"]
 FetchVcl = Literal["generated", "custom", "both", False]
 
 _VALID_FETCH_VCL: frozenset[object] = frozenset({"generated", "custom", "both", False})
 _MAX_SURROGATE_KEYS = 256
+_SERVICE_PAGE_SIZE = 100
 
 
 @dataclass(unsafe_hash=True)
@@ -110,6 +120,7 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
         /,
         api_token: str,
         service_id: str = "",
+        domain: str = "",
     ) -> None:
         """Initialise the Fastly resource.
 
@@ -118,11 +129,18 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
                 purge-only pipelines, or ``global:read`` scope if VCL fetching is used.
             service_id: Alphanumeric Fastly service ID.  Required for all
                 operations except ``url``-mode purges; may also be supplied as a
-                put param to override this default.
+                put param to override this default.  Takes precedence over
+                *domain* when both are set.
+            domain: Hostname served by the target Fastly service (e.g.
+                ``"www.example.com"``).  Used to look up the service ID
+                automatically when *service_id* is not supplied.  The lookup
+                paginates ``GET /service`` and inspects ``GET /service/{id}/domain``
+                until a match is found.  Ignored when *service_id* is set.
         """
         super().__init__(FastlyVersion)
         self.api_token = api_token
         self.service_id = service_id
+        self.domain = domain
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -152,20 +170,87 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
         # The list is ordered oldest-to-newest; return the highest number.
         return max(active, key=lambda v: v.number)
 
+    def _lookup_service_id_by_domain(
+        self, client: fastly.ApiClient, domain: str
+    ) -> str:
+        """Return the service ID of the Fastly service that serves *domain*.
+
+        Paginates ``ServiceApi.list_services`` and calls
+        ``ServiceApi.list_service_domains`` for each service until a domain
+        entry whose ``name`` matches *domain* is found.
+
+        Args:
+            client: An authenticated Fastly API client.
+            domain: Exact hostname to search for (e.g. ``"www.example.com"``).
+
+        Returns:
+            The alphanumeric Fastly service ID.
+
+        Raises:
+            ValueError: when no service in the account has *domain* configured.
+        """
+        svc_api = service_api.ServiceApi(client)
+        page = 1
+        while True:
+            services = svc_api.list_services(per_page=100, page=page)
+            if not services:
+                break
+            for svc in services:
+                svc_id = svc.id
+                if not svc_id:
+                    continue
+                for d in svc_api.list_service_domains(svc_id):
+                    if d.name == domain:
+                        return svc_id
+            if len(services) < _SERVICE_PAGE_SIZE:
+                break
+            page += 1
+        msg = f"No Fastly service found with domain {domain!r}"
+        raise ValueError(msg)
+
+    def _get_service_id(self, override: str | None, client: fastly.ApiClient) -> str:
+        """Resolve the effective service ID.
+
+        Priority: step-level *override* → source-level ``service_id`` →
+        domain lookup via ``_lookup_service_id_by_domain``.
+
+        Args:
+            override: Step-level ``service_id`` param, or ``None``.
+            client: An authenticated Fastly API client (required for domain
+                lookup; unused when ``service_id`` is already known).
+
+        Raises:
+            ValueError: when no service ID can be determined.
+        """
+        resolved = override or self.service_id
+        if resolved:
+            return resolved
+        if self.domain:
+            return self._lookup_service_id_by_domain(client, self.domain)
+        msg = (
+            "One of service_id or domain must be set in the resource source "
+            "configuration, or service_id must be supplied as a step param"
+        )
+        raise ValueError(msg)
+
     def _resolve_service_id(self, override: str | None) -> str:
         """Return *override* if provided, otherwise fall back to source service_id.
 
+        Does not perform domain lookup.  Use :meth:`_get_service_id` when a
+        ``fastly.ApiClient`` is already open.
+
         Raises:
-            ValueError: when neither the source nor the override supplies an ID.
+            ValueError: when neither the source nor the override supplies an ID
+                and no domain is configured.
         """
         resolved = override or self.service_id
-        if not resolved:
+        if not resolved and not self.domain:
             msg = (
-                "service_id must be set either in the resource source configuration "
-                "or supplied as a step param"
+                "One of service_id or domain must be set in the resource source "
+                "configuration, or service_id must be supplied as a step param"
             )
             raise ValueError(msg)
-        return resolved
+        return resolved  # may be "" when domain lookup is deferred
 
     # ------------------------------------------------------------------
     # check
@@ -183,6 +268,8 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
         """
         service_id = self._resolve_service_id(None)
         with self._api_client() as client:
+            if not service_id:
+                service_id = self._lookup_service_id_by_domain(client, self.domain)
             active = self._active_version(client, service_id)
 
         current = FastlyVersion(service_version=str(active.number))
@@ -227,10 +314,9 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
                 ``..`` components.  Defaults to ``"vcl"``.
             service_id: Override the source-level service ID for this step.
         """
-        resolved_service_id = self._resolve_service_id(service_id)
-        version_number = int(version.service_version)
-
         with self._api_client() as client:
+            resolved_service_id = self._get_service_id(service_id, client)
+            version_number = int(version.service_version)
             ver = version_api.VersionApi(client).get_service_version(
                 resolved_service_id, version_number
             )
@@ -361,7 +447,7 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
 
             match mode:
                 case "purge_all":
-                    resolved = self._resolve_service_id(service_id)
+                    resolved = self._get_service_id(service_id, client)
                     purge_client.purge_all(resolved)
                     metadata["service_id"] = resolved
 
@@ -371,7 +457,7 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
                             "surrogate_key param is required when mode='surrogate_key'"
                         )
                         raise ValueError(msg)
-                    resolved = self._resolve_service_id(service_id)
+                    resolved = self._get_service_id(service_id, client)
                     purge_client.purge_tag(
                         resolved,
                         surrogate_key,
@@ -393,7 +479,7 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
                             f"{_MAX_SURROGATE_KEYS} keys; got {len(surrogate_keys)}"
                         )
                         raise ValueError(msg)
-                    resolved = self._resolve_service_id(service_id)
+                    resolved = self._get_service_id(service_id, client)
                     purge_client.bulk_purge_tag(
                         resolved,
                         surrogate_key=" ".join(surrogate_keys),

@@ -15,20 +15,39 @@ resource_types:
 
 ## Source Configuration
 
+Identify the service by its opaque ID or by a domain it serves — one of the
+two must be provided.
+
+**By service ID:**
+
 ```yaml
 resources:
   - name: my-fastly-service
     type: fastly
     source:
-      api_token: ((fastly.api_token))   # required
-      service_id: ((fastly.service_id)) # required for check/get; may be
-                                        # overridden per step via params
+      api_token: ((fastly.api_token))
+      service_id: ((fastly.service_id))
+```
+
+**By domain (resolved at runtime):**
+
+```yaml
+resources:
+  - name: my-fastly-service
+    type: fastly
+    source:
+      api_token: ((fastly.api_token))
+      domain: www.example.com
 ```
 
 | field | type | required | description |
 |---|---|---|---|
-| `api_token` | string | yes | Fastly API token. Needs `purge_select` scope for purge-only use; `global:read` scope to fetch VCL. |
-| `service_id` | string | no* | Alphanumeric Fastly service ID. Required for `check`/`get` and all `put` modes except `url`. May be overridden per step. |
+| `api_token` | string | yes | Fastly API token. Needs `purge_select` scope for purge-only use; `global:read` scope to fetch VCL or resolve a service by domain. |
+| `service_id` | string | no† | Alphanumeric Fastly service ID. Required unless `domain` is set. May be overridden per step. Takes precedence over `domain` when both are set. |
+| `domain` | string | no† | Hostname served by the target service (e.g. `www.example.com`). The resource lists all services in the account at runtime and matches on domain name. Ignored when `service_id` is also set. |
+
+† Exactly one of `service_id` or `domain` must be set for `check`/`get` and
+all `put` modes except `url`.
 
 ## Behaviour
 
@@ -207,7 +226,8 @@ jobs:
 
 | operation | minimum scope |
 |---|---|
-| `check` / `get` (metadata only) | `global:read` |
+| `check` / `get` (metadata only, `service_id` configured) | `global:read` |
+| `check` / `get` (domain lookup) | `global:read` |
 | `get` with `fetch_vcl` | `global:read` |
 | `put` (any purge mode) | `purge_select` or `purge_all` |
 
