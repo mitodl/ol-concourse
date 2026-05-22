@@ -556,3 +556,42 @@ def release_resource(  # noqa: PLR0913
         webhook_token=webhook_token,
         source=source,
     )
+
+
+def fastly_service(
+    name: Identifier,
+    api_token: str = "((fastly.api_token))",  # noqa: S107
+    service_id: str = "((fastly.service_id))",
+    check_every: str = "1h",
+) -> Resource:
+    """Generate a Fastly resource for the given service.
+
+    The resource tracks the active VCL version number on the service (``check``),
+    can download VCL content for downstream linting or auditing (``get``), and
+    performs instant cache purges (``put``).
+
+    Pair with :func:`~ol_concourse.lib.resource_types.fastly_resource_type` to
+    register the custom resource type in the same pipeline.
+
+    :param name: Resource name used across pipeline steps.
+    :param api_token: Fastly API token.  Needs ``purge_select`` scope for
+        purge-only pipelines or ``global`` scope when VCL fetching is used
+        (default: ``((fastly.api_token))``).
+    :param service_id: Alphanumeric Fastly service ID.  May be overridden per
+        step via params when multiple environments share a single resource
+        definition (default: ``((fastly.service_id))``).
+    :param check_every: How often Concourse polls for VCL version changes
+        (default: ``1h``).  Set to ``"never"`` for purge-only pipelines where
+        triggering on VCL activations is not desired.
+    :returns: A configured Concourse fastly resource.
+    """
+    return Resource(
+        name=name,
+        type="fastly",
+        icon="lightning-bolt",
+        check_every=check_every,
+        source={
+            "api_token": api_token,
+            "service_id": service_id,
+        },
+    )

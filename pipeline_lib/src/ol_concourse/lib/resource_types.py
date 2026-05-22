@@ -31,9 +31,7 @@ def github_deployments_resource() -> ResourceType:
     return ResourceType(
         name=Identifier("github-deployments"),
         type=REGISTRY_IMAGE,
-        source=RegistryImage(
-            repository="mitodl/concourse-github-deployments-resource"
-        ),
+        source=RegistryImage(repository="mitodl/concourse-github-deployments-resource"),
     )
 
 
@@ -136,4 +134,13 @@ def slack_notification_resource() -> ResourceType:
         source=RegistryImage(
             repository="arbourd/concourse-slack-alert-resource", tag="v0.15.0"
         ),
+    )
+
+
+def fastly_resource_type() -> ResourceType:
+    """Return the ResourceType definition for the Fastly cache management resource."""
+    return ResourceType(
+        name=Identifier("fastly"),
+        type=REGISTRY_IMAGE,
+        source=RegistryImage(repository="mitodl/concourse-fastly-resource"),
     )
