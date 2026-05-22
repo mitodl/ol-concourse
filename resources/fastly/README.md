@@ -27,7 +27,7 @@ resources:
 
 | field | type | required | description |
 |---|---|---|---|
-| `api_token` | string | yes | Fastly API token. Needs `purge_select` scope for purge-only use; `global` scope to fetch VCL. |
+| `api_token` | string | yes | Fastly API token. Needs `purge_select` scope for purge-only use; `global:read` scope to fetch VCL. |
 | `service_id` | string | no* | Alphanumeric Fastly service ID. Required for `check`/`get` and all `put` modes except `url`. May be overridden per step. |
 
 ## Behaviour

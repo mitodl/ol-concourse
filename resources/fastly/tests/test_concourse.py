@@ -40,7 +40,7 @@ def make_version_response(
 
     mock = MagicMock()
     mock.number = number
-    mock.get = lambda key, default=None: active if key == "active" else default
+    mock.active = active
     mock.updated_at = datetime.fromisoformat(updated_at)
     return mock
 
@@ -147,11 +147,9 @@ def _make_vcl_response(
     content: str, name: str = "main_vcl", main: bool = True
 ) -> MagicMock:
     m = MagicMock()
-    m.get = lambda key, default=None: {
-        "content": content,
-        "name": name,
-        "main": main,
-    }.get(key, default)
+    m.name = name
+    m.content = content
+    m.main = main
     return m
 
 
@@ -181,9 +179,7 @@ def test_get_fetch_vcl_generated(resource: FastlyResource, tmp_path: Path) -> No
     """Get with fetch_vcl='generated' writes vcl/generated.vcl."""
     mock_ver = make_version_response(12, active=True)
     mock_generated = MagicMock()
-    mock_generated.get = lambda key, default=None: (
-        "sub vcl_recv { pass; }" if key == "content" else default
-    )
+    mock_generated.content = "sub vcl_recv { pass; }"
 
     with (
         patch("concourse.version_api.VersionApi") as MockVersionApi,
@@ -231,9 +227,7 @@ def test_get_fetch_vcl_both(resource: FastlyResource, tmp_path: Path) -> None:
     """Get with fetch_vcl='both' writes generated.vcl and custom files."""
     mock_ver = make_version_response(12, active=True)
     mock_generated = MagicMock()
-    mock_generated.get = lambda key, default=None: (
-        "# generated" if key == "content" else default
-    )
+    mock_generated.content = "# generated"
     vcl_file = _make_vcl_response("# custom", name="my_vcl", main=True)
 
     with (
@@ -260,9 +254,7 @@ def test_get_custom_vcl_dir(resource: FastlyResource, tmp_path: Path) -> None:
     """The vcl_dir param controls where VCL files are written."""
     mock_ver = make_version_response(3, active=True)
     mock_generated = MagicMock()
-    mock_generated.get = lambda key, default=None: (
-        "# g" if key == "content" else default
-    )
+    mock_generated.content = "# g"
 
     with (
         patch("concourse.version_api.VersionApi") as MockVersionApi,
@@ -476,3 +468,126 @@ def test_put_missing_service_id_raises(
         resource_no_service.publish_new_version(
             tmp_path, mock_build_metadata(), mode="purge_all"
         )
+
+
+def test_put_surrogate_keys_over_limit_raises(
+    resource: FastlyResource, tmp_path: Path
+) -> None:
+    """Passing more than 256 surrogate keys raises ValueError before the API call."""
+    too_many = [f"key-{i}" for i in range(257)]
+    with pytest.raises(ValueError, match="at most 256 keys"):
+        resource.publish_new_version(
+            tmp_path,
+            mock_build_metadata(),
+            mode="surrogate_keys",
+            surrogate_keys=too_many,
+        )
+
+
+def test_check_rollback_returns_current(resource: FastlyResource) -> None:
+    """Check emits the current (lower) version when an older version is re-activated."""
+    previous = FastlyVersion(service_version="10")
+    with _patch_active(resource, 7), patch.object(resource, "_api_client"):
+        versions = resource.fetch_new_versions(previous)
+    assert versions == [FastlyVersion(service_version="7")]
+
+
+def test_get_fetch_vcl_true_raises(resource: FastlyResource, tmp_path: Path) -> None:
+    """fetch_vcl=True raises ValueError; only the named literals are accepted."""
+    mock_ver = make_version_response(5, active=True)
+    with (
+        patch("concourse.version_api.VersionApi") as MockVersionApi,
+        patch("concourse.fastly.ApiClient"),
+        patch("concourse.fastly.Configuration"),
+        pytest.raises(ValueError, match="fetch_vcl must be one of"),
+    ):
+        MockVersionApi.return_value.get_service_version.return_value = mock_ver
+        resource.download_version(
+            FastlyVersion(service_version="5"),
+            tmp_path,
+            mock_build_metadata(),
+            fetch_vcl=True,  # type: ignore[arg-type]
+        )
+
+
+def test_get_vcl_dir_absolute_raises(resource: FastlyResource, tmp_path: Path) -> None:
+    """vcl_dir as an absolute path raises ValueError."""
+    mock_ver = make_version_response(5, active=True)
+    with (
+        patch("concourse.version_api.VersionApi") as MockVersionApi,
+        patch("concourse.fastly.ApiClient"),
+        patch("concourse.fastly.Configuration"),
+        pytest.raises(ValueError, match="vcl_dir must be a relative path"),
+    ):
+        MockVersionApi.return_value.get_service_version.return_value = mock_ver
+        resource.download_version(
+            FastlyVersion(service_version="5"),
+            tmp_path,
+            mock_build_metadata(),
+            fetch_vcl="generated",
+            vcl_dir="/var/evil",
+        )
+
+
+def test_get_vcl_dir_traversal_raises(resource: FastlyResource, tmp_path: Path) -> None:
+    """vcl_dir containing '..' raises ValueError."""
+    mock_ver = make_version_response(5, active=True)
+    with (
+        patch("concourse.version_api.VersionApi") as MockVersionApi,
+        patch("concourse.fastly.ApiClient"),
+        patch("concourse.fastly.Configuration"),
+        pytest.raises(ValueError, match="vcl_dir must be a relative path"),
+    ):
+        MockVersionApi.return_value.get_service_version.return_value = mock_ver
+        resource.download_version(
+            FastlyVersion(service_version="5"),
+            tmp_path,
+            mock_build_metadata(),
+            fetch_vcl="generated",
+            vcl_dir="../../etc",
+        )
+
+
+def test_get_vcl_unsafe_name_raises(resource: FastlyResource, tmp_path: Path) -> None:
+    """A VCL file whose API name contains a path separator raises ValueError."""
+    mock_ver = make_version_response(5, active=True)
+    evil_file = _make_vcl_response("# evil", name="../escape", main=False)
+    with (
+        patch("concourse.version_api.VersionApi") as MockVersionApi,
+        patch("concourse.vcl_api.VclApi") as MockVclApi,
+        patch("concourse.fastly.ApiClient"),
+        patch("concourse.fastly.Configuration"),
+        pytest.raises(ValueError, match="Unsafe VCL name"),
+    ):
+        MockVersionApi.return_value.get_service_version.return_value = mock_ver
+        MockVclApi.return_value.list_custom_vcl.return_value = [evil_file]
+        resource.download_version(
+            FastlyVersion(service_version="5"),
+            tmp_path,
+            mock_build_metadata(),
+            fetch_vcl="custom",
+        )
+
+
+def test_validate_vcl_name_valid() -> None:
+    """_validate_vcl_name returns the name unchanged for safe names."""
+    from concourse import _validate_vcl_name
+
+    assert _validate_vcl_name("my-vcl") == "my-vcl"
+    assert _validate_vcl_name("recv_handler") == "recv_handler"
+
+
+def test_validate_vcl_name_slash_raises() -> None:
+    """_validate_vcl_name raises ValueError for names containing '/'."""
+    from concourse import _validate_vcl_name
+
+    with pytest.raises(ValueError, match="Unsafe VCL name"):
+        _validate_vcl_name("dir/traversal")
+
+
+def test_validate_vcl_name_dotdot_raises() -> None:
+    """_validate_vcl_name raises ValueError for names starting with '.'."""
+    from concourse import _validate_vcl_name
+
+    with pytest.raises(ValueError, match="Unsafe VCL name"):
+        _validate_vcl_name(".hidden")
