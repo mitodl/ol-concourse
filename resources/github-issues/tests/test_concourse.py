@@ -43,7 +43,7 @@ def mock_build_metadata(**kwargs) -> BuildMetadata:
 
 
 # Helper function to create mock Issue objects
-def create_mock_issue(  # noqa: PLR0913
+def create_mock_issue(
     number: int,
     title: str,
     state: str,
@@ -112,8 +112,9 @@ MOCK_ISSUES_DATA = [
     },
 ]
 
-MOCK_ISSUES = [  # type: ignore [arg-type]
-    create_mock_issue(**data) for data in MOCK_ISSUES_DATA
+MOCK_ISSUES = [
+    create_mock_issue(**data)  # type: ignore[arg-type]
+    for data in MOCK_ISSUES_DATA
 ]
 
 
@@ -124,29 +125,39 @@ def mock_github():
         mock_gh_instance = MockGithub.return_value
         mock_repo = MagicMock()
         mock_repo.full_name = (
-            "test/repo"
-        )  # Set the full_name attribute for search queries
+            "test/repo"  # Set the full_name attribute for search queries
+        )
         mock_gh_instance.get_repo.return_value = mock_repo
         yield mock_gh_instance, mock_repo
 
 
 @pytest.mark.parametrize(
-    "config_state, config_prefix, expected_issue_numbers",
+    "config_state, config_prefix, expected_issue_number",
     [
-        ("closed", "[bot]", {1}),  # Only closed issues with prefix
-        ("closed", None, {1, 2}),  # All closed issues
-        ("open", "[bot]", {3}),  # Only open issues with prefix
-        ("open", None, {3, 4}),  # All open issues
+        # GitHub returns issues newest-first, so the mock list is reversed
+        # (highest number last → first in the reversed list).
+        # [2,1] for closed, [4,3] for open.
+        ("closed", "[bot]", 1),  # [2,1]: issue 2 has no prefix, issue 1 matches
+        ("closed", None, 2),  # [2,1]: issue 2 is the first (most-recent) match
+        ("open", "[bot]", 3),  # [4,3]: issue 4 has no prefix, issue 3 matches
+        ("open", None, 4),  # [4,3]: issue 4 is the first (most-recent) match
     ],
 )
 def test_fetch_new_versions_no_previous(
-    mock_github, config_state, config_prefix, expected_issue_numbers
+    mock_github, config_state, config_prefix, expected_issue_number
 ):
-    """Test fetching versions without a previous version."""
+    """First check returns only the single most-recent matching version.
+
+    Concourse only needs the latest version to seed its state on the first
+    check, so we stop scanning as soon as we find one match rather than
+    returning the entire history.
+    """
     mock_gh_instance, mock_repo = mock_github
 
-    # Filter mock issues based on the expected state for the API call
-    api_call_issues = [issue for issue in MOCK_ISSUES if issue.state == config_state]
+    # GitHub API returns issues newest-first; simulate that ordering.
+    api_call_issues = [
+        issue for issue in reversed(MOCK_ISSUES) if issue.state == config_state
+    ]
     mock_repo.get_issues.return_value = api_call_issues
 
     resource = ConcourseGithubIssuesResource(
@@ -157,11 +168,11 @@ def test_fetch_new_versions_no_previous(
     )
     wrapper = SimpleTestResourceWrapper(resource)
 
-    # We pass None as previous_version to fetch_new_versions
     versions = wrapper.fetch_new_versions(None)
     version_numbers = {v.issue_number for v in versions}
 
-    assert version_numbers == expected_issue_numbers
+    # Exactly one version is returned: the most-recent matching issue.
+    assert version_numbers == {expected_issue_number}
     # Verify get_issues was called with the correct state and no 'since'
     mock_repo.get_issues.assert_called_once_with(
         state=config_state, labels=[], since=NotSet
@@ -308,48 +319,61 @@ def test_fetch_new_versions_with_prefix_and_previous(mock_github):
 
 
 def test_fetch_new_versions_limit_old(mock_github):
-    """Test that limit_old_versions restricts the number of issues returned."""
+    """limit_old_versions caps results on the incremental (with-previous) path.
+
+    The first-check path always returns a single version regardless of
+    limit_old_versions; the cap only applies when there IS a previous version
+    and multiple new issues have appeared since then.
+    """
     mock_gh_instance, mock_repo = mock_github
 
-    # Create more mock issues to test limiting
-    more_mock_issues = [
+    # Five new closed issues, all created/closed after the previous version.
+    # GitHub returns newest first, so order them descending by number.
+    new_issues = [
         create_mock_issue(
             number=i,
-            title=f"[bot] Old Issue {i}",
+            title=f"[bot] New Issue {i}",
             state="closed",
-            created_at=NOW - timedelta(days=10 + i),
-            closed_at=NOW - timedelta(days=5 + i),
+            created_at=NOW - timedelta(hours=10 - i),
+            closed_at=NOW - timedelta(hours=10 - i),
         )
-        for i in range(5, 10)  # Issues 5, 6, 7, 8, 9
-    ] + MOCK_ISSUES  # Add existing mocks
-
-    # Sort by closed_at descending to simulate typical GitHub API order
-    # (our internal logic sorts by number ascending after filtering).
-    api_call_issues = sorted(
-        [issue for issue in more_mock_issues if issue.state == "closed"],
-        key=lambda i: i.closed_at,
-        reverse=True,  # Simulate typical GitHub API order (newest first)
-    )
+        for i in range(5, 10)  # Issues 5..9
+    ]
+    # Simulate GitHub newest-first ordering: 9, 8, 7, 6, 5
+    api_call_issues = list(reversed(new_issues))
     mock_repo.get_issues.return_value = api_call_issues
+
+    previous_version = ConcourseGithubIssuesVersion(
+        issue_number=1,
+        issue_title="[bot] Issue 1",
+        issue_state="closed",
+        issue_created_at=T_MINUS_3.strftime(ISO_8601_FORMAT),
+        issue_closed_at=T_MINUS_2.strftime(ISO_8601_FORMAT),
+        issue_url="http://example.com/issue/1",
+    )
+    parsed_closed_at = datetime.strptime(  # noqa: DTZ007
+        previous_version.issue_closed_at,  # type: ignore[arg-type]
+        ISO_8601_FORMAT,
+    )
+    expected_since = parsed_closed_at + timedelta(seconds=1)
 
     resource = ConcourseGithubIssuesResource(
         repository="test/repo",
         access_token="dummy_token",
         issue_state="closed",
         issue_prefix="[bot]",
-        limit_old_versions=2,  # Limit to 2 oldest matching issues
+        limit_old_versions=2,
     )
     wrapper = SimpleTestResourceWrapper(resource)
 
-    versions = wrapper.fetch_new_versions(None)  # No previous version
+    versions = wrapper.fetch_new_versions(previous_version)
     version_numbers = {v.issue_number for v in versions}
 
-    # Expected: Issues 1, 5, 6, 7, 8, 9 match state and prefix.
-    # get_matching_issues sorts by number ascending: 1, 5, 6, 7, 8, 9
-    # limit_old_versions=2 takes the first 2: 1, 5
-    assert version_numbers == {1, 5}
+    # get_matching_issues iterates newest-first [9,8,7,6,5], collects the
+    # first 2 matches [9,8] (limit_old_versions=2), then sorts ascending.
+    assert version_numbers == {8, 9}
     mock_repo.get_issues.assert_called_once_with(
-        state="closed", labels=[], since=NotSet
+        state="closed", labels=[], since=expected_since
     )
 
 
@@ -425,8 +449,7 @@ def test_publish_new_version_creates_new_issue(mock_github):
         access_token="dummy_token",
         issue_state="open",  # Important for publish logic
         issue_title_template=(
-            "[bot] Pipeline {BUILD_PIPELINE_NAME}"
-            " task {BUILD_JOB_NAME} completed"
+            "[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed"
         ),
         issue_body_template="Build {BUILD_NAME} finished.",
         assignees=["user1"],
@@ -485,8 +508,7 @@ def test_publish_new_version_comments_on_existing(mock_github):
         access_token="dummy_token",
         issue_state="open",
         issue_title_template=(
-            "[bot] Pipeline {BUILD_PIPELINE_NAME}"
-            " task {BUILD_JOB_NAME} completed"
+            "[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed"
         ),
         issue_body_template="Build {BUILD_NAME} finished.",
     )
@@ -686,7 +708,7 @@ def test_timeout_default(mock_github):
             access_token="dummy_token",
         )
         _, kwargs = MockGithub.call_args
-        assert kwargs["timeout"] == 30  # noqa: PLR2004
+        assert kwargs["timeout"] == 30
 
 
 def test_timeout_configurable(mock_github):
@@ -699,4 +721,4 @@ def test_timeout_configurable(mock_github):
             timeout=60,
         )
         _, kwargs = MockGithub.call_args
-        assert kwargs["timeout"] == 60  # noqa: PLR2004
+        assert kwargs["timeout"] == 60

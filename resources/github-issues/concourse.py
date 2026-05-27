@@ -81,8 +81,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         auth_method: Literal["token", "app"] = "token",
         issue_state: Literal["open", "closed"] = "closed",
         issue_title_template: str = (
-            "[bot] Pipeline {BUILD_PIPELINE_NAME}"
-            " task {BUILD_JOB_NAME} completed"
+            "[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed"
         ),
         issue_body_template: str = textwrap.dedent(
             """\
@@ -190,34 +189,60 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         matching_issues.sort(key=lambda issue: issue.number)
         return matching_issues
 
+    def _get_latest_matching_issue(self) -> "Issue | None":
+        """Return the single most-recent matching issue, or None.
+
+        Iterates the GitHub API PaginatedList (newest first by default) and
+        stops as soon as the first qualifying issue is found, so at most one
+        page of results is fetched rather than the entire history.
+        """
+        for issue in self.get_all_issues():
+            if not issue.title.startswith(self.issue_prefix or ""):
+                continue
+            if self.skip_if_labeled:
+                issue_label_names = {lbl.name for lbl in issue.labels}
+                if issue_label_names.intersection(self.skip_if_labeled):
+                    continue
+            return issue
+        return None
+
     def fetch_new_versions(
         self, previous_version: ConcourseGithubIssuesVersion | None = None
     ) -> set[ConcourseGithubIssuesVersion]:
-        """Fetch new versions since the previous one."""
-        since_datetime: datetime | None = None
-        if previous_version:
-            timestamp_str: str | None = None
-            if self.issue_state == "closed":
-                timestamp_str = previous_version.issue_closed_at
-            elif self.issue_state == "open":
-                timestamp_str = previous_version.issue_created_at
+        """Fetch new versions since the previous one.
 
-            if timestamp_str:
-                try:
-                    # Add a small buffer (1 second) to avoid potential clock skew issues
-                    # or fetching the exact same event again.
-                    since_datetime = datetime.strptime(  # noqa: DTZ007
-                        timestamp_str, ISO_8601_FORMAT
-                    ) + timedelta(seconds=1)
-                except ValueError:
-                    # Handle cases where the timestamp might be invalid
-                    print(f"Warning: Could not parse timestamp {timestamp_str}")  # noqa: T201
-                    # Proceed without 'since' if parsing fails
+        On the first check (no previous version), Concourse only needs the
+        current latest version to seed its state.  Scanning the full issue
+        history is expensive, so we stop at the first (most-recent) match
+        instead of exhausting the paginated API.
+        """
+        if previous_version is None:
+            latest = self._get_latest_matching_issue()
+            if latest:
+                return {self._to_version(latest)}
+            return set()
+
+        since_datetime: datetime | None = None
+        timestamp_str: str | None = None
+        if self.issue_state == "closed":
+            timestamp_str = previous_version.issue_closed_at
+        elif self.issue_state == "open":
+            timestamp_str = previous_version.issue_created_at
+
+        if timestamp_str:
+            try:
+                # Add a small buffer (1 second) to avoid potential clock skew
+                # issues or fetching the exact same event again.
+                since_datetime = datetime.strptime(  # noqa: DTZ007
+                    timestamp_str, ISO_8601_FORMAT
+                ) + timedelta(seconds=1)
+            except ValueError:
+                print(f"Warning: Could not parse timestamp {timestamp_str}")  # noqa: T201
 
         matching_issues = self.get_matching_issues(since=since_datetime)
         versions = {self._to_version(issue) for issue in matching_issues}
         # Filter out the previous_version itself if it happens to be included
-        if previous_version and previous_version in versions:
+        if previous_version in versions:
             versions.remove(previous_version)
         return versions
 
