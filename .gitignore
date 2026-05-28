@@ -36,3 +36,5 @@ resources/*/requirements.txt
 
 # Aider
 .aider*
+resources/fastly/.pi-lens/
+resources/fastly/.pi-lens/

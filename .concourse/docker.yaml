@@ -1,568 +1,635 @@
 ---
 resources:
-  - name: ol-concourse-packer-src
-    type: git
-    icon: github
-    source:
-      uri: https://github.com/mitodl/ol-concourse
-      branch: main
-      paths:
-        - resources/packer
-        - uv.lock
-        - pyproject.toml
+- name: ol-concourse-packer-src
+  type: git
+  icon: github
+  source:
+    uri: https://github.com/mitodl/ol-concourse
+    branch: main
+    paths:
+    - resources/packer
+    - uv.lock
+    - pyproject.toml
 
-  - name: ol-concourse-pulumi-src
-    type: git
-    icon: github
-    source:
-      uri: https://github.com/mitodl/ol-concourse
-      branch: main
-      paths:
-        - resources/pulumi
-        - uv.lock
-        - pyproject.toml
+- name: ol-concourse-pulumi-src
+  type: git
+  icon: github
+  source:
+    uri: https://github.com/mitodl/ol-concourse
+    branch: main
+    paths:
+    - resources/pulumi
+    - uv.lock
+    - pyproject.toml
 
-  - name: ol-concourse-github-issues-src
-    type: git
-    icon: github
-    source:
-      uri: https://github.com/mitodl/ol-concourse
-      branch: main
-      paths:
-        - resources/github-issues
-        - uv.lock
-        - pyproject.toml
+- name: ol-concourse-github-issues-src
+  type: git
+  icon: github
+  source:
+    uri: https://github.com/mitodl/ol-concourse
+    branch: main
+    paths:
+    - resources/github-issues
+    - uv.lock
+    - pyproject.toml
 
-  - name: ol-concourse-pypi-src
-    type: git
-    icon: github
-    source:
-      uri: https://github.com/mitodl/ol-concourse
-      branch: main
-      paths:
-        - resources/pypi
-        - uv.lock
-        - pyproject.toml
+- name: ol-concourse-pypi-src
+  type: git
+  icon: github
+  source:
+    uri: https://github.com/mitodl/ol-concourse
+    branch: main
+    paths:
+    - resources/pypi
+    - uv.lock
+    - pyproject.toml
 
-  - name: ol-concourse-npm-src
-    type: git
-    icon: github
-    source:
-      uri: https://github.com/mitodl/ol-concourse
-      branch: main
-      paths:
-        - resources/npm
-        - uv.lock
-        - pyproject.toml
+- name: ol-concourse-npm-src
+  type: git
+  icon: github
+  source:
+    uri: https://github.com/mitodl/ol-concourse
+    branch: main
+    paths:
+    - resources/npm
+    - uv.lock
+    - pyproject.toml
 
-  - name: ol-concourse-github-deployments-src
-    type: git
-    icon: github
-    source:
-      uri: https://github.com/mitodl/ol-concourse
-      branch: main
-      paths:
-        - resources/github-deployments
-        - uv.lock
-        - pyproject.toml
+- name: ol-concourse-github-deployments-src
+  type: git
+  icon: github
+  source:
+    uri: https://github.com/mitodl/ol-concourse
+    branch: main
+    paths:
+    - resources/github-deployments
+    - uv.lock
+    - pyproject.toml
 
-  - name: ol-concourse-release-src
-    type: git
-    icon: github
-    source:
-      uri: https://github.com/mitodl/ol-concourse
-      branch: main
-      paths:
-        - resources/release
-        - uv.lock
-        - pyproject.toml
+- name: ol-concourse-release-src
+  type: git
+  icon: github
+  source:
+    uri: https://github.com/mitodl/ol-concourse
+    branch: main
+    paths:
+    - resources/release
+    - uv.lock
+    - pyproject.toml
 
-  - name: concourse-packer-resource
-    type: registry-image
-    icon: docker
-    source:
-      tag: latest
-      repository: mitodl/concourse-packer-resource
-      username: ((dockerhub.username))
-      password: ((dockerhub.password))
+- name: ol-concourse-fastly-src
+  type: git
+  icon: github
+  source:
+    uri: https://github.com/mitodl/ol-concourse
+    branch: main
+    paths:
+    - resources/fastly
+    - uv.lock
+    - pyproject.toml
 
-  - name: concourse-pulumi-resource
-    type: registry-image
-    icon: docker
-    source:
-      tag: latest
-      repository: mitodl/concourse-pulumi-resource
-      username: ((dockerhub.username))
-      password: ((dockerhub.password))
+- name: concourse-packer-resource
+  type: registry-image
+  icon: docker
+  source:
+    tag: latest
+    repository: mitodl/concourse-packer-resource
+    username: ((dockerhub.username))
+    password: ((dockerhub.password))
 
-  - name: concourse-pulumi-resource-provisioner
-    type: registry-image
-    icon: docker
-    source:
-      tag: latest
-      repository: mitodl/concourse-pulumi-resource-provisioner
-      username: ((dockerhub.username))
-      password: ((dockerhub.password))
+- name: concourse-pulumi-resource
+  type: registry-image
+  icon: docker
+  source:
+    tag: latest
+    repository: mitodl/concourse-pulumi-resource
+    username: ((dockerhub.username))
+    password: ((dockerhub.password))
 
-  - name: concourse-github-issues-resource
-    type: registry-image
-    icon: docker
-    source:
-      tag: latest
-      repository: mitodl/concourse-github-issues-resource
-      username: ((dockerhub.username))
-      password: ((dockerhub.password))
+- name: concourse-pulumi-resource-provisioner
+  type: registry-image
+  icon: docker
+  source:
+    tag: latest
+    repository: mitodl/concourse-pulumi-resource-provisioner
+    username: ((dockerhub.username))
+    password: ((dockerhub.password))
 
-  - name: concourse-pypi-resource
-    type: registry-image
-    icon: docker
-    source:
-      tag: latest
-      repository: mitodl/concourse-pypi-resource
-      username: ((dockerhub.username))
-      password: ((dockerhub.password))
+- name: concourse-github-issues-resource
+  type: registry-image
+  icon: docker
+  source:
+    tag: latest
+    repository: mitodl/concourse-github-issues-resource
+    username: ((dockerhub.username))
+    password: ((dockerhub.password))
 
-  - name: concourse-npm-resource
-    type: registry-image
-    icon: docker
-    source:
-      tag: latest
-      repository: mitodl/concourse-npm-resource
-      username: ((dockerhub.username))
-      password: ((dockerhub.password))
+- name: concourse-pypi-resource
+  type: registry-image
+  icon: docker
+  source:
+    tag: latest
+    repository: mitodl/concourse-pypi-resource
+    username: ((dockerhub.username))
+    password: ((dockerhub.password))
 
-  - name: ol-concourse-task-src
-    type: git
-    icon: github
-    source:
-      uri: https://github.com/mitodl/ol-concourse
-      branch: main
-      paths:
-        - pipeline_lib
-        - uv.lock
-        - pyproject.toml
+- name: concourse-npm-resource
+  type: registry-image
+  icon: docker
+  source:
+    tag: latest
+    repository: mitodl/concourse-npm-resource
+    username: ((dockerhub.username))
+    password: ((dockerhub.password))
 
-  - name: ol-concourse-task-image
-    type: registry-image
-    icon: docker
-    source:
-      tag: latest
-      repository: mitodl/ol-concourse-dsl
-      username: ((dockerhub.username))
-      password: ((dockerhub.password))
+- name: ol-concourse-task-src
+  type: git
+  icon: github
+  source:
+    uri: https://github.com/mitodl/ol-concourse
+    branch: main
+    paths:
+    - pipeline_lib
+    - uv.lock
+    - pyproject.toml
 
-  - name: concourse-github-deployments-resource
-    type: registry-image
-    icon: docker
-    source:
-      tag: latest
-      repository: mitodl/concourse-github-deployments-resource
-      username: ((dockerhub.username))
-      password: ((dockerhub.password))
+- name: ol-concourse-task-image
+  type: registry-image
+  icon: docker
+  source:
+    tag: latest
+    repository: mitodl/ol-concourse-dsl
+    username: ((dockerhub.username))
+    password: ((dockerhub.password))
 
-  - name: concourse-release-resource
-    type: registry-image
-    icon: docker
-    source:
-      tag: latest
-      repository: mitodl/concourse-release-resource
-      username: ((dockerhub.username))
-      password: ((dockerhub.password))
+- name: concourse-github-deployments-resource
+  type: registry-image
+  icon: docker
+  source:
+    tag: latest
+    repository: mitodl/concourse-github-deployments-resource
+    username: ((dockerhub.username))
+    password: ((dockerhub.password))
+
+- name: concourse-release-resource
+  type: registry-image
+  icon: docker
+  source:
+    tag: latest
+    repository: mitodl/concourse-release-resource
+    username: ((dockerhub.username))
+    password: ((dockerhub.password))
+
+- name: concourse-fastly-resource
+  type: registry-image
+  icon: docker
+  source:
+    tag: latest
+    repository: mitodl/concourse-fastly-resource
+    username: ((dockerhub.username))
+    password: ((dockerhub.password))
 
 jobs:
-  - name: build-and-publish-packer-image
-    public: true
-    plan:
-      - get: ol-concourse-packer-src
-        trigger: true
-      - task: generate-requirements
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: ghcr.io/astral-sh/uv
-              tag: python3.13-bookworm
-          inputs:
-            - name: ol-concourse-packer-src
-          outputs:
-            - name: build-context
-          run:
-            path: /bin/sh
-            args:
-              - -exc
-              - |
-                cp -a ol-concourse-packer-src/. build-context/
-                cd build-context
-                uv build --package ol-concourse-packer --out-dir resources/packer/dist/
-      - task: build-image
-        privileged: true
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: concourse/oci-build-task
-          inputs:
-            - name: build-context
-          outputs:
-            - name: image
-          run:
-            path: build
-          params:
-            CONTEXT: build-context/resources/packer
-            DOCKERFILE: build-context/resources/packer/Dockerfile
-      - put: concourse-packer-resource
-        params:
-          image: image/image.tar
-          additional_tags: ol-concourse-packer-src/.git/ref
+- name: build-and-publish-packer-image
+  public: true
+  plan:
+  - get: ol-concourse-packer-src
+    trigger: true
+  - task: generate-requirements
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: ghcr.io/astral-sh/uv
+          tag: python3.13-bookworm
+      inputs:
+      - name: ol-concourse-packer-src
+      outputs:
+      - name: build-context
+      run:
+        path: /bin/sh
+        args:
+        - -exc
+        - |
+          cp -a ol-concourse-packer-src/. build-context/
+          cd build-context
+          uv build --package ol-concourse-packer --out-dir resources/packer/dist/
+  - task: build-image
+    privileged: true
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: concourse/oci-build-task
+      inputs:
+      - name: build-context
+      outputs:
+      - name: image
+      run:
+        path: build
+      params:
+        CONTEXT: build-context/resources/packer
+        DOCKERFILE: build-context/resources/packer/Dockerfile
+  - put: concourse-packer-resource
+    params:
+      image: image/image.tar
+      additional_tags: ol-concourse-packer-src/.git/ref
 
-  - name: build-and-publish-pulumi-image
-    public: true
-    plan:
-      - get: ol-concourse-pulumi-src
-        trigger: true
-      - task: generate-requirements
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: ghcr.io/astral-sh/uv
-              tag: python3.13-bookworm
-          inputs:
-            - name: ol-concourse-pulumi-src
-          outputs:
-            - name: build-context
-          run:
-            path: /bin/sh
-            args:
-              - -exc
-              - |
-                cp -a ol-concourse-pulumi-src/. build-context/
-                cd build-context
-                uv build --package ol-concourse-pulumi --out-dir resources/pulumi/dist/
-      - task: build-image
-        privileged: true
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: concourse/oci-build-task
-          inputs:
-            - name: build-context
-          outputs:
-            - name: image
-          run:
-            path: build
-          params:
-            CONTEXT: build-context/resources/pulumi
-            DOCKERFILE: build-context/resources/pulumi/Dockerfile
-      - put: concourse-pulumi-resource
-        params:
-          image: image/image.tar
-          additional_tags: ol-concourse-pulumi-src/.git/ref
-      - task: build-image-provisioner
-        privileged: true
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: concourse/oci-build-task
-          inputs:
-            - name: build-context
-          outputs:
-            - name: image
-          run:
-            path: build
-          params:
-            CONTEXT: build-context/resources/pulumi
-            DOCKERFILE: build-context/resources/pulumi/Dockerfile.mitol_provision
-      - put: concourse-pulumi-resource-provisioner
-        params:
-          image: image/image.tar
-          additional_tags: ol-concourse-pulumi-src/.git/ref
+- name: build-and-publish-pulumi-image
+  public: true
+  plan:
+  - get: ol-concourse-pulumi-src
+    trigger: true
+  - task: generate-requirements
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: ghcr.io/astral-sh/uv
+          tag: python3.13-bookworm
+      inputs:
+      - name: ol-concourse-pulumi-src
+      outputs:
+      - name: build-context
+      run:
+        path: /bin/sh
+        args:
+        - -exc
+        - |
+          cp -a ol-concourse-pulumi-src/. build-context/
+          cd build-context
+          uv build --package ol-concourse-pulumi --out-dir resources/pulumi/dist/
+  - task: build-image
+    privileged: true
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: concourse/oci-build-task
+      inputs:
+      - name: build-context
+      outputs:
+      - name: image
+      run:
+        path: build
+      params:
+        CONTEXT: build-context/resources/pulumi
+        DOCKERFILE: build-context/resources/pulumi/Dockerfile
+  - put: concourse-pulumi-resource
+    params:
+      image: image/image.tar
+      additional_tags: ol-concourse-pulumi-src/.git/ref
+  - task: build-image-provisioner
+    privileged: true
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: concourse/oci-build-task
+      inputs:
+      - name: build-context
+      outputs:
+      - name: image
+      run:
+        path: build
+      params:
+        CONTEXT: build-context/resources/pulumi
+        DOCKERFILE: build-context/resources/pulumi/Dockerfile.mitol_provision
+  - put: concourse-pulumi-resource-provisioner
+    params:
+      image: image/image.tar
+      additional_tags: ol-concourse-pulumi-src/.git/ref
 
-  - name: build-and-publish-github-issues-image
-    public: true
-    plan:
-      - get: ol-concourse-github-issues-src
-        trigger: true
-      - task: generate-requirements
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: ghcr.io/astral-sh/uv
-              tag: python3.13-bookworm
-          inputs:
-            - name: ol-concourse-github-issues-src
-          outputs:
-            - name: build-context
-          run:
-            path: /bin/sh
-            args:
-              - -exc
-              - |
-                cp -a ol-concourse-github-issues-src/. build-context/
-                cd build-context
-                uv build --package ol-concourse-github-issues --out-dir resources/github-issues/dist/
-      - task: build-image
-        privileged: true
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: concourse/oci-build-task
-          inputs:
-            - name: build-context
-          outputs:
-            - name: image
-          run:
-            path: build
-          params:
-            CONTEXT: build-context/resources/github-issues
-            DOCKERFILE: build-context/resources/github-issues/Dockerfile
-      - put: concourse-github-issues-resource
-        params:
-          image: image/image.tar
-          additional_tags: ol-concourse-github-issues-src/.git/ref
+- name: build-and-publish-github-issues-image
+  public: true
+  plan:
+  - get: ol-concourse-github-issues-src
+    trigger: true
+  - task: generate-requirements
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: ghcr.io/astral-sh/uv
+          tag: python3.13-bookworm
+      inputs:
+      - name: ol-concourse-github-issues-src
+      outputs:
+      - name: build-context
+      run:
+        path: /bin/sh
+        args:
+        - -exc
+        - |
+          cp -a ol-concourse-github-issues-src/. build-context/
+          cd build-context
+          uv build --package ol-concourse-github-issues --out-dir resources/github-issues/dist/
+  - task: build-image
+    privileged: true
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: concourse/oci-build-task
+      inputs:
+      - name: build-context
+      outputs:
+      - name: image
+      run:
+        path: build
+      params:
+        CONTEXT: build-context/resources/github-issues
+        DOCKERFILE: build-context/resources/github-issues/Dockerfile
+  - put: concourse-github-issues-resource
+    params:
+      image: image/image.tar
+      additional_tags: ol-concourse-github-issues-src/.git/ref
 
-  - name: build-and-publish-pypi-image
-    public: true
-    plan:
-      - get: ol-concourse-pypi-src
-        trigger: true
-      - task: generate-requirements
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: ghcr.io/astral-sh/uv
-              tag: python3.13-bookworm
-          inputs:
-            - name: ol-concourse-pypi-src
-          outputs:
-            - name: build-context
-          run:
-            path: /bin/sh
-            args:
-              - -exc
-              - |
-                cp -a ol-concourse-pypi-src/. build-context/
-                cd build-context
-                uv build --package ol-concourse-pypi --out-dir resources/pypi/dist/
-      - task: build-image
-        privileged: true
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: concourse/oci-build-task
-          inputs:
-            - name: build-context
-          outputs:
-            - name: image
-          run:
-            path: build
-          params:
-            CONTEXT: build-context/resources/pypi
-            DOCKERFILE: build-context/resources/pypi/Dockerfile
-      - put: concourse-pypi-resource
-        params:
-          image: image/image.tar
-          additional_tags: ol-concourse-pypi-src/.git/ref
+- name: build-and-publish-pypi-image
+  public: true
+  plan:
+  - get: ol-concourse-pypi-src
+    trigger: true
+  - task: generate-requirements
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: ghcr.io/astral-sh/uv
+          tag: python3.13-bookworm
+      inputs:
+      - name: ol-concourse-pypi-src
+      outputs:
+      - name: build-context
+      run:
+        path: /bin/sh
+        args:
+        - -exc
+        - |
+          cp -a ol-concourse-pypi-src/. build-context/
+          cd build-context
+          uv build --package ol-concourse-pypi --out-dir resources/pypi/dist/
+  - task: build-image
+    privileged: true
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: concourse/oci-build-task
+      inputs:
+      - name: build-context
+      outputs:
+      - name: image
+      run:
+        path: build
+      params:
+        CONTEXT: build-context/resources/pypi
+        DOCKERFILE: build-context/resources/pypi/Dockerfile
+  - put: concourse-pypi-resource
+    params:
+      image: image/image.tar
+      additional_tags: ol-concourse-pypi-src/.git/ref
 
-  - name: build-and-publish-npm-image
-    public: true
-    plan:
-      - get: ol-concourse-npm-src
-        trigger: true
-      - task: generate-requirements
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: ghcr.io/astral-sh/uv
-              tag: python3.13-bookworm
-          inputs:
-            - name: ol-concourse-npm-src
-          outputs:
-            - name: build-context
-          run:
-            path: /bin/sh
-            args:
-              - -exc
-              - |
-                cp -a ol-concourse-npm-src/. build-context/
-                cd build-context
-                uv build --package ol-concourse-npm --out-dir resources/npm/dist/
-      - task: build-image
-        privileged: true
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: concourse/oci-build-task
-          inputs:
-            - name: build-context
-          outputs:
-            - name: image
-          run:
-            path: build
-          params:
-            CONTEXT: build-context/resources/npm
-            DOCKERFILE: build-context/resources/npm/Dockerfile
-      - put: concourse-npm-resource
-        params:
-          image: image/image.tar
-          additional_tags: ol-concourse-npm-src/.git/ref
+- name: build-and-publish-npm-image
+  public: true
+  plan:
+  - get: ol-concourse-npm-src
+    trigger: true
+  - task: generate-requirements
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: ghcr.io/astral-sh/uv
+          tag: python3.13-bookworm
+      inputs:
+      - name: ol-concourse-npm-src
+      outputs:
+      - name: build-context
+      run:
+        path: /bin/sh
+        args:
+        - -exc
+        - |
+          cp -a ol-concourse-npm-src/. build-context/
+          cd build-context
+          uv build --package ol-concourse-npm --out-dir resources/npm/dist/
+  - task: build-image
+    privileged: true
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: concourse/oci-build-task
+      inputs:
+      - name: build-context
+      outputs:
+      - name: image
+      run:
+        path: build
+      params:
+        CONTEXT: build-context/resources/npm
+        DOCKERFILE: build-context/resources/npm/Dockerfile
+  - put: concourse-npm-resource
+    params:
+      image: image/image.tar
+      additional_tags: ol-concourse-npm-src/.git/ref
 
-  - name: build-and-publish-task-image
-    public: true
-    plan:
-      - get: ol-concourse-task-src
-        trigger: true
-      - task: generate-requirements
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: ghcr.io/astral-sh/uv
-              tag: python3.13-bookworm
-          inputs:
-            - name: ol-concourse-task-src
-          outputs:
-            - name: build-context
-          run:
-            path: /bin/sh
-            args:
-              - -exc
-              - |
-                cp -a ol-concourse-task-src/. build-context/
-                cd build-context
-                uv build --package ol-concourse --out-dir pipeline_lib/dist/
-      - task: build-image
-        privileged: true
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: concourse/oci-build-task
-          inputs:
-            - name: build-context
-          outputs:
-            - name: image
-          run:
-            path: build
-          params:
-            CONTEXT: build-context/pipeline_lib
-            DOCKERFILE: build-context/pipeline_lib/Dockerfile
-      - put: ol-concourse-task-image
-        params:
-          image: image/image.tar
-          additional_tags: ol-concourse-task-src/.git/ref
+- name: build-and-publish-task-image
+  public: true
+  plan:
+  - get: ol-concourse-task-src
+    trigger: true
+  - task: generate-requirements
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: ghcr.io/astral-sh/uv
+          tag: python3.13-bookworm
+      inputs:
+      - name: ol-concourse-task-src
+      outputs:
+      - name: build-context
+      run:
+        path: /bin/sh
+        args:
+        - -exc
+        - |
+          cp -a ol-concourse-task-src/. build-context/
+          cd build-context
+          uv build --package ol-concourse --out-dir pipeline_lib/dist/
+  - task: build-image
+    privileged: true
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: concourse/oci-build-task
+      inputs:
+      - name: build-context
+      outputs:
+      - name: image
+      run:
+        path: build
+      params:
+        CONTEXT: build-context/pipeline_lib
+        DOCKERFILE: build-context/pipeline_lib/Dockerfile
+  - put: ol-concourse-task-image
+    params:
+      image: image/image.tar
+      additional_tags: ol-concourse-task-src/.git/ref
 
-  - name: build-and-publish-github-deployments-image
-    public: true
-    plan:
-      - get: ol-concourse-github-deployments-src
-        trigger: true
-      - task: generate-requirements
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: ghcr.io/astral-sh/uv
-              tag: python3.13-bookworm
-          inputs:
-            - name: ol-concourse-github-deployments-src
-          outputs:
-            - name: build-context
-          run:
-            path: /bin/sh
-            args:
-              - -exc
-              - |
-                cp -a ol-concourse-github-deployments-src/. build-context/
-                cd build-context
-                uv build --package ol-concourse-github-deployments --out-dir resources/github-deployments/dist/
-      - task: build-image
-        privileged: true
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: concourse/oci-build-task
-          inputs:
-            - name: build-context
-          outputs:
-            - name: image
-          run:
-            path: build
-          params:
-            CONTEXT: build-context/resources/github-deployments
-            DOCKERFILE: build-context/resources/github-deployments/Dockerfile
-      - put: concourse-github-deployments-resource
-        params:
-          image: image/image.tar
-          additional_tags: ol-concourse-github-deployments-src/.git/ref
+- name: build-and-publish-github-deployments-image
+  public: true
+  plan:
+  - get: ol-concourse-github-deployments-src
+    trigger: true
+  - task: generate-requirements
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: ghcr.io/astral-sh/uv
+          tag: python3.13-bookworm
+      inputs:
+      - name: ol-concourse-github-deployments-src
+      outputs:
+      - name: build-context
+      run:
+        path: /bin/sh
+        args:
+        - -exc
+        - |
+          cp -a ol-concourse-github-deployments-src/. build-context/
+          cd build-context
+          uv build --package ol-concourse-github-deployments --out-dir resources/github-deployments/dist/
+  - task: build-image
+    privileged: true
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: concourse/oci-build-task
+      inputs:
+      - name: build-context
+      outputs:
+      - name: image
+      run:
+        path: build
+      params:
+        CONTEXT: build-context/resources/github-deployments
+        DOCKERFILE: build-context/resources/github-deployments/Dockerfile
+  - put: concourse-github-deployments-resource
+    params:
+      image: image/image.tar
+      additional_tags: ol-concourse-github-deployments-src/.git/ref
 
-  - name: build-and-publish-release-image
-    public: true
-    plan:
-      - get: ol-concourse-release-src
-        trigger: true
-      - task: generate-requirements
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: ghcr.io/astral-sh/uv
-              tag: python3.13-bookworm
-          inputs:
-            - name: ol-concourse-release-src
-          outputs:
-            - name: build-context
-          run:
-            path: /bin/sh
-            args:
-              - -exc
-              - |
-                cp -a ol-concourse-release-src/. build-context/
-                cd build-context
-                uv build --package ol-concourse-release --out-dir resources/release/dist/
-      - task: build-image
-        privileged: true
-        config:
-          platform: linux
-          image_resource:
-            type: registry-image
-            source:
-              repository: concourse/oci-build-task
-          inputs:
-            - name: build-context
-          outputs:
-            - name: image
-          run:
-            path: build
-          params:
-            CONTEXT: build-context/resources/release
-            DOCKERFILE: build-context/resources/release/Dockerfile
-      - put: concourse-release-resource
-        params:
-          image: image/image.tar
-          additional_tags: ol-concourse-release-src/.git/ref
+- name: build-and-publish-fastly-image
+  public: true
+  plan:
+  - get: ol-concourse-fastly-src
+    trigger: true
+  - task: generate-requirements
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: ghcr.io/astral-sh/uv
+          tag: python3.13-bookworm
+      inputs:
+      - name: ol-concourse-fastly-src
+      outputs:
+      - name: build-context
+      run:
+        path: /bin/sh
+        args:
+        - -exc
+        - |
+          cp -a ol-concourse-fastly-src/. build-context/
+          cd build-context
+          uv build --package ol-concourse-fastly --out-dir resources/fastly/dist/
+  - task: build-image
+    privileged: true
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: concourse/oci-build-task
+      inputs:
+      - name: build-context
+      outputs:
+      - name: image
+      run:
+        path: build
+      params:
+        CONTEXT: build-context/resources/fastly
+        DOCKERFILE: build-context/resources/fastly/Dockerfile
+  - put: concourse-fastly-resource
+    params:
+      image: image/image.tar
+      additional_tags: ol-concourse-fastly-src/.git/ref
+
+- name: build-and-publish-release-image
+  public: true
+  plan:
+  - get: ol-concourse-release-src
+    trigger: true
+  - task: generate-requirements
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: ghcr.io/astral-sh/uv
+          tag: python3.13-bookworm
+      inputs:
+      - name: ol-concourse-release-src
+      outputs:
+      - name: build-context
+      run:
+        path: /bin/sh
+        args:
+        - -exc
+        - |
+          cp -a ol-concourse-release-src/. build-context/
+          cd build-context
+          uv build --package ol-concourse-release --out-dir resources/release/dist/
+  - task: build-image
+    privileged: true
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: concourse/oci-build-task
+      inputs:
+      - name: build-context
+      outputs:
+      - name: image
+      run:
+        path: build
+      params:
+        CONTEXT: build-context/resources/release
+        DOCKERFILE: build-context/resources/release/Dockerfile
+  - put: concourse-release-resource
+    params:
+      image: image/image.tar
+      additional_tags: ol-concourse-release-src/.git/ref
