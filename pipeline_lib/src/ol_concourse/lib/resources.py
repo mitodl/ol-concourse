@@ -498,6 +498,7 @@ def release_resource(  # noqa: PLR0913
     changelog_file: str = "CHANGELOG.md",
     changelog_dir: str = "releases",
     webhook_token: str | None = None,
+    semver_tag_fallback: bool = False,
 ) -> Resource:
     """Generate a release resource for the given git repository.
 
@@ -525,6 +526,10 @@ def release_resource(  # noqa: PLR0913
     :param webhook_token: Concourse webhook token; used by the Slack release
         bot to trigger ``check`` explicitly.  Defaults ``check_every`` to
         ``never`` so the resource is not polled.
+    :param semver_tag_fallback: When ``True`` and no date-format tags exist,
+        fall back to the latest ``vX.Y.Z`` / ``X.Y.Z`` tag as the ``since``
+        boundary.  Intended for repos transitioning off a semver release
+        workflow (default: ``False``).
 
     :returns: A configured Concourse resource object.
     :rtype: Resource
@@ -545,6 +550,8 @@ def release_resource(  # noqa: PLR0913
         source["repository"] = repository
     if changelog_style is not None:
         source["changelog_style"] = changelog_style
+    if semver_tag_fallback:
+        source["semver_tag_fallback"] = True
     # webhook_token is set on the Resource object only (not in source)
 
     return Resource(
