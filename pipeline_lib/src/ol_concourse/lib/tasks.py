@@ -13,13 +13,14 @@ from ol_concourse.lib.models.pipeline import (
     TaskStep,
 )
 
-# Default image for pipeline_lib task steps. Bundles ol-concourse, bump-my-version, and git.
+# Default image for pipeline_lib task steps.
+# Bundles ol-concourse, bump-my-version, and git.
 # Tag is kept as "latest" until a versioned release of the task image is published.
 # Once the first image is built and pushed, pin this to a specific digest or tag
 # (e.g. "2026.04.15") to ensure reproducible pipeline behavior.
 TASK_IMAGE = AnonymousResource(
     type=REGISTRY_IMAGE,
-    source={"repository": "ghcr.io/mitodl/ol-concourse-task", "tag": "latest"},
+    source={"repository": "mitodl/ol-concourse-dsl", "tag": "latest"},
 )
 
 
@@ -56,10 +57,7 @@ def bump_version_task(
     :returns: A configured Concourse
         :class:`~ol_concourse.lib.models.pipeline.TaskStep`.
     """
-    if (
-        "/" not in version_file
-        or version_file.startswith(("/", "./", "../"))
-    ):
+    if "/" not in version_file or version_file.startswith(("/", "./", "../")):
         msg = (
             f"version_file must be workspace-relative in 'input-name/path' form "
             f"(e.g. 'release/version'), got: {version_file!r}"
