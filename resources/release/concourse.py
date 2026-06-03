@@ -13,6 +13,8 @@ resources:
       changelog_style: cumulative   # or "per_release", or omit to disable
       changelog_file: CHANGELOG.md  # only used when changelog_style=cumulative
       changelog_dir: releases        # only used when changelog_style=per_release
+      semver_tag_fallback: true      # treat vX.Y.Z / X.Y.Z tags as the baseline
+                                     # when no date-format tags exist yet
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from concoursetools import BuildMetadata, ConcourseResource, TypedVersion
 from github import Auth, Github
 
 VERSION_PATTERN = re.compile(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})\.(\d+)$")
+SEMVER_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
 # Default minimum clone depth.  Configurable via the ``clone_depth`` source
 # param.  Increase if the previous release tag is more than this many commits
@@ -74,7 +77,7 @@ class ReleaseVersion(TypedVersion):
 
     version: str  # YYYY.M.D.N (no leading zeros — PEP 440 compliant)
     head_sha: str  # full SHA of HEAD at check time
-    since: str  # previous tag (YYYY.M.D.N or empty string when no prior tags)
+    since: str  # previous tag (YYYY.M.D.N, vX.Y.Z/X.Y.Z semver, or empty string)
     commit_count: str  # number of commits since last release tag
     authors: str  # comma-separated sorted author email list
 
@@ -108,8 +111,17 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         changelog_file: str = "CHANGELOG.md",
         changelog_dir: str = "releases",
         clone_depth: int = _DEFAULT_CLONE_DEPTH,
+        semver_tag_fallback: bool = False,
     ) -> None:
-        """Initialize the release resource with git and GitHub configuration."""
+        """Initialize the release resource with git and GitHub configuration.
+
+        When *semver_tag_fallback* is ``True`` and no date-format (YYYY.M.D.N)
+        tags exist in the repository, the resource falls back to the most recent
+        tag matching ``vX.Y.Z`` or ``X.Y.Z``.  The semver tag is used only as
+        the *since* boundary for commit counting and changelog generation; the
+        emitted version is always a new date-format string.  This is intended for
+        repositories transitioning from a semver release workflow.
+        """
         super().__init__(ReleaseVersion)
         self.uri = uri
         self.branch = branch
@@ -122,6 +134,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         self.changelog_file = changelog_file
         self.changelog_dir = changelog_dir
         self.clone_depth = clone_depth
+        self.semver_tag_fallback = semver_tag_fallback
 
     # ------------------------------------------------------------------
     # check
@@ -180,15 +193,26 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             count, authors = _commit_info_range(
                 repo_path, latest_tag, head_sha, env=env
             )
+            since = latest_tag
         else:
-            count, authors = _commit_info_all(repo_path, head_sha, env=env)
+            # No date-format tags yet — optionally anchor diff at latest semver tag.
+            since = ""
+            if self.semver_tag_fallback:
+                semver_tags = _get_semver_tags(repo_path, env=env)
+                if semver_tags:
+                    since = semver_tags[-1]
+
+            if since:
+                count, authors = _commit_info_range(repo_path, since, head_sha, env=env)
+            else:
+                count, authors = _commit_info_all(repo_path, head_sha, env=env)
 
         next_version = _compute_next_version(tags)
         return [
             ReleaseVersion(
                 version=next_version,
                 head_sha=head_sha,
-                since=latest_tag or "",
+                since=since,
                 commit_count=str(count),
                 authors=authors,
             )
@@ -388,7 +412,13 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         # Collect commits for changelog (between last tag and pre-bump HEAD,
         # plus the hotfix commit if present).
         prior_tags = _get_release_tags(repo_path, env=env)
-        since_ref = prior_tags[-1] if prior_tags else ""
+        if prior_tags:
+            since_ref = prior_tags[-1]
+        elif self.semver_tag_fallback:
+            semver_tags = _get_semver_tags(repo_path, env=env)
+            since_ref = semver_tags[-1] if semver_tags else ""
+        else:
+            since_ref = ""
         until_ref = (
             _run(["git", "rev-parse", "HEAD"], cwd=repo_path, env=env).strip()
             if commit_hash
@@ -575,9 +605,7 @@ def _run(
         if redact:
             stdout = stdout.replace(redact, "***")
             stderr = stderr.replace(redact, "***")
-        raise subprocess.CalledProcessError(
-            result.returncode, cmd, stdout, stderr
-        )
+        raise subprocess.CalledProcessError(result.returncode, cmd, stdout, stderr)
     return result.stdout
 
 
@@ -611,6 +639,21 @@ def _get_release_tags(repo_path: Path, *, env: dict) -> list[str]:
     output = _run(["git", "tag", "--list"], cwd=repo_path, env=env)
     tags = [t.strip() for t in output.splitlines() if VERSION_PATTERN.match(t.strip())]
     return sorted(tags, key=_parse_version_tuple)
+
+
+def _get_semver_tags(repo_path: Path, *, env: dict[str, str]) -> list[str]:
+    """Return all vX.Y.Z or X.Y.Z tags in the repository, sorted oldest-first."""
+    output = _run(["git", "tag", "--list"], cwd=repo_path, env=env)
+    tags = [t.strip() for t in output.splitlines() if SEMVER_PATTERN.match(t.strip())]
+    return sorted(tags, key=_parse_semver_tuple)
+
+
+def _parse_semver_tuple(tag: str) -> tuple[int, int, int]:
+    """Parse a vX.Y.Z or X.Y.Z tag into a sortable integer tuple."""
+    m = SEMVER_PATTERN.match(tag)
+    if m:
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return (0, 0, 0)
 
 
 def _commit_info_range(

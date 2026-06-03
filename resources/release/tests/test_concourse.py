@@ -11,9 +11,12 @@ import pytest
 from concourse import (
     ReleaseResource,
     ReleaseVersion,
+    SEMVER_PATTERN,
     _build_changelog_entry,
     _build_checklist,
     _compute_next_version,
+    _get_semver_tags,
+    _parse_semver_tuple,
     _parse_version_tuple,
     _update_cumulative_changelog,
     CHANGELOG_HEADER,
@@ -126,12 +129,54 @@ def test_compute_next_version_handles_mixed_zero_padded_tags(monkeypatch):
     )
     tags = ["2026.04.14.1", "2026.4.14.2", "2026.04.14.3", "2026.4.13.9"]
     assert _compute_next_version(tags) == "2026.4.14.4"
-def test_compute_next_version_handles_mixed_zero_padded_tags(monkeypatch):
-    monkeypatch.setattr(
-        "concourse.datetime", _fake_datetime(datetime(2026, 4, 14, tzinfo=UTC))
-    )
-    tags = ["2026.04.14.1", "2026.4.14.2", "2026.04.14.3", "2026.4.13.9"]
-    assert _compute_next_version(tags) == "2026.4.14.4"
+
+
+# ---------------------------------------------------------------------------
+# _parse_semver_tuple / SEMVER_PATTERN
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "tag, expected",
+    [
+        ("1.2.3", (1, 2, 3)),
+        ("v1.2.3", (1, 2, 3)),
+        ("v10.20.300", (10, 20, 300)),
+        ("0.0.1", (0, 0, 1)),
+        ("not-semver", (0, 0, 0)),
+        ("2026.4.14.1", (0, 0, 0)),  # date-format tag must not match
+        ("", (0, 0, 0)),
+    ],
+)
+def test_parse_semver_tuple(tag, expected):
+    assert _parse_semver_tuple(tag) == expected
+
+
+@pytest.mark.parametrize(
+    "tag, should_match",
+    [
+        ("1.2.3", True),
+        ("v1.2.3", True),
+        ("v0.0.1", True),
+        ("v10.20.300", True),
+        ("2026.4.14.1", False),  # date-format must not collide
+        ("v1.2.3.4", False),  # four components — not semver
+        ("v1.2", False),  # only two components
+        ("1.2.3-rc1", False),  # pre-release suffix
+    ],
+)
+def test_semver_pattern(tag, should_match):
+    assert bool(SEMVER_PATTERN.match(tag)) == should_match
+
+
+@patch("concourse._run")
+def test_get_semver_tags_sorted(mock_run, tmp_path):
+    mock_run.return_value = "v2.0.0\nv1.9.0\nv1.10.0\n1.0.0\n2026.4.14.1\nbad-tag"
+    result = _get_semver_tags(tmp_path, env={})
+    # date-format and bad-tag excluded;
+    # remainder sorted by (major, minor, patch)
+    assert result == ["1.0.0", "v1.9.0", "v1.10.0", "v2.0.0"]
+    assert "2026.4.14.1" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -244,8 +289,210 @@ def test_update_cumulative_changelog_header_only_file(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# fetch_new_versions (check)
+# semver_tag_fallback — _compute_versions
 # ---------------------------------------------------------------------------
+
+
+@patch("concourse._run")
+@patch("concourse.tempfile.TemporaryDirectory")
+def test_fetch_new_versions_semver_fallback_used_when_no_date_tags(
+    mock_tmpdir, mock_run, tmp_path, monkeypatch
+):
+    """With semver_tag_fallback=True and only semver tags, since = latest semver tag."""
+    mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
+    head_sha = "newwork1" * 5
+
+    outputs = [
+        "",  # git clone
+        "",  # git fetch --tags
+        "v1.2.3\nv1.3.0\nbad-tag",  # git tag --list (no date-format tags)
+        head_sha,  # git rev-parse origin/main
+        # semver fallback branch: git tag --list again for _get_semver_tags
+        "v1.2.3\nv1.3.0\nbad-tag",
+        # _commit_info_range for v1.3.0..head_sha
+        "dev@example.com\nalice@example.com",
+    ]
+    idx = 0
+
+    def run_side_effect(cmd, **kwargs):
+        nonlocal idx
+        out = outputs[idx]
+        idx += 1
+        return out
+
+    mock_run.side_effect = run_side_effect
+    resource = make_resource(semver_tag_fallback=True)
+
+    with patch("concourse.datetime") as mock_dt:
+        mock_dt.now.return_value.date.return_value = datetime(
+            2026, 4, 14, tzinfo=UTC
+        ).date()
+        versions = resource.fetch_new_versions(None)
+
+    assert len(versions) == 1
+    assert versions[0].since == "v1.3.0"
+    assert versions[0].commit_count == "2"
+
+
+@patch("concourse._run")
+@patch("concourse.tempfile.TemporaryDirectory")
+def test_fetch_new_versions_semver_fallback_ignored_when_date_tags_exist(
+    mock_tmpdir, mock_run, tmp_path, monkeypatch
+):
+    """Date-format tags take priority over semver tags even when fallback is on."""
+    mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
+    head_sha = "newwork1" * 5
+    tag_sha = "oldtag11" * 5
+
+    outputs = [
+        "",
+        "",
+        "v1.3.0\n2026.4.14.1",  # both semver and date-format present
+        head_sha,
+        tag_sha,  # rev-list -n1 2026.4.14.1
+        "dev@example.com",
+    ]
+    idx = 0
+
+    def run_side_effect(cmd, **kwargs):
+        nonlocal idx
+        out = outputs[idx]
+        idx += 1
+        return out
+
+    mock_run.side_effect = run_side_effect
+    resource = make_resource(semver_tag_fallback=True)
+
+    with patch("concourse.datetime") as mock_dt:
+        mock_dt.now.return_value.date.return_value = datetime(
+            2026, 4, 14, tzinfo=UTC
+        ).date()
+        versions = resource.fetch_new_versions(None)
+
+    assert versions[0].since == "2026.4.14.1"
+
+
+@patch("concourse._run")
+@patch("concourse.tempfile.TemporaryDirectory")
+def test_fetch_new_versions_semver_fallback_disabled(mock_tmpdir, mock_run, tmp_path):
+    """With semver_tag_fallback=False, semver tags are ignored and since is empty."""
+    mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
+    head_sha = "newwork1" * 5
+
+    outputs = [
+        "",
+        "",
+        "v1.2.3\nv1.3.0",  # only semver tags
+        head_sha,
+        "dev@example.com\nalice@example.com",  # _commit_info_all
+    ]
+    idx = 0
+
+    def run_side_effect(cmd, **kwargs):
+        nonlocal idx
+        out = outputs[idx]
+        idx += 1
+        return out
+
+    mock_run.side_effect = run_side_effect
+    resource = make_resource(semver_tag_fallback=False)
+
+    with patch("concourse.datetime") as mock_dt:
+        mock_dt.now.return_value.date.return_value = datetime(
+            2026, 4, 14, tzinfo=UTC
+        ).date()
+        versions = resource.fetch_new_versions(None)
+
+    assert versions[0].since == ""
+
+
+# ---------------------------------------------------------------------------
+# semver_tag_fallback — _create_release (out / action=create)
+# ---------------------------------------------------------------------------
+
+
+@patch("concourse._run")
+def test_create_release_semver_fallback_uses_latest_semver_as_since(mock_run, tmp_path):
+    """_create_release uses latest semver tag as since_ref when no date-format tags."""
+    version_str = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    pre_bump_sha = "prebump1" * 5
+    log_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kw):
+        if "log" in cmd:
+            log_calls.append(list(cmd))
+            return ""
+        if "tag" in cmd and "--list" in cmd:
+            return "v2.0.0\nv2.1.0"  # only semver tags
+        if "rev-parse" in cmd:
+            return pre_bump_sha
+        if "status" in cmd:
+            return ""
+        return ""
+
+    mock_run.side_effect = fake_run
+    resource = make_resource(semver_tag_fallback=True)
+    resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    # The git log call for changelog generation should use v2.1.0 as since_ref
+    assert log_calls, "Expected at least one git log call"
+    log_cmd_str = " ".join(log_calls[0])
+    assert "v2.1.0" in log_cmd_str, (
+        f"Expected v2.1.0 as since_ref in log call, got: {log_cmd_str}"
+    )
+
+
+@patch("concourse._run")
+def test_create_release_semver_fallback_disabled_no_since(mock_run, tmp_path):
+    """With semver_tag_fallback=False, since_ref is empty regardless of semver tags."""
+    version_str = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    pre_bump_sha = "prebump1" * 5
+    log_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kw):
+        if "log" in cmd:
+            log_calls.append(list(cmd))
+            return ""
+        if "tag" in cmd and "--list" in cmd:
+            return "v2.0.0\nv2.1.0"
+        if "rev-parse" in cmd:
+            return pre_bump_sha
+        if "status" in cmd:
+            return ""
+        return ""
+
+    mock_run.side_effect = fake_run
+    resource = make_resource(semver_tag_fallback=False)
+    resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    assert log_calls, "Expected at least one git log call"
+    log_cmd_str = " ".join(log_calls[0])
+    # No since..until range — just the SHA
+    assert "v2.1.0" not in log_cmd_str, (
+        "semver tag must not appear in log call when fallback is disabled"
+    )
 
 
 def _make_run_side_effects(
