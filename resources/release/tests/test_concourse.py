@@ -288,9 +288,30 @@ def test_update_cumulative_changelog_header_only_file(tmp_path):
     assert entry in content
 
 
-# ---------------------------------------------------------------------------
-# semver_tag_fallback — _compute_versions
-# ---------------------------------------------------------------------------
+@patch("concourse._run")
+@patch("concourse.tempfile.TemporaryDirectory")
+def test_download_version_writes_empty_since_when_no_prior_tag(
+    mock_tmpdir, mock_run, tmp_path
+):
+    """Since file is written even when version.since is empty."""
+    mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
+    head_sha = "abc" * 13 + "a"
+    outputs = ["", "", f"{head_sha}|dev@example.com|Initial commit"]
+    idx = 0
+
+    def run_side_effect(cmd, **kwargs):
+        nonlocal idx
+        out = outputs[idx % len(outputs)]
+        idx += 1
+        return out
+
+    mock_run.side_effect = run_side_effect
+    dest = tmp_path / "output"
+    resource = make_resource()
+    version = make_version(since="", head_sha=head_sha)
+    resource.download_version(version, dest, MagicMock())
+    assert (dest / "since").exists()
+    assert (dest / "since").read_text() == ""
 
 
 @patch("concourse._run")
@@ -638,8 +659,6 @@ def test_download_version_writes_all_outputs(
             f"{'b' * 40}|alice@example.com|Add feature",
         ]
     )
-    # _clone calls _run twice (git clone + git fetch --tags), then _collect_commits
-    # calls git log once using version.head_sha directly (no rev-parse needed).
     outputs = ["", "", git_log_output]
     call_index = 0
 
@@ -658,6 +677,7 @@ def test_download_version_writes_all_outputs(
     resource.download_version(version, dest, MagicMock())
 
     assert (dest / "version").read_text() == version.version
+    assert (dest / "since").read_text() == version.since
     commits = json.loads((dest / "commits.json").read_text())
     assert len(commits) == 2
     assert (dest / "checklist.md").exists()

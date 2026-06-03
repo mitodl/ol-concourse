@@ -246,6 +246,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
         destination_dir.mkdir(parents=True, exist_ok=True)
         (destination_dir / "version").write_text(version.version)
+        (destination_dir / "since").write_text(version.since)
         (destination_dir / "commits.json").write_text(json.dumps(commits, indent=2))
         (destination_dir / "checklist.md").write_text(
             _build_checklist(version.version, commits)

@@ -90,11 +90,19 @@ def bump_version_task(
                 path="bash",
                 args=[
                     "-ec",
-                    f"""VERSION=$(cat {shlex.quote(version_file)})
+                    rf"""VERSION=$(cat {shlex.quote(version_file)})
+CURRENT_VERSION_ARGS=""
+if [ -f {shlex.quote(version_input + "/since")} ]; then
+    SINCE=$(cat {shlex.quote(version_input + "/since")})
+    if echo "$SINCE" | grep -qE '^v?[0-9]+\.[0-9]+\.[0-9]+$'; then
+        CURRENT_VERSION_ARGS="--current-version ${{SINCE#v}}"
+    fi
+fi
 git -C {shlex.quote(repo_id)} config user.email {shlex.quote(git_email)}
 git -C {shlex.quote(repo_id)} config user.name {shlex.quote(git_user)}
 cd {shlex.quote(repo_id)}
-bump-my-version bump --new-version "$VERSION" --no-commit --allow-dirty --verbose""",
+bump-my-version bump --new-version "$VERSION" $CURRENT_VERSION_ARGS \\
+  --no-commit --allow-dirty --verbose""",
                 ],
             ),
         ),
