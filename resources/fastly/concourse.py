@@ -440,6 +440,7 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
             )
             raise ValueError(msg)
 
+        purge_kind = "soft" if soft else "hard"
         metadata: dict[str, str] = {"mode": mode, "soft": str(soft).lower()}
 
         with self._api_client() as client:
@@ -450,6 +451,7 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
                     resolved = self._get_service_id(service_id, client)
                     purge_client.purge_all(resolved)
                     metadata["service_id"] = resolved
+                    metadata["purged"] = f"{purge_kind} purge-all on service {resolved}"
 
                 case "surrogate_key":
                     if not surrogate_key:
@@ -465,6 +467,10 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
                     )
                     metadata["service_id"] = resolved
                     metadata["surrogate_key"] = surrogate_key
+                    metadata["purged"] = (
+                        f"{purge_kind} surrogate-key purge of '{surrogate_key}'"
+                        f" on service {resolved}"
+                    )
 
                 case "surrogate_keys":
                     if not surrogate_keys:
@@ -487,6 +493,10 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
                     )
                     metadata["service_id"] = resolved
                     metadata["surrogate_keys"] = " ".join(surrogate_keys)
+                    metadata["purged"] = (
+                        f"{purge_kind} bulk surrogate-key purge of"
+                        f" {len(surrogate_keys)} key(s) on service {resolved}"
+                    )
 
                 case "url":
                     if not url:
@@ -494,6 +504,7 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
                         raise ValueError(msg)
                     purge_client.purge_single_url(url, fastly_soft_purge=soft_header)
                     metadata["url"] = url
+                    metadata["purged"] = f"{purge_kind} URL purge of {url}"
 
                 case _:
                     msg = f"Unknown purge mode: {mode!r}"

@@ -340,6 +340,7 @@ def test_put_purge_all(resource: FastlyResource, tmp_path: Path) -> None:
     purge_mock.purge_all.assert_called_once_with(SERVICE_ID)
     assert meta["mode"] == "purge_all"
     assert meta["soft"] == "false"
+    assert meta["purged"] == f"hard purge-all on service {SERVICE_ID}"
     assert version == FastlyVersion(service_version="0")
 
 
@@ -380,6 +381,10 @@ def test_put_surrogate_key(resource: FastlyResource, tmp_path: Path) -> None:
         SERVICE_ID, "html-pages", fastly_soft_purge=0
     )
     assert meta["surrogate_key"] == "html-pages"
+    assert (
+        meta["purged"]
+        == f"hard surrogate-key purge of 'html-pages' on service {SERVICE_ID}"
+    )
 
 
 def test_put_surrogate_key_soft(resource: FastlyResource, tmp_path: Path) -> None:
@@ -422,6 +427,10 @@ def test_put_surrogate_keys_batch(resource: FastlyResource, tmp_path: Path) -> N
         fastly_soft_purge=0,
     )
     assert meta["surrogate_keys"] == "key1 key2 key3"
+    assert (
+        meta["purged"]
+        == f"hard bulk surrogate-key purge of 3 key(s) on service {SERVICE_ID}"
+    )
 
 
 def test_put_url_purge(resource: FastlyResource, tmp_path: Path) -> None:
@@ -441,6 +450,7 @@ def test_put_url_purge(resource: FastlyResource, tmp_path: Path) -> None:
         )
     purge_mock.purge_single_url.assert_called_once_with(target_url, fastly_soft_purge=0)
     assert meta["url"] == target_url
+    assert meta["purged"] == f"hard URL purge of {target_url}"
 
 
 def test_put_soft_purge_all_raises(resource: FastlyResource, tmp_path: Path) -> None:
