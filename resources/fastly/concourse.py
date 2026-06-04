@@ -430,7 +430,7 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
             ValueError: on missing required params or invalid ``mode`` /
                 ``soft`` combinations.
         """
-        soft_header: int | None = 1 if soft else None
+        soft_header: int = 1 if soft else 0
 
         if soft and mode == "purge_all":
             msg = (

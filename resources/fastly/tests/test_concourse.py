@@ -377,7 +377,7 @@ def test_put_surrogate_key(resource: FastlyResource, tmp_path: Path) -> None:
             surrogate_key="html-pages",
         )
     purge_mock.purge_tag.assert_called_once_with(
-        SERVICE_ID, "html-pages", fastly_soft_purge=None
+        SERVICE_ID, "html-pages", fastly_soft_purge=0
     )
     assert meta["surrogate_key"] == "html-pages"
 
@@ -419,7 +419,7 @@ def test_put_surrogate_keys_batch(resource: FastlyResource, tmp_path: Path) -> N
     purge_mock.bulk_purge_tag.assert_called_once_with(
         SERVICE_ID,
         surrogate_key="key1 key2 key3",
-        fastly_soft_purge=None,
+        fastly_soft_purge=0,
     )
     assert meta["surrogate_keys"] == "key1 key2 key3"
 
@@ -439,9 +439,7 @@ def test_put_url_purge(resource: FastlyResource, tmp_path: Path) -> None:
             mode="url",
             url=target_url,
         )
-    purge_mock.purge_single_url.assert_called_once_with(
-        target_url, fastly_soft_purge=None
-    )
+    purge_mock.purge_single_url.assert_called_once_with(target_url, fastly_soft_purge=0)
     assert meta["url"] == target_url
 
 
