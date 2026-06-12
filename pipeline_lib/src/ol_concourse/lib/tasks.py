@@ -101,8 +101,7 @@ fi
 git -C {shlex.quote(repo_id)} config user.email {shlex.quote(git_email)}
 git -C {shlex.quote(repo_id)} config user.name {shlex.quote(git_user)}
 cd {shlex.quote(repo_id)}
-bump-my-version bump --new-version "$VERSION" $CURRENT_VERSION_ARGS \\
-  --no-commit --allow-dirty --verbose""",
+bump-my-version bump --new-version "$VERSION" $CURRENT_VERSION_ARGS --no-commit --allow-dirty --verbose""",  # noqa: E501
                 ],
             ),
         ),
