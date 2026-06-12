@@ -5,20 +5,25 @@ to avoid colliding with the pulumi resource's identically-named concourse.py.
 """
 
 import os
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from packer_concourse import PackerResource, PackerVersion, _manifest_to_version_and_metadata
+from packer_concourse import (
+    PackerResource,
+    PackerVersion,
+    _manifest_to_version_and_metadata,
+)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _build_metadata():
     from concoursetools import BuildMetadata
+
     return BuildMetadata(
         BUILD_ID="1",
         BUILD_NAME="1",
@@ -30,7 +35,7 @@ def _build_metadata():
     )
 
 
-EMPTY_MANIFEST = {"artifacts": {}}
+EMPTY_MANIFEST = {"artifacts": {}}  # type: ignore[var-annotated]
 
 REAL_MANIFEST = {
     "artifacts": {
@@ -49,6 +54,7 @@ REAL_MANIFEST = {
 # PackerVersion
 # ---------------------------------------------------------------------------
 
+
 class TestPackerVersion:
     def test_default_id(self):
         v = PackerVersion()
@@ -62,6 +68,7 @@ class TestPackerVersion:
 # ---------------------------------------------------------------------------
 # _manifest_to_version_and_metadata
 # ---------------------------------------------------------------------------
+
 
 class TestManifestToVersionAndMetadata:
     def test_empty_manifest_returns_default_version(self):
@@ -81,11 +88,7 @@ class TestManifestToVersionAndMetadata:
 
     def test_none_values_become_empty_strings(self):
         manifest = {
-            "artifacts": {
-                "amazon-ebs.web": {
-                    "0": {"id": "ami-x", "description": None}
-                }
-            }
+            "artifacts": {"amazon-ebs.web": {"0": {"id": "ami-x", "description": None}}}
         }
         _, metadata = _manifest_to_version_and_metadata(manifest)
         assert metadata["amazon-ebs.web::0::description"] == ""
@@ -108,6 +111,7 @@ class TestManifestToVersionAndMetadata:
 # PackerResource.publish_new_version
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def sources_dir(tmp_path):
     return tmp_path
@@ -129,11 +133,18 @@ class TestPublishNewVersionValidate:
     @patch("packer_concourse.packer_lib.init")
     @patch("packer_concourse.packer_lib.version")
     def test_validate_calls_packer_steps(
-        self, mock_version, mock_init, mock_validate, mock_fmt,
-        resource, sources_dir, metadata
+        self,
+        mock_version,
+        mock_init,
+        mock_validate,
+        mock_fmt,
+        resource,
+        sources_dir,
+        metadata,
     ):
         version, meta = resource.publish_new_version(
-            sources_dir, metadata,
+            sources_dir,
+            metadata,
             objective="validate",
             template="template.pkr.hcl",
         )
@@ -149,11 +160,18 @@ class TestPublishNewVersionValidate:
     @patch("packer_concourse.packer_lib.init")
     @patch("packer_concourse.packer_lib.version")
     def test_validate_passes_vars_to_packer(
-        self, mock_version, mock_init, mock_validate, mock_fmt,
-        resource, sources_dir, metadata
+        self,
+        mock_version,
+        mock_init,
+        mock_validate,
+        mock_fmt,
+        resource,
+        sources_dir,
+        metadata,
     ):
         resource.publish_new_version(
-            sources_dir, metadata,
+            sources_dir,
+            metadata,
             objective="validate",
             template="template.pkr.hcl",
             vars={"region": "us-east-1"},
@@ -170,28 +188,45 @@ class TestPublishNewVersionValidate:
     @patch("packer_concourse.packer_lib.init")
     @patch("packer_concourse.packer_lib.version")
     def test_validate_sets_env_vars(
-        self, mock_version, mock_init, mock_validate, mock_fmt,
-        resource, sources_dir, metadata
+        self,
+        mock_version,
+        mock_init,
+        mock_validate,
+        mock_fmt,
+        resource,
+        sources_dir,
+        metadata,
     ):
         resource.publish_new_version(
-            sources_dir, metadata,
+            sources_dir,
+            metadata,
             objective="validate",
             template="template.pkr.hcl",
             env_vars={"MY_VAR": "hello"},
         )
         assert os.environ.get("MY_VAR") == "hello"
 
-    @patch("packer_concourse.io_utils.read_value_from_file", return_value="secret-token")
+    @patch(
+        "packer_concourse.io_utils.read_value_from_file", return_value="secret-token"
+    )
     @patch("packer_concourse.packer_lib.format_packer_cmd")
     @patch("packer_concourse.packer_lib.validate")
     @patch("packer_concourse.packer_lib.init")
     @patch("packer_concourse.packer_lib.version")
     def test_validate_reads_env_vars_from_files(
-        self, mock_version, mock_init, mock_validate, mock_fmt, mock_read,
-        resource, sources_dir, metadata
+        self,
+        mock_version,
+        mock_init,
+        mock_validate,
+        mock_fmt,
+        mock_read,
+        resource,
+        sources_dir,
+        metadata,
     ):
         resource.publish_new_version(
-            sources_dir, metadata,
+            sources_dir,
+            metadata,
             objective="validate",
             template="template.pkr.hcl",
             env_vars_from_files={"AWS_SESSION_TOKEN": "path/to/token"},
@@ -205,11 +240,11 @@ class TestPublishNewVersionBuild:
     @patch("packer_concourse.packer_lib.init")
     @patch("packer_concourse.packer_lib.version")
     def test_build_returns_version_from_manifest(
-        self, mock_version, mock_init, mock_build,
-        resource, sources_dir, metadata
+        self, mock_version, mock_init, mock_build, resource, sources_dir, metadata
     ):
         version, meta = resource.publish_new_version(
-            sources_dir, metadata,
+            sources_dir,
+            metadata,
             objective="build",
             template="template.pkr.hcl",
         )
@@ -220,11 +255,11 @@ class TestPublishNewVersionBuild:
     @patch("packer_concourse.packer_lib.init")
     @patch("packer_concourse.packer_lib.version")
     def test_build_with_empty_manifest(
-        self, mock_version, mock_init, mock_build,
-        resource, sources_dir, metadata
+        self, mock_version, mock_init, mock_build, resource, sources_dir, metadata
     ):
         version, meta = resource.publish_new_version(
-            sources_dir, metadata,
+            sources_dir,
+            metadata,
             objective="build",
             template="template.pkr.hcl",
         )
@@ -235,11 +270,11 @@ class TestPublishNewVersionBuild:
     @patch("packer_concourse.packer_lib.init")
     @patch("packer_concourse.packer_lib.version")
     def test_build_passes_force_and_debug(
-        self, mock_version, mock_init, mock_build,
-        resource, sources_dir, metadata
+        self, mock_version, mock_init, mock_build, resource, sources_dir, metadata
     ):
         resource.publish_new_version(
-            sources_dir, metadata,
+            sources_dir,
+            metadata,
             objective="build",
             template="template.pkr.hcl",
             force=True,
@@ -258,7 +293,8 @@ class TestPublishNewVersionInvalidObjective:
     ):
         with pytest.raises(ValueError, match="Invalid objective"):
             resource.publish_new_version(
-                sources_dir, metadata,
+                sources_dir,
+                metadata,
                 objective="deploy",
                 template="template.pkr.hcl",
             )
