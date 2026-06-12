@@ -76,6 +76,53 @@ def bump_version_task(
     if version_input != repo_id:
         inputs.append(Input(name=Identifier(repo_id)))
 
+    # Python script injected for the semver->calver one-time transition.
+    # bump-my-version's `bump` and `replace` commands both call parse() on the
+    # current version before touching files; when the parse regex is calver-only
+    # and the current version is an old semver string, parse() returns None and
+    # serialize/hooks crash.  This script reads the [[tool.bumpversion.files]]
+    # entries directly and does plain string substitution, then updates the
+    # current_version tracking field — no parse() call involved.
+    _transition_script = r"""import tomllib, pathlib, sys
+
+since = sys.argv[1]
+new_ver = sys.argv[2]
+
+with open("pyproject.toml", "rb") as f:
+    config = tomllib.load(f)
+
+bv = config.get("tool", {}).get("bumpversion", {})
+for file_config in bv.get("files", []):
+    filename = file_config.get("filename")
+    if not filename:
+        continue
+    search_tmpl = file_config.get("search", "{current_version}")
+    repl_tmpl = file_config.get("replace", "{new_version}")
+    search = search_tmpl.replace("{current_version}", since)
+    repl = repl_tmpl.replace("{new_version}", new_ver)
+    path = pathlib.Path(filename)
+    if not path.exists():
+        print("Skipping " + filename + " (not found)", file=sys.stderr)
+        continue
+    content = path.read_text()
+    if search in content:
+        path.write_text(content.replace(search, repl, 1))
+        print("Updated " + filename)
+    else:
+        print("Warning: version string not found in " + filename, file=sys.stderr)
+
+pyproject = pathlib.Path("pyproject.toml")
+content = pyproject.read_text()
+pyproject.write_text(
+    content.replace(
+        'current_version = "' + since + '"',
+        'current_version = "' + new_ver + '"',
+        1,
+    )
+)
+print("Updated pyproject.toml current_version tracking")
+"""
+
     return TaskStep(
         task=Identifier("bump-version"),
         privileged=False,
@@ -95,7 +142,7 @@ SINCE_SEMVER=""
 if [ -f {shlex.quote(version_input + "/since")} ]; then
     SINCE=$(cat {shlex.quote(version_input + "/since")})
     SINCE_STRIPPED="${{SINCE#v}}"
-    if echo "$SINCE_STRIPPED" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    if echo "$SINCE_STRIPPED" | grep -qE '^[0-9]{{1,3}}\.[0-9]+\.[0-9]+$'; then
         SINCE_SEMVER="$SINCE_STRIPPED"
     fi
 fi
@@ -103,9 +150,7 @@ git -C {shlex.quote(repo_id)} config user.email {shlex.quote(git_email)}
 git -C {shlex.quote(repo_id)} config user.name {shlex.quote(git_user)}
 cd {shlex.quote(repo_id)}
 if [ -n "$SINCE_SEMVER" ]; then
-    bump-my-version replace \
-        --current-version "$SINCE_SEMVER" --new-version "$VERSION" \
-        --allow-dirty --verbose
+    python3 -c {shlex.quote(_transition_script)} "$SINCE_SEMVER" "$VERSION"
 else
     bump-my-version bump --new-version "$VERSION" --no-commit --allow-dirty --verbose
 fi""",

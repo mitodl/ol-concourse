@@ -63,16 +63,22 @@ class TestBumpVersionTask:
         assert "release/since" in script
         assert "SINCE_SEMVER" in script
 
-    def test_shell_script_uses_replace_for_semver_transition(self):
+    def test_shell_script_uses_python_for_semver_transition(self):
         step = bump_version_task(version_file="release/version", repository="src")
         script = step.config.run.args[1]
-        assert "bump-my-version replace" in script
-        assert '--current-version "$SINCE_SEMVER"' in script
+        assert "python3 -c" in script
+        assert "tomllib" in script
+        assert '"$SINCE_SEMVER"' in script
 
     def test_shell_script_strips_v_prefix_from_since(self):
         step = bump_version_task(version_file="release/version", repository="src")
         script = step.config.run.args[1]
         assert "${SINCE#v}" in script
+
+    def test_shell_script_semver_regex_excludes_calver_years(self):
+        step = bump_version_task(version_file="release/version", repository="src")
+        script = step.config.run.args[1]
+        assert "[0-9]{1,3}" in script
 
     def test_shell_script_reads_version_from_file(self):
         step = bump_version_task(version_file="release/version")
