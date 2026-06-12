@@ -723,28 +723,34 @@ def _configure_git_identity(
 def _configure_https_auth(
     repo_path: Path, access_token: str, *, env: dict[str, str]
 ) -> None:
-    """Configure git HTTPS authentication via http.extraheader.
+    """Configure git HTTPS authentication by rewriting the remote URL.
 
-    Uses ``http.extraheader`` rather than embedding the token in the remote
-    URL so that the credential never appears in ``git remote -v``, process
-    listings, or CalledProcessError messages.
+    Embeds the token directly in the remote URL
+    (``https://x-token-auth:TOKEN@github.com/...``) rather than relying on
+    ``http.extraheader``, which can be silently overridden by system or global
+    git credential helpers present in the container.
+
+    Strips any previously embedded credentials from the URL before writing the
+    new one, so this is safe to call on repos already cloned with a token URL.
 
     Only applied when the remote URL is HTTPS; SSH remotes are authenticated
     via the private key passed through ``_git_ssh_env``.
     """
+    from urllib.parse import urlparse
+
     current_url = _run(
         ["git", "remote", "get-url", "origin"], cwd=repo_path, env=env
     ).strip()
     if not current_url.startswith("https://"):
         return  # SSH remote — auth is handled by _git_ssh_env private key
+
+    parsed = urlparse(current_url)
+    host = parsed.hostname or "github.com"
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    authed_url = parsed._replace(netloc=f"x-token-auth:{access_token}@{host}").geturl()
     _run(
-        [
-            "git",
-            "config",
-            "--local",
-            "http.extraheader",
-            f"Authorization: token {access_token}",
-        ],
+        ["git", "remote", "set-url", "origin", authed_url],
         cwd=repo_path,
         env=env,
         redact=access_token,
