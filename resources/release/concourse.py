@@ -258,6 +258,13 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             _build_changelog_entry(version.version, commits)
         )
 
+        # Write .git/ref and .git/short_ref so downstream steps that expect the
+        # same layout as the standard Concourse git resource can read the SHA.
+        git_dir = destination_dir / ".git"
+        git_dir.mkdir(exist_ok=True)
+        (git_dir / "ref").write_text(version.head_sha)
+        (git_dir / "short_ref").write_text(version.head_sha[:7])
+
         return version, {
             "version": version.version,
             "commit_count": version.commit_count,
