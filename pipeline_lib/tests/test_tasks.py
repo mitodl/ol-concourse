@@ -57,6 +57,23 @@ class TestBumpVersionTask:
         assert "--no-commit" in script
         assert "--allow-dirty" in script
 
+    def test_shell_script_checks_since_file_for_semver(self):
+        step = bump_version_task(version_file="release/version", repository="src")
+        script = step.config.run.args[1]
+        assert "release/since" in script
+        assert "SINCE_SEMVER" in script
+
+    def test_shell_script_uses_replace_for_semver_transition(self):
+        step = bump_version_task(version_file="release/version", repository="src")
+        script = step.config.run.args[1]
+        assert "bump-my-version replace" in script
+        assert '--current-version "$SINCE_SEMVER"' in script
+
+    def test_shell_script_strips_v_prefix_from_since(self):
+        step = bump_version_task(version_file="release/version", repository="src")
+        script = step.config.run.args[1]
+        assert "${SINCE#v}" in script
+
     def test_shell_script_reads_version_from_file(self):
         step = bump_version_task(version_file="release/version")
         script = step.config.run.args[1]

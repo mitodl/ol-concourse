@@ -91,10 +91,24 @@ def bump_version_task(
                 args=[
                     "-ec",
                     rf"""VERSION=$(cat {shlex.quote(version_file)})
+SINCE_SEMVER=""
+if [ -f {shlex.quote(version_input + "/since")} ]; then
+    SINCE=$(cat {shlex.quote(version_input + "/since")})
+    SINCE_STRIPPED="${{SINCE#v}}"
+    if echo "$SINCE_STRIPPED" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        SINCE_SEMVER="$SINCE_STRIPPED"
+    fi
+fi
 git -C {shlex.quote(repo_id)} config user.email {shlex.quote(git_email)}
 git -C {shlex.quote(repo_id)} config user.name {shlex.quote(git_user)}
 cd {shlex.quote(repo_id)}
-bump-my-version bump --new-version "$VERSION" --no-commit --allow-dirty --verbose""",
+if [ -n "$SINCE_SEMVER" ]; then
+    bump-my-version replace \
+        --current-version "$SINCE_SEMVER" --new-version "$VERSION" \
+        --allow-dirty --verbose
+else
+    bump-my-version bump --new-version "$VERSION" --no-commit --allow-dirty --verbose
+fi""",
                 ],
             ),
         ),
