@@ -381,7 +381,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
              the changelog update in a single "Release {version}" commit so
              that the entire release is one atomic unit.
         """
-        branch_name = f"release/{version}"
+        branch_name = f"releases/{version}"
 
         _run(["git", "fetch", "origin", self.branch, "--tags"], cwd=repo_path, env=env)
 
@@ -493,7 +493,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
         Returns the merge commit SHA.
         """
-        branch_name = f"release/{version}"
+        branch_name = f"releases/{version}"
 
         _run(
             ["git", "fetch", "origin", self.branch, branch_name],
@@ -513,7 +513,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 "--no-ff",
                 f"origin/{branch_name}",
                 "-m",
-                f"Merge release/{version}",
+                f"Merge releases/{version}",
             ],
             cwd=repo_path,
             env=env,

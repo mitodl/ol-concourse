@@ -761,11 +761,11 @@ def test_publish_new_version_create(mock_run, tmp_path):
             "",  # git checkout main
             "",  # git reset --hard origin/main
             pre_bump_sha,  # git rev-parse HEAD (pre-bump)
-            "",  # git checkout -b release/2026.4.14.1
+            "",  # git checkout -b releases/2026.4.14.1
             "",  # git status --porcelain (staging check — empty, no dirty files)
             "",  # git tag --list (for prior tags in _collect_commits_range)
             "",  # git log (no commits in range)
-            "",  # git push origin release/2026.4.14.1
+            "",  # git push origin releases/2026.4.14.1
             "",  # git tag 2026.4.14.1 <sha>
             "",  # git push origin refs/tags/2026.4.14.1
         ]
@@ -924,7 +924,7 @@ def test_publish_new_version_finish(mock_run, tmp_path):
     merge_cmds = [c for c in all_cmds if "merge" in c]
     assert merge_cmds, "Expected a git merge call"
     merge_cmd = merge_cmds[0]
-    assert f"origin/release/{version_str}" in merge_cmd
+    assert f"origin/releases/{version_str}" in merge_cmd
     assert "--no-ff" in merge_cmd
 
     push_cmds = [c for c in all_cmds if "push" in c]
