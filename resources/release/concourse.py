@@ -23,12 +23,13 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -157,7 +158,9 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             _clone(self.uri, repo_path, env=env, depth=self.clone_depth)
             return self._compute_versions(repo_path, env=env)
 
-    def _compute_versions(self, repo_path: Path, env: dict) -> list[ReleaseVersion]:
+    def _compute_versions(
+        self, repo_path: Path, env: dict[str, str]
+    ) -> list[ReleaseVersion]:
         tags = _get_release_tags(repo_path, env=env)
         latest_tag = tags[-1] if tags else None
 
@@ -261,8 +264,8 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         }
 
     def _collect_commits(
-        self, repo_path: Path, version: ReleaseVersion, env: dict
-    ) -> list[dict]:
+        self, repo_path: Path, version: ReleaseVersion, env: dict[str, str]
+    ) -> list[dict[str, Any]]:
         """Return enriched commit list between the previous tag and head_sha."""
         if version.since:
             range_spec = f"{version.since}..{version.head_sha}"
@@ -274,7 +277,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             env=env,
         )
 
-        commits: list[dict] = []
+        commits: list[dict[str, Any]] = []
         for line in output.splitlines():
             line = line.strip()
             if not line:
@@ -365,7 +368,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         repo_path: Path,
         version: str,
         commit_hash: str | None,
-        env: dict,
+        env: dict[str, str],
     ) -> str:
         """Create the release branch and version tag.
 
@@ -382,6 +385,27 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
         _run(["git", "fetch", "origin", self.branch, "--tags"], cwd=repo_path, env=env)
 
+        # Stash uncommitted changes (version-bump files from bump_version_task) after
+        # fetch but before the hard reset.  git reset --hard discards working-tree
+        # modifications; stashing here preserves them so they can be committed as
+        # part of the release commit below.
+        had_stash = bool(
+            _run(["git", "status", "--porcelain"], cwd=repo_path, env=env).strip()
+        )
+        if had_stash:
+            _run(
+                [
+                    "git",
+                    "stash",
+                    "push",
+                    "--include-untracked",
+                    "-m",
+                    "bump_version_task changes",
+                ],
+                cwd=repo_path,
+                env=env,
+            )
+
         # Ensure we are on the correct branch and up-to-date with the remote
         # before capturing the pre-bump SHA; avoids tagging the wrong commit
         # if the workspace is in a detached-HEAD state.
@@ -391,6 +415,9 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             cwd=repo_path,
             env=env,
         )
+
+        if had_stash:
+            _run(["git", "stash", "pop"], cwd=repo_path, env=env)
 
         # The tag marks the last commit of the source that was cut for this
         # release — the HEAD of the tracked branch before any release machinery
@@ -459,7 +486,9 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         )
         return pre_bump_sha
 
-    def _finish_release(self, repo_path: Path, version: str, env: dict) -> str:
+    def _finish_release(
+        self, repo_path: Path, version: str, env: dict[str, str]
+    ) -> str:
         """Merge the release branch into the configured tracked branch.
 
         Returns the merge commit SHA.
@@ -493,8 +522,8 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         return _run(["git", "rev-parse", "HEAD"], cwd=repo_path, env=env).strip()
 
     def _collect_commits_range(
-        self, repo_path: Path, since_ref: str, until_ref: str, env: dict
-    ) -> list[dict]:
+        self, repo_path: Path, since_ref: str, until_ref: str, env: dict[str, str]
+    ) -> list[dict[str, Any]]:
         """Return enriched commit list between two refs."""
         range_spec = f"{since_ref}..{until_ref}" if since_ref else until_ref
         output = _run(
@@ -503,7 +532,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             env=env,
         )
 
-        commits: list[dict] = []
+        commits: list[dict[str, Any]] = []
         for line in output.splitlines():
             line = line.strip()
             if not line:
@@ -528,7 +557,11 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         return commits
 
     def _stage_changelog(
-        self, repo_path: Path, version: str, commits: list[dict], env: dict
+        self,
+        repo_path: Path,
+        version: str,
+        commits: list[dict[str, Any]],
+        env: dict[str, str],
     ) -> None:
         """Write / update the changelog file and stage it for the release commit."""
         entry = _build_changelog_entry(version, commits)
@@ -552,7 +585,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
 
 @contextmanager
-def _git_ssh_env(private_key: str | None) -> Iterator[dict]:
+def _git_ssh_env(private_key: str | None) -> Iterator[dict[str, str]]:
     """Yield an env dict with GIT_SSH_COMMAND set for the given private key.
 
     When private_key is None, yields a copy of the current environment
@@ -582,7 +615,7 @@ def _run(
     cmd: list[str],
     *,
     cwd: Path | None = None,
-    env: dict | None = None,
+    env: dict[str, str] | None = None,
     redact: str | None = None,
 ) -> str:
     """Run a subprocess command and return stdout as a string.
@@ -606,12 +639,16 @@ def _run(
         if redact:
             stdout = stdout.replace(redact, "***")
             stderr = stderr.replace(redact, "***")
+        if stderr:
+            print(f"[git stderr] {stderr.rstrip()}", file=sys.stderr)  # noqa: T201
+        if stdout:
+            print(f"[git stdout] {stdout.rstrip()}", file=sys.stderr)  # noqa: T201
         raise subprocess.CalledProcessError(result.returncode, cmd, stdout, stderr)
     return result.stdout
 
 
 def _clone(
-    uri: str, target: Path, *, env: dict, depth: int = _DEFAULT_CLONE_DEPTH
+    uri: str, target: Path, *, env: dict[str, str], depth: int = _DEFAULT_CLONE_DEPTH
 ) -> None:
     """Shallow-clone uri into target, fetching all tags.
 
@@ -635,7 +672,7 @@ def _clone(
     _run(["git", "fetch", "--tags", *tag_depth_args], cwd=target, env=env)
 
 
-def _get_release_tags(repo_path: Path, *, env: dict) -> list[str]:
+def _get_release_tags(repo_path: Path, *, env: dict[str, str]) -> list[str]:
     """Return all YYYY.MM.DD.N tags in the repository, sorted oldest-first."""
     output = _run(["git", "tag", "--list"], cwd=repo_path, env=env)
     tags = [t.strip() for t in output.splitlines() if VERSION_PATTERN.match(t.strip())]
@@ -658,7 +695,7 @@ def _parse_semver_tuple(tag: str) -> tuple[int, int, int]:
 
 
 def _commit_info_range(
-    repo_path: Path, since_ref: str, until_ref: str, *, env: dict
+    repo_path: Path, since_ref: str, until_ref: str, *, env: dict[str, str]
 ) -> tuple[int, str]:
     """Return (commit_count, comma-separated unique author emails) for a range."""
     range_spec = f"{since_ref}..{until_ref}" if since_ref else until_ref
@@ -667,7 +704,9 @@ def _commit_info_range(
     return len(emails), ",".join(sorted(set(emails)))
 
 
-def _commit_info_all(repo_path: Path, until_ref: str, *, env: dict) -> tuple[int, str]:
+def _commit_info_all(
+    repo_path: Path, until_ref: str, *, env: dict[str, str]
+) -> tuple[int, str]:
     """Return (commit_count, comma-separated unique author emails) for all commits."""
     output = _run(["git", "log", "--format=%ae", until_ref], cwd=repo_path, env=env)
     emails = [e.strip() for e in output.splitlines() if e.strip()]
@@ -675,13 +714,15 @@ def _commit_info_all(repo_path: Path, until_ref: str, *, env: dict) -> tuple[int
 
 
 def _configure_git_identity(
-    repo_path: Path, name: str, email: str, *, env: dict
+    repo_path: Path, name: str, email: str, *, env: dict[str, str]
 ) -> None:
     _run(["git", "config", "user.name", name], cwd=repo_path, env=env)
     _run(["git", "config", "user.email", email], cwd=repo_path, env=env)
 
 
-def _configure_https_auth(repo_path: Path, access_token: str, *, env: dict) -> None:
+def _configure_https_auth(
+    repo_path: Path, access_token: str, *, env: dict[str, str]
+) -> None:
     """Configure git HTTPS authentication via http.extraheader.
 
     Uses ``http.extraheader`` rather than embedding the token in the remote
@@ -716,8 +757,12 @@ def _configure_https_auth(repo_path: Path, access_token: str, *, env: dict) -> N
 
 
 def _enrich_with_github(
-    commits: list[dict], access_token: str, repository: str, *, max_commits: int = 50
-) -> list[dict]:
+    commits: list[dict[str, Any]],
+    access_token: str,
+    repository: str,
+    *,
+    max_commits: int = 50,
+) -> list[dict[str, Any]]:
     """Query the GitHub API to fill in pr_number and pr_title for each commit.
 
     Only the first *max_commits* entries are queried to avoid exhausting the
@@ -777,7 +822,7 @@ def _compute_next_version(existing_tags: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _build_checklist(version: str, commits: list[dict]) -> str:
+def _build_checklist(version: str, commits: list[dict[str, Any]]) -> str:
     """Build a GitHub Issue body with a markdown task checklist."""
     lines = [
         f"## Release {version}",
@@ -803,7 +848,7 @@ def _build_checklist(version: str, commits: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _build_changelog_entry(version: str, commits: list[dict]) -> str:
+def _build_changelog_entry(version: str, commits: list[dict[str, Any]]) -> str:
     """Build a single Keep a Changelog entry for the given version."""
     today_str = datetime.now(tz=UTC).strftime("%Y-%m-%d")
     lines = [

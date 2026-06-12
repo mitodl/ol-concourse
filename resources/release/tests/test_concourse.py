@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,8 +29,8 @@ from concourse import (
 # ---------------------------------------------------------------------------
 
 
-def make_resource(**kwargs) -> ReleaseResource:
-    defaults = {
+def make_resource(**kwargs: Any) -> ReleaseResource:
+    defaults: dict[str, Any] = {
         "uri": "https://github.com/mitodl/my-app.git",
         "branch": "main",
         "access_token": None,
@@ -51,7 +52,7 @@ def make_version(**kwargs) -> ReleaseVersion:
     return ReleaseVersion(**defaults)
 
 
-def make_commits(n: int = 2) -> list[dict]:
+def make_commits(n: int = 2) -> list[dict[str, Any]]:
     return [
         {
             "sha": f"{'a' * 7}{i}" * 5,
@@ -226,7 +227,7 @@ def test_build_checklist_empty_commits():
 
 
 def test_build_changelog_entry_format():
-    commits = [
+    commits: list[dict[str, Any]] = [
         {
             "sha": "abc1234def5",
             "author": "dev@example.com",
@@ -518,7 +519,7 @@ def test_create_release_semver_fallback_disabled_no_since(mock_run, tmp_path):
 
 def _make_run_side_effects(
     tag_list: list[str], head_sha: str, tag_sha: str = ""
-) -> list:
+) -> list[str]:
     """Build a list of subprocess outputs for check's _run calls."""
     # clone=no output; fetch tags=no output; tag --list; rev-parse HEAD; rev-list -n1
     tags_output = "\n".join(tag_list)
@@ -731,7 +732,7 @@ def test_publish_new_version_invalid_action(mock_run, tmp_path):
         resource.publish_new_version(
             tmp_path,
             MagicMock(),
-            action="deploy",
+            action="deploy",  # type: ignore[arg-type]
             repo_dir="app-source",
             version_file="release/version",
         )
@@ -756,11 +757,12 @@ def test_publish_new_version_create(mock_run, tmp_path):
             "",  # git config user.name
             "",  # git config user.email
             "",  # git fetch origin main --tags
-            "",  # git checkout main  (new: ensure correct branch)
-            "",  # git reset --hard origin/main  (new: sync with remote)
+            "",  # git status --porcelain (check dirty before reset — no dirty files)
+            "",  # git checkout main
+            "",  # git reset --hard origin/main
             pre_bump_sha,  # git rev-parse HEAD (pre-bump)
             "",  # git checkout -b release/2026.4.14.1
-            "",  # git status --porcelain (empty — no dirty files)
+            "",  # git status --porcelain (staging check — empty, no dirty files)
             "",  # git tag --list (for prior tags in _collect_commits_range)
             "",  # git log (no commits in range)
             "",  # git push origin release/2026.4.14.1
@@ -789,6 +791,61 @@ def test_publish_new_version_create(mock_run, tmp_path):
         if "tag" in c.args[0] and pre_bump_sha in c.args[0]
     ]
     assert tag_calls, "Expected git tag call with pre_bump_sha"
+
+
+@patch("concourse._run")
+def test_publish_new_version_create_stashes_dirty_files(mock_run, tmp_path):
+    """Dirty files from bump_version_task are stashed before git reset --hard.
+
+    Stashed changes are popped after the reset so they survive and land in the
+    release commit.
+    """
+    version_str = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    pre_bump_sha = "prebump1" * 5
+    stash_calls: list[list[str]] = []
+    status_call_count = 0
+
+    def fake_run(cmd, **kw):
+        nonlocal status_call_count
+        if "stash" in cmd:
+            stash_calls.append(list(cmd))
+            return ""
+        if "status" in cmd and "--porcelain" in cmd:
+            status_call_count += 1
+            # First call (pre-reset check): return dirty marker to trigger stash.
+            # Second call (staging check after stash pop): return dirty to trigger add.
+            return "M pyproject.toml" if status_call_count <= 2 else ""
+        if "rev-parse" in cmd:
+            return pre_bump_sha
+        if "tag" in cmd and "--list" in cmd:
+            return ""
+        if "log" in cmd:
+            return ""
+        return ""
+
+    mock_run.side_effect = fake_run
+    resource = make_resource()
+    resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    stash_push = [c for c in stash_calls if "push" in c]
+    stash_pop = [c for c in stash_calls if "pop" in c]
+    assert stash_push, "Expected git stash push when dirty files are present"
+    assert stash_pop, "Expected git stash pop to restore version-bump changes"
+    # stash push must precede stash pop
+    push_idx = stash_calls.index(stash_push[0])
+    pop_idx = stash_calls.index(stash_pop[0])
+    assert push_idx < pop_idx, "git stash push must precede git stash pop"
 
 
 @patch("concourse._run")
