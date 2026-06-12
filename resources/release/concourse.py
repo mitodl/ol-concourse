@@ -591,7 +591,7 @@ def _git_ssh_env(private_key: str | None) -> Iterator[dict[str, str]]:
     When private_key is None, yields a copy of the current environment
     unchanged so callers can unconditionally use the env dict.
     """
-    base_env = os.environ.copy()
+    base_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     if not private_key:
         yield base_env
         return
