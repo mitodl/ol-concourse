@@ -98,8 +98,9 @@ for file_config in bv.get("files", []):
         continue
     search_tmpl = file_config.get("search", "{current_version}")
     repl_tmpl = file_config.get("replace", "{new_version}")
-    search = search_tmpl.replace("{current_version}", since)
-    repl = repl_tmpl.replace("{new_version}", new_ver)
+    unescape = lambda s: s.replace("{{", "{").replace("}}", "}")
+    search = unescape(search_tmpl).replace("{current_version}", since)
+    repl = unescape(repl_tmpl).replace("{new_version}", new_ver)
     path = pathlib.Path(filename)
     if not path.exists():
         print("Skipping " + filename + " (not found)", file=sys.stderr)
