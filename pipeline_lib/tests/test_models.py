@@ -12,6 +12,7 @@ from ol_concourse.lib.models.pipeline import (
     Command,
     DisplayConfig,
     Duration,
+    GetStep,
     GroupConfig,
     Identifier,
     Input,
@@ -21,6 +22,7 @@ from ol_concourse.lib.models.pipeline import (
     Output,
     Pipeline,
     Platform,
+    PutStep,
     Resource,
     ResourceType,
     SetPipelineStep,
@@ -403,6 +405,148 @@ class TestPipelineValidation:
             groups=[GroupConfig(name=Identifier("tests"), jobs=["test-*"])],
         )
         assert len(pipeline.jobs) == 2
+
+
+class TestStepModifierAcross:
+    def test_across_none_is_valid(self):
+        step = GetStep(get="repo")
+        assert step.across is None
+
+    def test_across_with_var_is_valid(self):
+        step = GetStep(
+            get="repo",
+            across=[AcrossVar(var=Identifier("env"), values=[Value("prod")])],
+        )
+        assert len(step.across) == 1
+
+    def test_across_empty_list_raises(self):
+        with pytest.raises(ValidationError, match="at least one var"):
+            GetStep(get="repo", across=[])
+
+    def test_across_empty_list_on_put_raises(self):
+        with pytest.raises(ValidationError, match="at least one var"):
+            PutStep(put="repo", across=[])
+
+
+class TestPipelineResourceValidation:
+    def test_unused_resource_raises(self):
+        resource = Resource(name=Identifier("repo"), type="git")
+        with pytest.raises(ValidationError, match="is not used"):
+            Pipeline(jobs=[_minimal_job()], resources=[resource])
+
+    def test_used_resource_via_get_valid(self):
+        pipeline = Pipeline(
+            jobs=[Job(name=Identifier("j"), plan=[GetStep(get="repo")])],
+            resources=[Resource(name=Identifier("repo"), type="git")],
+        )
+        assert len(pipeline.resources) == 1
+
+    def test_used_resource_via_put_valid(self):
+        pipeline = Pipeline(
+            jobs=[Job(name=Identifier("j"), plan=[PutStep(put="repo")])],
+            resources=[Resource(name=Identifier("repo"), type="git")],
+        )
+        assert len(pipeline.resources) == 1
+
+    def test_resource_aliased_via_get_resource_field(self):
+        pipeline = Pipeline(
+            jobs=[
+                Job(
+                    name=Identifier("j"),
+                    plan=[GetStep(get="code", resource="repo")],
+                )
+            ],
+            resources=[Resource(name=Identifier("repo"), type="git")],
+        )
+        assert len(pipeline.resources) == 1
+
+    def test_resource_aliased_via_put_resource_field(self):
+        pipeline = Pipeline(
+            jobs=[
+                Job(
+                    name=Identifier("j"),
+                    plan=[PutStep(put="artifact", resource="repo")],
+                )
+            ],
+            resources=[Resource(name=Identifier("repo"), type="git")],
+        )
+        assert len(pipeline.resources) == 1
+
+    def test_unknown_resource_in_get_raises(self):
+        with pytest.raises(ValidationError, match="unknown resource"):
+            Pipeline(
+                jobs=[Job(name=Identifier("j"), plan=[GetStep(get="typo")])],
+                resources=[Resource(name=Identifier("repo"), type="git")],
+            )
+
+    def test_unknown_resource_in_put_raises(self):
+        with pytest.raises(ValidationError, match="unknown resource"):
+            Pipeline(
+                jobs=[Job(name=Identifier("j"), plan=[PutStep(put="typo")])],
+                resources=[Resource(name=Identifier("repo"), type="git")],
+            )
+
+    def test_resource_used_in_job_hook_valid(self):
+        pipeline = Pipeline(
+            jobs=[
+                Job(
+                    name=Identifier("j"),
+                    plan=[TaskStep(task=Identifier("t"), file="ci/task.yml")],
+                    on_failure=PutStep(put="notify"),
+                )
+            ],
+            resources=[Resource(name=Identifier("notify"), type="slack-notification")],
+        )
+        assert len(pipeline.resources) == 1
+
+    def test_passed_job_not_exist_raises(self):
+        with pytest.raises(ValidationError, match="no matching job"):
+            Pipeline(
+                jobs=[
+                    Job(
+                        name=Identifier("consumer"),
+                        plan=[GetStep(get="repo", passed=["nonexistent"])],
+                    )
+                ],
+                resources=[Resource(name=Identifier("repo"), type="git")],
+            )
+
+    def test_passed_job_exists_valid(self):
+        pipeline = Pipeline(
+            jobs=[
+                Job(name=Identifier("producer"), plan=[PutStep(put="repo")]),
+                Job(
+                    name=Identifier("consumer"),
+                    plan=[GetStep(get="repo", passed=["producer"])],
+                ),
+            ],
+            resources=[Resource(name=Identifier("repo"), type="git")],
+        )
+        assert len(pipeline.jobs) == 2
+
+    def test_passed_job_glob_valid(self):
+        pipeline = Pipeline(
+            jobs=[
+                Job(name=Identifier("build-unit"), plan=[PutStep(put="repo")]),
+                Job(
+                    name=Identifier("deploy"),
+                    plan=[GetStep(get="repo", passed=["build-*"])],
+                ),
+            ],
+            resources=[Resource(name=Identifier("repo"), type="git")],
+        )
+        assert len(pipeline.jobs) == 2
+
+    def test_no_resources_and_no_get_put_valid(self):
+        pipeline = Pipeline(
+            jobs=[
+                Job(
+                    name=Identifier("j"),
+                    plan=[TaskStep(task=Identifier("t"), file="ci/task.yml")],
+                )
+            ],
+        )
+        assert pipeline.resources is None
 
 
 class TestResourceTypes:

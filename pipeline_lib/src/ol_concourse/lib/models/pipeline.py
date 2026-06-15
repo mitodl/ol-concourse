@@ -298,6 +298,13 @@ class StepModifierMixin(BaseModel):
             " related pipelines."
         ),
     )
+
+    @model_validator(mode="after")
+    def validate_across_not_empty(self) -> StepModifierMixin:
+        if self.across is not None and len(self.across) == 0:
+            raise ValueError("across: must specify at least one var")
+        return self
+
     attempts: PositiveInt | None = Field(
         None,
         description=(
@@ -2133,6 +2140,62 @@ class Pipeline(BaseModel):
                 seen[name] = True
         return errors
 
+    @staticmethod
+    def _all_steps(steps: list[Any]) -> list[Any]:
+        result: list[Any] = []
+        for step in steps or []:
+            if step is None:
+                continue
+            result.append(step)
+            if hasattr(step, "do") and step.do is not None:
+                result.extend(Pipeline._all_steps(step.do))
+            if hasattr(step, "try_") and step.try_ is not None:
+                result.extend(Pipeline._all_steps([step.try_]))
+            if hasattr(step, "in_parallel") and step.in_parallel is not None:
+                ip = step.in_parallel
+                if hasattr(ip, "steps") and ip.steps is not None:
+                    result.extend(Pipeline._all_steps(ip.steps))
+                elif isinstance(ip, list):
+                    result.extend(Pipeline._all_steps(ip))
+            for attr in ("on_success", "on_failure", "on_error", "on_abort", "ensure"):
+                hook = getattr(step, attr, None)
+                if hook is not None:
+                    result.extend(Pipeline._all_steps([hook]))
+        return result
+
+    def _collect_step_errors(
+        self, defined_resources: set[str]
+    ) -> tuple[set[str], set[str], list[str]]:
+        used: set[str] = set()
+        unknown: set[str] = set()
+        errors: list[str] = []
+        job_names = {str(j.name) for j in (self.jobs or []) if j.name}
+        for job in self.jobs or []:
+            job_hooks = [
+                getattr(job, a, None)
+                for a in ("on_success", "on_failure", "on_error", "on_abort", "ensure")
+            ]
+            all_top = list(job.plan or []) + [h for h in job_hooks if h is not None]
+            for step in self._all_steps(all_top):
+                if isinstance(step, GetStep):
+                    raw = step.resource or step.get
+                    name = str(raw) if raw else None
+                    if name:
+                        used.add(name)
+                        if name not in defined_resources:
+                            unknown.add(name)
+                    for job_glob in step.passed or []:
+                        if not any(fnmatch.fnmatch(j, job_glob) for j in job_names):
+                            errors.append(f"no matching job(s) for '{job_glob}'")
+                elif isinstance(step, PutStep):
+                    raw = step.resource or step.put
+                    name = str(raw) if raw else None
+                    if name:
+                        used.add(name)
+                        if name not in defined_resources:
+                            unknown.add(name)
+        return used, unknown, errors
+
     def _group_errors(self, job_names: set[str]) -> list[str]:
         errors: list[str] = []
         jobs_in_groups: set[str] = set()
@@ -2173,6 +2236,15 @@ class Pipeline(BaseModel):
         if self.groups:
             job_names = {str(j.name) for j in (self.jobs or []) if j.name}
             errors.extend(self._group_errors(job_names))
+
+        if self.jobs:
+            defined = {str(r.name) for r in (self.resources or []) if r.name}
+            used, unknowns, step_errors = self._collect_step_errors(defined)
+            for rname in sorted(defined - used):
+                errors.append(f"resource '{rname}' is not used")
+            for rname in sorted(unknowns):
+                errors.append(f"unknown resource '{rname}'")
+            errors.extend(step_errors)
 
         if errors:
             raise ValueError("\n".join(errors))
