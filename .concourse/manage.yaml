@@ -1,36 +1,64 @@
 ---
-# Self-managing pipeline: keeps the docker image build and PyPI publishing
-# pipelines in sync with their respective .concourse/*.yaml files whenever
-# the ol-concourse repository changes.
+jobs:
+- name: set-self
+  plan:
+  - trigger: true
+    get: ol-concourse
+  - set_pipeline: self
+    file: ol-concourse/.concourse/manage.yaml
+  public: true
+- name: set-docker-pipeline
+  plan:
+  - trigger: true
+    get: ol-concourse
+  - config:
+      image_resource:
+        source:
+          repository: mitodl/ol-concourse-dsl
+          tag: latest
+        type: registry-image
+      run:
+        args:
+        - -exc
+        - python ol-concourse/.concourse/docker.py > generated/pipeline.yaml
+        path: /bin/sh
+      inputs:
+      - name: ol-concourse
+      platform: linux
+      outputs:
+      - name: generated
+    task: generate-pipeline
+  - set_pipeline: docker
+    file: generated/pipeline.yaml
+  public: true
+- name: set-pypi-pipeline
+  plan:
+  - trigger: true
+    get: ol-concourse
+  - config:
+      image_resource:
+        source:
+          repository: mitodl/ol-concourse-dsl
+          tag: latest
+        type: registry-image
+      run:
+        args:
+        - -exc
+        - python ol-concourse/.concourse/pypi.py > generated/pipeline.yaml
+        path: /bin/sh
+      inputs:
+      - name: ol-concourse
+      platform: linux
+      outputs:
+      - name: generated
+    task: generate-pipeline
+  - set_pipeline: publish-ol-concourse
+    file: generated/pipeline.yaml
+  public: true
 resources:
 - name: ol-concourse
-  type: git
-  icon: github
   source:
     uri: https://github.com/mitodl/ol-concourse
     branch: main
-
-jobs:
-- name: set-self
-  public: true
-  plan:
-  - get: ol-concourse
-    trigger: true
-  - set_pipeline: self
-    file: ol-concourse/.concourse/manage.yaml
-
-- name: set-docker-pipeline
-  public: true
-  plan:
-  - get: ol-concourse
-    trigger: true
-  - set_pipeline: docker
-    file: ol-concourse/.concourse/docker.yaml
-
-- name: set-pypi-pipeline
-  public: true
-  plan:
-  - get: ol-concourse
-    trigger: true
-  - set_pipeline: publish-ol-concourse
-    file: ol-concourse/.concourse/pypi.yaml
+  icon: github
+  type: git
