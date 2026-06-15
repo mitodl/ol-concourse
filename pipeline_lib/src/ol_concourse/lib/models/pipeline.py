@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import fnmatch
+import re
 from enum import StrEnum
 from typing import Annotated, Any, Literal
+from urllib.parse import urlparse
 
 from pydantic import (
     BaseModel,
@@ -16,6 +19,10 @@ from pydantic import (
     StringConstraints,
     model_serializer,
     model_validator,
+)
+
+_GO_DURATION_RE = re.compile(
+    r"^(?:0|(?:(?:\d+(?:\.\d*)?|\.\d+)(?:ns|us|µs|ms|s|m|h))+)$"
 )
 
 
@@ -61,6 +68,15 @@ class Value(RootModel[Any]):
 class Duration(RootModel[str]):
     root: str
 
+    @model_validator(mode="after")
+    def validate_go_duration(self) -> Duration:
+        if not _GO_DURATION_RE.match(self.root):
+            raise ValueError(
+                f"'{self.root}' is not a valid duration: must be a Go duration string "
+                f"(e.g. '30m', '1h30m', '300ms', '0')"
+            )
+        return self
+
 
 class RegistryImage(BaseModel):
     repository: str
@@ -79,6 +95,18 @@ class DisplayConfig(BaseModel):
             " http, https, or relative URL."
         ),
     )
+
+    @model_validator(mode="after")
+    def validate_background_image_url(self) -> DisplayConfig:
+        if self.background_image is None:
+            return self
+        parsed = urlparse(self.background_image)
+        if parsed.scheme not in ("", "http", "https"):
+            raise ValueError(
+                f"background_image scheme must be either http, https or relative, "
+                f"got '{parsed.scheme}'"
+            )
+        return self
 
 
 class Cache(BaseModel):
@@ -270,6 +298,13 @@ class StepModifierMixin(BaseModel):
             " related pipelines."
         ),
     )
+
+    @model_validator(mode="after")
+    def validate_across_not_empty(self) -> StepModifierMixin:
+        if self.across is not None and len(self.across) == 0:
+            raise ValueError("across: must specify at least one var")
+        return self
+
     attempts: PositiveInt | None = Field(
         None,
         description=(
@@ -591,6 +626,12 @@ class AcrossVar(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def validate_max_in_flight(self) -> AcrossVar:
+        if isinstance(self.max_in_flight, Number) and self.max_in_flight.root <= 0:
+            raise ValueError("max_in_flight must be greater than 0")
+        return self
+
 
 class DummyVarSource(VarSource):
     model_config = ConfigDict(extra="forbid")
@@ -856,6 +897,12 @@ class SetPipelineStep(Step, StepModifierMixin):
         ),
     )
 
+    @model_validator(mode="after")
+    def validate_file_required(self) -> SetPipelineStep:
+        if self.file is None:
+            raise ValueError("set_pipeline step must specify 'file'")
+        return self
+
 
 class LoadVarStep(Step, StepModifierMixin):
     model_config = ConfigDict(extra="forbid")
@@ -918,6 +965,12 @@ class LoadVarStep(Step, StepModifierMixin):
             " value."
         ),
     )
+
+    @model_validator(mode="after")
+    def validate_file_required(self) -> LoadVarStep:
+        if self.file is None:
+            raise ValueError("load_var step must specify 'file'")
+        return self
 
 
 class Resource(BaseModel):
@@ -1513,6 +1566,23 @@ class TaskConfig(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def validate_task_config(self) -> TaskConfig:
+        errors = []
+        if not self.platform:
+            errors.append("missing 'platform'")
+        if self.inputs:
+            for i, inp in enumerate(self.inputs):
+                if not inp.name:
+                    errors.append(f"input in position {i} is missing a name")
+        if self.outputs:
+            for i, out in enumerate(self.outputs):
+                if not out.name:
+                    errors.append(f"output in position {i} is missing a name")
+        if errors:
+            raise ValueError("; ".join(errors))
+        return self
+
 
 class TaskStep(Step, StepModifierMixin):
     model_config = ConfigDict(extra="forbid")
@@ -1736,6 +1806,16 @@ class TaskStep(Step, StepModifierMixin):
         ),
     )
 
+    @model_validator(mode="after")
+    def validate_config_or_file(self) -> TaskStep:
+        if self.config is None and self.file is None:
+            raise ValueError("task step must specify either 'config' or 'file'")
+        if self.config is not None and self.file is not None:
+            raise ValueError(
+                "task step must specify only one of 'config' or 'file', not both"
+            )
+        return self
+
 
 class InParallelStep(Step, StepModifierMixin):
     model_config = ConfigDict(extra="forbid")
@@ -1926,6 +2006,43 @@ class Job(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def validate_build_log_retention(self) -> Job:
+        errors = []
+        if (
+            self.build_log_retention is not None
+            and self.build_logs_to_retain is not None
+        ):
+            errors.append(
+                "cannot use both 'build_log_retention' and 'build_logs_to_retain'"
+            )
+        if self.build_log_retention is not None:
+            r = self.build_log_retention
+            if r.builds is not None and r.builds.root < 0:
+                errors.append("build_log_retention.builds must not be negative")
+            if r.days is not None and r.days.root < 0:
+                errors.append("build_log_retention.days must not be negative")
+            if (
+                r.minimum_succeeded_builds is not None
+                and r.minimum_succeeded_builds.root < 0
+            ):
+                errors.append(
+                    "build_log_retention.minimum_succeeded_builds must not be negative"
+                )
+            if (
+                r.builds is not None
+                and r.minimum_succeeded_builds is not None
+                and r.builds.root > 0
+                and r.minimum_succeeded_builds.root > r.builds.root
+            ):
+                errors.append(
+                    "build_log_retention.minimum_succeeded_builds must not exceed "
+                    "build_log_retention.builds"
+                )
+        if errors:
+            raise ValueError("; ".join(errors))
+        return self
+
 
 class Pipeline(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -2010,6 +2127,130 @@ class Pipeline(BaseModel):
             "A set of  resources  resources  for the pipeline to continuously  check."
         ),
     )
+
+    @staticmethod
+    def _duplicate_names(items: list[Any], kind: str) -> list[str]:
+        seen: dict[str, bool] = {}
+        errors = []
+        for item in items:
+            name = str(item.name) if item.name else ""
+            if not name:
+                continue
+            if name in seen:
+                errors.append(f"{kind} '{name}' appears more than once")
+            else:
+                seen[name] = True
+        return errors
+
+    @staticmethod
+    def _all_steps(steps: list[Any]) -> list[Any]:
+        result: list[Any] = []
+        for step in steps or []:
+            if step is None:
+                continue
+            result.append(step)
+            if hasattr(step, "do") and step.do is not None:
+                result.extend(Pipeline._all_steps(step.do))
+            if hasattr(step, "try_") and step.try_ is not None:
+                result.extend(Pipeline._all_steps([step.try_]))
+            if hasattr(step, "in_parallel") and step.in_parallel is not None:
+                ip = step.in_parallel
+                if hasattr(ip, "steps") and ip.steps is not None:
+                    result.extend(Pipeline._all_steps(ip.steps))
+                elif isinstance(ip, list):
+                    result.extend(Pipeline._all_steps(ip))
+            for attr in ("on_success", "on_failure", "on_error", "on_abort", "ensure"):
+                hook = getattr(step, attr, None)
+                if hook is not None:
+                    result.extend(Pipeline._all_steps([hook]))
+        return result
+
+    def _collect_step_errors(
+        self, defined_resources: set[str]
+    ) -> tuple[set[str], set[str], list[str]]:
+        used: set[str] = set()
+        unknown: set[str] = set()
+        errors: list[str] = []
+        job_names = {str(j.name) for j in (self.jobs or []) if j.name}
+        for job in self.jobs or []:
+            job_hooks = [
+                getattr(job, a, None)
+                for a in ("on_success", "on_failure", "on_error", "on_abort", "ensure")
+            ]
+            all_top = list(job.plan or []) + [h for h in job_hooks if h is not None]
+            for step in self._all_steps(all_top):
+                if isinstance(step, GetStep):
+                    raw = step.resource or step.get
+                    name = str(raw) if raw else None
+                    if name:
+                        used.add(name)
+                        if name not in defined_resources:
+                            unknown.add(name)
+                    for job_glob in step.passed or []:
+                        if not any(fnmatch.fnmatchcase(j, job_glob) for j in job_names):
+                            errors.append(f"no matching job(s) for '{job_glob}'")
+                elif isinstance(step, PutStep):
+                    raw = step.resource or step.put
+                    name = str(raw) if raw else None
+                    if name:
+                        used.add(name)
+                        if name not in defined_resources:
+                            unknown.add(name)
+        return used, unknown, errors
+
+    def _group_errors(self, job_names: set[str]) -> list[str]:
+        errors: list[str] = []
+        jobs_in_groups: set[str] = set()
+        seen_group_names: dict[str, bool] = {}
+        for group in self.groups or []:
+            group_name = str(group.name) if group.name else ""
+            if group_name in seen_group_names:
+                errors.append(f"group '{group_name}' appears more than once")
+            else:
+                seen_group_names[group_name] = True
+            for job_glob in group.jobs or []:
+                matched = [j for j in job_names if fnmatch.fnmatchcase(j, job_glob)]
+                if not matched:
+                    errors.append(
+                        f"no jobs match '{job_glob}' for group '{group_name}'"
+                    )
+                else:
+                    jobs_in_groups.update(matched)
+        for job_name in sorted(job_names - jobs_in_groups):
+            errors.append(f"job '{job_name}' belongs to no group")
+        return errors
+
+    @model_validator(mode="after")
+    def validate_pipeline(self) -> Pipeline:
+        errors: list[str] = []
+
+        if not self.jobs:
+            errors.append("pipeline must contain at least one job")
+        else:
+            errors.extend(self._duplicate_names(self.jobs, "job"))
+
+        if self.resources:
+            errors.extend(self._duplicate_names(self.resources, "resource"))
+
+        if self.resource_types:
+            errors.extend(self._duplicate_names(self.resource_types, "resource type"))
+
+        if self.groups:
+            job_names = {str(j.name) for j in (self.jobs or []) if j.name}
+            errors.extend(self._group_errors(job_names))
+
+        if self.jobs:
+            defined = {str(r.name) for r in (self.resources or []) if r.name}
+            used, unknowns, step_errors = self._collect_step_errors(defined)
+            for rname in sorted(defined - used):
+                errors.append(f"resource '{rname}' is not used")
+            for rname in sorted(unknowns):
+                errors.append(f"unknown resource '{rname}'")
+            errors.extend(step_errors)
+
+        if errors:
+            raise ValueError("\n".join(errors))
+        return self
 
 
 class TryStep(Step, StepModifierMixin):
