@@ -271,6 +271,18 @@ class TestJobValidation:
         )
         assert job.build_log_retention.builds.root == 10
 
+    def test_zero_builds_with_min_succeeded_is_valid(self):
+        # builds=0 means "no limit"; the min_succeeded constraint only applies
+        # when builds > 0, matching Concourse's own Builds > 0 guard.
+        job = Job(
+            name=Identifier("j"),
+            plan=[],
+            build_log_retention=BuildLogRetentionPolicy(
+                builds=Number(0), minimum_succeeded_builds=Number(1)
+            ),
+        )
+        assert job.build_log_retention.builds.root == 0
+
 
 class TestPipelineFragment:
     def test_empty_fragment(self):

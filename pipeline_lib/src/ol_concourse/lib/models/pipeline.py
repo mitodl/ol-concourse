@@ -2134,6 +2134,8 @@ class Pipeline(BaseModel):
         errors = []
         for item in items:
             name = str(item.name) if item.name else ""
+            if not name:
+                continue
             if name in seen:
                 errors.append(f"{kind} '{name}' appears more than once")
             else:
@@ -2185,7 +2187,7 @@ class Pipeline(BaseModel):
                         if name not in defined_resources:
                             unknown.add(name)
                     for job_glob in step.passed or []:
-                        if not any(fnmatch.fnmatch(j, job_glob) for j in job_names):
+                        if not any(fnmatch.fnmatchcase(j, job_glob) for j in job_names):
                             errors.append(f"no matching job(s) for '{job_glob}'")
                 elif isinstance(step, PutStep):
                     raw = step.resource or step.put
@@ -2207,7 +2209,7 @@ class Pipeline(BaseModel):
             else:
                 seen_group_names[group_name] = True
             for job_glob in group.jobs or []:
-                matched = [j for j in job_names if fnmatch.fnmatch(j, job_glob)]
+                matched = [j for j in job_names if fnmatch.fnmatchcase(j, job_glob)]
                 if not matched:
                     errors.append(
                         f"no jobs match '{job_glob}' for group '{group_name}'"
