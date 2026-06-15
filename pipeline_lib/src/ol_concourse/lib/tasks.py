@@ -83,44 +83,76 @@ def bump_version_task(
     # serialize/hooks crash.  This script reads the [[tool.bumpversion.files]]
     # entries directly and does plain string substitution, then updates the
     # current_version tracking field — no parse() call involved.
-    _transition_script = r"""import tomllib, pathlib, sys
+    _transition_script = r"""import tomllib, pathlib, re, sys
 
-since = sys.argv[1]
+since = sys.argv[1]  # semver baseline passed in from outside
 new_ver = sys.argv[2]
 
 with open("pyproject.toml", "rb") as f:
     config = tomllib.load(f)
 
 bv = config.get("tool", {}).get("bumpversion", {})
+# The tracking field may have drifted from the version actually written in
+# files (e.g. bumpversion PR merged at 0.92.0, release-script then pushed
+# 0.93.0 before the Concourse pipeline ran).  Build an ordered list of
+# candidates so we try the most-likely-correct value first.
+tracked_ver = bv.get("current_version", since)
+candidates = list(dict.fromkeys(c for c in (since, tracked_ver) if c))
+
+unescape = lambda s: s.replace("{{", "{").replace("}}", "}")
+
 for file_config in bv.get("files", []):
     filename = file_config.get("filename")
     if not filename:
         continue
     search_tmpl = file_config.get("search", "{current_version}")
-    repl_tmpl = file_config.get("replace", "{new_version}")
-    unescape = lambda s: s.replace("{{", "{").replace("}}", "}")
-    search = unescape(search_tmpl).replace("{current_version}", since)
+    repl_tmpl   = file_config.get("replace", "{new_version}")
     repl = unescape(repl_tmpl).replace("{new_version}", new_ver)
     path = pathlib.Path(filename)
     if not path.exists():
         print("Skipping " + filename + " (not found)", file=sys.stderr)
         continue
     content = path.read_text()
-    if search in content:
-        path.write_text(content.replace(search, repl, 1))
-        print("Updated " + filename)
-    else:
-        print("Warning: version string not found in " + filename, file=sys.stderr)
 
+    replaced = False
+    for candidate in candidates:
+        search = unescape(search_tmpl).replace("{current_version}", candidate)
+        if search in content:
+            path.write_text(content.replace(search, repl, 1))
+            print("Updated " + filename + " (replaced " + candidate + ")")
+            replaced = True
+            break
+
+    if not replaced:
+        # Last-resort: regex scan for any semver-looking version in the
+        # search pattern so we can handle arbitrary drift.
+        pattern = re.escape(unescape(search_tmpl)).replace(
+            re.escape("{current_version}"), r"([0-9]+\.[0-9]+\.[0-9]+)"
+        )
+        m = re.search(pattern, content)
+        if m:
+            actual = m.group(1)
+            search = unescape(search_tmpl).replace("{current_version}", actual)
+            path.write_text(content.replace(search, repl, 1))
+            print("Updated " + filename + " (detected " + actual + " via regex)")
+        else:
+            print("Warning: version string not found in " + filename, file=sys.stderr)
+
+# Update the current_version tracking field.  Try each candidate so that
+# drift between `since` and the field value is handled gracefully.
 pyproject = pathlib.Path("pyproject.toml")
 content = pyproject.read_text()
-pyproject.write_text(
-    content.replace(
-        'current_version = "' + since + '"',
+updated = content
+for candidate in candidates:
+    next_content = updated.replace(
+        'current_version = "' + candidate + '"',
         'current_version = "' + new_ver + '"',
         1,
     )
-)
+    if next_content != updated:
+        updated = next_content
+        break
+pyproject.write_text(updated)
 print("Updated pyproject.toml current_version tracking")
 """
 
@@ -150,6 +182,16 @@ fi
 git -C {shlex.quote(repo_id)} config user.email {shlex.quote(git_email)}
 git -C {shlex.quote(repo_id)} config user.name {shlex.quote(git_user)}
 cd {shlex.quote(repo_id)}
+if [ -z "$SINCE_SEMVER" ] && [ -f pyproject.toml ]; then
+    PYPROJECT_VER=$(echo 'import tomllib as t
+bv=t.load(open("pyproject.toml","rb")).get("tool",{{}}).get("bumpversion",{{}})
+print(bv.get("current_version",""))
+' | python3 2>/dev/null || true)
+    PYPROJECT_STRIPPED="${{PYPROJECT_VER#v}}"
+    if echo "$PYPROJECT_STRIPPED" | grep -qE '^[0-9]{{1,3}}\.[0-9]+\.[0-9]+$'; then
+        SINCE_SEMVER="$PYPROJECT_STRIPPED"
+    fi
+fi
 if [ -n "$SINCE_SEMVER" ]; then
     python3 -c {shlex.quote(_transition_script)} "$SINCE_SEMVER" "$VERSION"
 else
