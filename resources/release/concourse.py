@@ -179,15 +179,22 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             prev_tag = tags[-2] if len(tags) >= 2 else ""  # noqa: PLR2004
 
             if tag_sha == head_sha:
-                # HEAD is already tagged — no new commits
-                count, authors = _commit_info_range(
-                    repo_path, prev_tag, head_sha, env=env
-                )
+                # HEAD is already tagged — no new commits.
+                # Use prev_tag as the baseline; when there is no prior date-format
+                # tag, fall back to the latest semver tag (same logic as the
+                # no-date-tags branch) so that commit_count and authors reflect the
+                # commits included in this release rather than the entire history.
+                since = prev_tag
+                if not since and self.semver_tag_fallback:
+                    semver_tags = _get_semver_tags(repo_path, env=env)
+                    if semver_tags:
+                        since = semver_tags[-1]
+                count, authors = _commit_info_range(repo_path, since, head_sha, env=env)
                 return [
                     ReleaseVersion(
                         version=latest_tag,
                         head_sha=head_sha,
-                        since=prev_tag,
+                        since=since,
                         commit_count=str(count),
                         authors=authors,
                     )
@@ -353,17 +360,18 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 _configure_https_auth(repo_path, self.access_token, env=env)
 
             if action == "create":
-                head_sha = self._create_release(
+                head_sha, since = self._create_release(
                     repo_path, version_str, commit_hash, env=env
                 )
             else:
                 head_sha = self._finish_release(repo_path, version_str, env=env)
+                since = ""
 
         return (
             ReleaseVersion(
                 version=version_str,
                 head_sha=head_sha,
-                since="",
+                since=since,
                 commit_count="0",
                 authors="",
             ),
@@ -376,10 +384,12 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         version: str,
         commit_hash: str | None,
         env: dict[str, str],
-    ) -> str:
+    ) -> tuple[str, str]:
         """Create the release branch and version tag.
 
-        Returns the pre-bumpver HEAD SHA that was used as the release tag.
+        Returns ``(pre_bump_sha, since_ref)`` where *pre_bump_sha* is the HEAD
+        SHA that was tagged and *since_ref* is the baseline ref used for commit
+        range computation (previous date-format tag, semver fallback, or empty).
 
         Commit ordering:
           1. Cherry-pick hotfix (if any) onto the branch first so it is
@@ -491,7 +501,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             cwd=repo_path,
             env=env,
         )
-        return pre_bump_sha
+        return pre_bump_sha, since_ref
 
     def _finish_release(
         self, repo_path: Path, version: str, env: dict[str, str]
