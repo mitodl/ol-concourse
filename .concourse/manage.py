@@ -70,7 +70,7 @@ def _generate_pipeline_task(script: str) -> TaskStep:
             outputs=[Output(name=Identifier("generated"))],
             run=Command(
                 path="/bin/sh",
-                args=["-exc", f"python {script} > generated/pipeline.yaml"],
+                args=["-exc", f"python3 {script} > generated/pipeline.yaml"],
             ),
         ),
     )
@@ -96,7 +96,7 @@ def build_pipeline() -> Pipeline:
             GetStep(get=Identifier("ol-concourse"), trigger=True),
             _generate_pipeline_task("ol-concourse/.concourse/docker.py"),
             SetPipelineStep(
-                set_pipeline=Identifier("docker"),
+                set_pipeline=Identifier("build-ol-concourse-images"),
                 file="generated/pipeline.yaml",
             ),
         ],
@@ -122,4 +122,8 @@ def build_pipeline() -> Pipeline:
 
 
 if __name__ == "__main__":
-    sys.stdout.write(_serialize(json.loads(build_pipeline().model_dump_json())))
+    sys.stdout.write(
+        _serialize(
+            build_pipeline().model_dump(mode="json", exclude_none=True, by_alias=True)
+        )
+    )

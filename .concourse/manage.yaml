@@ -20,7 +20,7 @@ jobs:
       run:
         args:
         - -exc
-        - python ol-concourse/.concourse/docker.py > generated/pipeline.yaml
+        - python3 ol-concourse/.concourse/docker.py > generated/pipeline.yaml
         path: /bin/sh
       inputs:
       - name: ol-concourse
@@ -28,7 +28,7 @@ jobs:
       outputs:
       - name: generated
     task: generate-pipeline
-  - set_pipeline: docker
+  - set_pipeline: build-ol-concourse-images
     file: generated/pipeline.yaml
   public: true
 - name: set-pypi-pipeline
@@ -44,7 +44,7 @@ jobs:
       run:
         args:
         - -exc
-        - python ol-concourse/.concourse/pypi.py > generated/pipeline.yaml
+        - python3 ol-concourse/.concourse/pypi.py > generated/pipeline.yaml
         path: /bin/sh
       inputs:
       - name: ol-concourse

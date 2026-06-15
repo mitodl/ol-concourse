@@ -13,7 +13,9 @@ try:
     import yaml as _yaml  # type: ignore[import-untyped]
 
     def _serialize(data: dict[str, Any]) -> str:
-        return _yaml.dump(data, sort_keys=False, allow_unicode=True)
+        return _yaml.dump(
+            data, sort_keys=False, allow_unicode=True, default_flow_style=False
+        )
 
 except ImportError:
 
@@ -118,4 +120,8 @@ def build_pipeline() -> Pipeline:
 
 
 if __name__ == "__main__":
-    sys.stdout.write(_serialize(json.loads(build_pipeline().model_dump_json())))
+    sys.stdout.write(
+        _serialize(
+            build_pipeline().model_dump(mode="json", exclude_none=True, by_alias=True)
+        )
+    )
