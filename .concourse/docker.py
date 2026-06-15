@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Generate the docker image build pipeline for ol-concourse resource types.
 
-Add a new entry to RESOURCE_BUILDS to automatically produce the git source
-resource, Docker image resource(s), and build job for a new resource type.
+Resource builds are auto-discovered by scanning the resources/ directory.
+Each subdirectory containing a Dockerfile and pyproject.toml produces one
+build job. Additional images can be produced by adding further Dockerfiles
+named Dockerfile.{suffix} (e.g. Dockerfile.provisioner); the suffix becomes
+the tail of the image name (e.g. concourse-pulumi-resource-provisioner).
 
 Usage (write to stdout):
     python .concourse/docker.py
@@ -10,7 +13,9 @@ Usage (write to stdout):
 
 import json
 import sys
+import tomllib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 try:
@@ -42,6 +47,7 @@ from ol_concourse.lib.models.pipeline import (
 )
 
 REPO_URI = "https://github.com/mitodl/ol-concourse"
+_REPO_ROOT = Path(__file__).parent.parent
 
 UV_IMAGE = AnonymousResource(
     type="registry-image",
@@ -79,114 +85,74 @@ class ResourceBuild:
             self.git_resource_name = f"ol-concourse-{self.name}-src"
 
 
-# To add a new resource type, append a ResourceBuild entry here.
+def _discover_resource_builds() -> list[ResourceBuild]:
+    """Scan resources/ and auto-derive a ResourceBuild for each subdirectory.
+
+    A subdirectory is included when it contains both a Dockerfile and a
+    pyproject.toml.  Additional Dockerfiles named Dockerfile.{suffix} produce
+    extra ImageBuild entries whose repository and resource names are derived
+    from the directory name and the suffix.
+    """
+    resources_dir = _REPO_ROOT / "resources"
+    builds: list[ResourceBuild] = []
+    for resource_dir in sorted(resources_dir.iterdir()):
+        if not resource_dir.is_dir():
+            continue
+        if not (resource_dir / "Dockerfile").exists():
+            continue
+        if not (resource_dir / "pyproject.toml").exists():
+            continue
+
+        name = resource_dir.name
+        pyproject = tomllib.loads((resource_dir / "pyproject.toml").read_text())
+        package: str = pyproject["project"]["name"]
+
+        images = [
+            ImageBuild(
+                repository=f"mitodl/concourse-{name}-resource",
+                resource_name=f"concourse-{name}-resource",
+            )
+        ]
+        for extra in sorted(resource_dir.glob("Dockerfile.*")):
+            suffix = extra.name[len("Dockerfile.") :]
+            images.append(
+                ImageBuild(
+                    repository=f"mitodl/concourse-{name}-resource-{suffix}",
+                    resource_name=f"concourse-{name}-resource-{suffix}",
+                    task_name=f"build-image-{suffix}",
+                    dockerfile=extra.name,
+                )
+            )
+
+        builds.append(
+            ResourceBuild(
+                name=name,
+                package=package,
+                resource_dir=f"resources/{name}",
+                images=images,
+            )
+        )
+    return builds
+
+
+# pipeline_lib is the DSL library itself, not a Concourse resource; its image
+# naming convention differs so it cannot be auto-discovered with the same rules.
+_PIPELINE_LIB_BUILD = ResourceBuild(
+    name="task",
+    package="ol-concourse",
+    resource_dir="pipeline_lib",
+    git_resource_name="ol-concourse-task-src",
+    images=[
+        ImageBuild(
+            repository="mitodl/ol-concourse-dsl",
+            resource_name="ol-concourse-task-image",
+        ),
+    ],
+)
+
 RESOURCE_BUILDS: list[ResourceBuild] = [
-    ResourceBuild(
-        name="packer",
-        package="ol-concourse-packer",
-        resource_dir="resources/packer",
-        images=[
-            ImageBuild(
-                repository="mitodl/concourse-packer-resource",
-                resource_name="concourse-packer-resource",
-            ),
-        ],
-    ),
-    ResourceBuild(
-        name="pulumi",
-        package="ol-concourse-pulumi",
-        resource_dir="resources/pulumi",
-        images=[
-            ImageBuild(
-                repository="mitodl/concourse-pulumi-resource",
-                resource_name="concourse-pulumi-resource",
-            ),
-            ImageBuild(
-                repository="mitodl/concourse-pulumi-resource-provisioner",
-                resource_name="concourse-pulumi-resource-provisioner",
-                task_name="build-image-provisioner",
-                dockerfile="Dockerfile.mitol_provision",
-            ),
-        ],
-    ),
-    ResourceBuild(
-        name="github-issues",
-        package="ol-concourse-github-issues",
-        resource_dir="resources/github-issues",
-        images=[
-            ImageBuild(
-                repository="mitodl/concourse-github-issues-resource",
-                resource_name="concourse-github-issues-resource",
-            ),
-        ],
-    ),
-    ResourceBuild(
-        name="pypi",
-        package="ol-concourse-pypi",
-        resource_dir="resources/pypi",
-        images=[
-            ImageBuild(
-                repository="mitodl/concourse-pypi-resource",
-                resource_name="concourse-pypi-resource",
-            ),
-        ],
-    ),
-    ResourceBuild(
-        name="npm",
-        package="ol-concourse-npm",
-        resource_dir="resources/npm",
-        images=[
-            ImageBuild(
-                repository="mitodl/concourse-npm-resource",
-                resource_name="concourse-npm-resource",
-            ),
-        ],
-    ),
-    ResourceBuild(
-        name="task",
-        package="ol-concourse",
-        resource_dir="pipeline_lib",
-        git_resource_name="ol-concourse-task-src",
-        images=[
-            ImageBuild(
-                repository="mitodl/ol-concourse-dsl",
-                resource_name="ol-concourse-task-image",
-            ),
-        ],
-    ),
-    ResourceBuild(
-        name="github-deployments",
-        package="ol-concourse-github-deployments",
-        resource_dir="resources/github-deployments",
-        images=[
-            ImageBuild(
-                repository="mitodl/concourse-github-deployments-resource",
-                resource_name="concourse-github-deployments-resource",
-            ),
-        ],
-    ),
-    ResourceBuild(
-        name="fastly",
-        package="ol-concourse-fastly",
-        resource_dir="resources/fastly",
-        images=[
-            ImageBuild(
-                repository="mitodl/concourse-fastly-resource",
-                resource_name="concourse-fastly-resource",
-            ),
-        ],
-    ),
-    ResourceBuild(
-        name="release",
-        package="ol-concourse-release",
-        resource_dir="resources/release",
-        images=[
-            ImageBuild(
-                repository="mitodl/concourse-release-resource",
-                resource_name="concourse-release-resource",
-            ),
-        ],
-    ),
+    *_discover_resource_builds(),
+    _PIPELINE_LIB_BUILD,
 ]
 
 
