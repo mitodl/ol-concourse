@@ -16,6 +16,7 @@ from concourse import (
     _build_changelog_entry,
     _build_checklist,
     _compute_next_version,
+    _get_in_flight_release_version,
     _get_semver_tags,
     _parse_semver_tuple,
     _parse_version_tuple,
@@ -329,6 +330,7 @@ def test_fetch_new_versions_semver_fallback_used_when_no_date_tags(
         "",  # git fetch --tags
         "v1.2.3\nv1.3.0\nbad-tag",  # git tag --list (no date-format tags)
         head_sha,  # git rev-parse origin/main
+        "",  # git branch -r (no in-flight)
         # semver fallback branch: git tag --list again for _get_semver_tags
         "v1.2.3\nv1.3.0\nbad-tag",
         # _commit_info_range for v1.3.0..head_sha
@@ -371,6 +373,7 @@ def test_fetch_new_versions_semver_fallback_ignored_when_date_tags_exist(
         "",
         "v1.3.0\n2026.4.14.1",  # both semver and date-format present
         head_sha,
+        "",  # git branch -r (no in-flight)
         tag_sha,  # rev-list -n1 2026.4.14.1
         "dev@example.com",
     ]
@@ -406,6 +409,7 @@ def test_fetch_new_versions_semver_fallback_disabled(mock_tmpdir, mock_run, tmp_
         "",
         "v1.2.3\nv1.3.0",  # only semver tags
         head_sha,
+        "",  # git branch -r (no in-flight)
         "dev@example.com\nalice@example.com",  # _commit_info_all
     ]
     idx = 0
@@ -518,25 +522,39 @@ def test_create_release_semver_fallback_disabled_no_since(mock_run, tmp_path):
 
 
 def _make_run_side_effects(
-    tag_list: list[str], head_sha: str, tag_sha: str = ""
+    tag_list: list[str],
+    head_sha: str,
+    tag_sha: str = "",
+    in_flight_branch: str = "",
 ) -> list[str]:
-    """Build a list of subprocess outputs for check's _run calls."""
-    # clone=no output; fetch tags=no output; tag --list; rev-parse HEAD; rev-list -n1
+    """Build a list of subprocess outputs for check's _run calls.
+
+    Call order in _compute_versions:
+      0  git clone
+      1  git fetch --tags
+      2  git tag --list
+      3  git rev-parse origin/main  → head_sha
+      4  git branch -r --list origin/releases/*  → in_flight_branch (empty = none)
+      5  git rev-list -n1 <latest_tag>  (only when tags exist and no in-flight)
+      6  git log --format=%ae  (commit range / all)
+    """
     tags_output = "\n".join(tag_list)
     effects = [
         "",  # git clone
         "",  # git fetch --tags
         tags_output,  # git tag --list
         head_sha,  # git rev-parse origin/main
+        in_flight_branch,  # git branch -r --list origin/releases/*
     ]
-    if tag_list:
+    if in_flight_branch:
+        # In-flight path: rev-list -n1 in_flight_version + commit_info_range
+        effects.append(tag_sha or head_sha)  # git rev-list -n1 in_flight_tag
+        effects.append("dev@example.com")
+    elif tag_list:
         effects.append(tag_sha or head_sha)  # git rev-list -n1 latest_tag
         if tag_sha != head_sha:
-            effects.append(  # git log --format=%ae (for commit_info_range)
-                "dev@example.com\nalice@example.com"
-            )
+            effects.append("dev@example.com\nalice@example.com")
         else:
-            # git log --format=%ae (for commit_info_range with prev_tag)
             effects.append("dev@example.com")
     else:
         effects.append("dev@example.com\nalice@example.com")  # commit_info_all
@@ -550,11 +568,13 @@ def test_fetch_new_versions_no_tags(mock_tmpdir, mock_run, tmp_path):
     head_sha = "deadbeef" * 5
 
     call_index = 0
-    outputs = ["", "", "", head_sha, "dev@example.com"]
+    # 0: clone, 1: fetch --tags, 2: tag --list (empty), 3: rev-parse,
+    # 4: branch -r (no in-flight), 5: commit_info_all
+    outputs = ["", "", "", head_sha, "", "dev@example.com"]
 
     def run_side_effect(cmd, **kwargs):
         nonlocal call_index
-        out = outputs[call_index % len(outputs)]
+        out = outputs[call_index]
         call_index += 1
         return out
 
@@ -577,18 +597,19 @@ def test_fetch_new_versions_head_equals_tag(mock_tmpdir, mock_run, tmp_path):
     head_sha = "tagged1234" * 4
 
     outputs = [
-        "",
-        "",
-        "2026.4.10.1\n2026.4.14.1",
-        head_sha,
-        head_sha,
-        "dev@example.com",
+        "",  # 0: git clone
+        "",  # 1: git fetch --tags
+        "2026.4.10.1\n2026.4.14.1",  # 2: git tag --list
+        head_sha,  # 3: git rev-parse origin/main
+        "",  # 4: git branch -r (no in-flight)
+        head_sha,  # 5: git rev-list -n1 2026.4.14.1 (same → tagged)
+        "dev@example.com",  # 6: git log (commit_info_range)
     ]
     call_index = 0
 
     def run_side_effect(cmd, **kwargs):
         nonlocal call_index
-        out = outputs[call_index % len(outputs)]
+        out = outputs[call_index]
         call_index += 1
         return out
 
@@ -610,18 +631,19 @@ def test_fetch_new_versions_new_commits(mock_tmpdir, mock_run, tmp_path, monkeyp
     tag_sha = "oldtagsha1" * 4
 
     outputs = [
-        "",
-        "",
-        "2026.4.14.1",
-        head_sha,
-        tag_sha,
-        "dev@example.com\nalice@example.com",
+        "",  # 0: git clone
+        "",  # 1: git fetch --tags
+        "2026.4.14.1",  # 2: git tag --list
+        head_sha,  # 3: git rev-parse origin/main
+        "",  # 4: git branch -r (no in-flight)
+        tag_sha,  # 5: git rev-list -n1 2026.4.14.1
+        "dev@example.com\nalice@example.com",  # 6: git log (commit_info_range)
     ]
     call_index = 0
 
     def run_side_effect(cmd, **kwargs):
         nonlocal call_index
-        out = outputs[call_index % len(outputs)]
+        out = outputs[call_index]
         call_index += 1
         return out
 
@@ -933,6 +955,11 @@ def test_publish_new_version_finish(mock_run, tmp_path):
     assert any("main" in " ".join(c) for c in push_cmds), (
         "Push should target the configured branch"
     )
+    # Release branch must be deleted so check stops seeing a release in flight
+    delete_cmds = [c for c in push_cmds if "--delete" in c]
+    assert any(f"releases/{version_str}" in " ".join(c) for c in delete_cmds), (
+        "Finish must delete the release branch from the remote"
+    )
 
 
 @patch("concourse._run")
@@ -1044,3 +1071,230 @@ def test_create_writes_per_release_changelog(mock_run, tmp_path):
     release_file = app_dir / "releases" / f"RELEASE_{version_str}.md"
     assert release_file.exists(), f"Expected {release_file}"
     assert f"## [{version_str}]" in release_file.read_text()
+
+
+# ---------------------------------------------------------------------------
+# _get_in_flight_release_version
+# ---------------------------------------------------------------------------
+
+
+@patch("concourse._run")
+def test_get_in_flight_release_version_none_when_no_branches(mock_run, tmp_path):
+    """Returns None when git branch -r lists no releases/ branches."""
+    mock_run.return_value = ""
+    result = _get_in_flight_release_version(tmp_path, env={})
+    assert result is None
+
+
+@patch("concourse._run")
+def test_get_in_flight_release_version_returns_latest(mock_run, tmp_path):
+    """Returns the most recent date-format version when multiple branches exist."""
+    mock_run.return_value = (
+        "  origin/releases/2026.4.10.1\n  origin/releases/2026.4.14.1\n"
+    )
+    result = _get_in_flight_release_version(tmp_path, env={})
+    assert result == "2026.4.14.1"
+
+
+@patch("concourse._run")
+def test_get_in_flight_release_version_ignores_non_date_branches(mock_run, tmp_path):
+    """Non date-format branch names under releases/ are ignored."""
+    mock_run.return_value = (
+        "  origin/releases/my-feature\n  origin/releases/2026.4.14.1\n"
+    )
+    result = _get_in_flight_release_version(tmp_path, env={})
+    assert result == "2026.4.14.1"
+
+
+# ---------------------------------------------------------------------------
+# fetch_new_versions — in-flight blocking
+# ---------------------------------------------------------------------------
+
+
+@patch("concourse._run")
+@patch("concourse.tempfile.TemporaryDirectory")
+def test_fetch_new_versions_blocks_while_release_in_flight(
+    mock_tmpdir, mock_run, tmp_path, monkeypatch
+):
+    """Check returns the in-flight version even when new commits exist on main."""
+    mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
+    in_flight_sha = "releasesha" * 4  # SHA the release tag points to
+    new_head_sha = "newcommit1" * 4  # new commit pushed to main after the cut
+
+    outputs = [
+        "",  # 0: git clone
+        "",  # 1: git fetch --tags
+        "2026.4.10.1\n2026.4.14.1",  # 2: git tag --list (release tag exists)
+        new_head_sha,  # 3: git rev-parse origin/main (new commit!)
+        "  origin/releases/2026.4.14.1\n",  # 4: git branch -r → in-flight!
+        in_flight_sha,  # 5: git rev-list -n1 2026.4.14.1
+        "dev@example.com",  # 6: git log (commit_info_range)
+    ]
+    idx = 0
+
+    def run_side_effect(cmd, **kwargs):
+        nonlocal idx
+        out = outputs[idx]
+        idx += 1
+        return out
+
+    mock_run.side_effect = run_side_effect
+    resource = make_resource()
+
+    with patch("concourse.datetime") as mock_dt:
+        mock_dt.now.return_value.date.return_value = datetime(
+            2026, 4, 14, tzinfo=UTC
+        ).date()
+        versions = resource.fetch_new_versions(None)
+
+    assert len(versions) == 1
+    v = versions[0]
+    # Must return the in-flight version, not a new one
+    assert v.version == "2026.4.14.1"
+    # head_sha is the tagged commit, not the new commit
+    assert v.head_sha == in_flight_sha
+    assert v.since == "2026.4.10.1"
+
+
+@patch("concourse._run")
+@patch("concourse.tempfile.TemporaryDirectory")
+def test_fetch_new_versions_unblocked_after_branch_deleted(
+    mock_tmpdir, mock_run, tmp_path, monkeypatch
+):
+    """After the release branch is deleted, check advances to the next version."""
+    mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
+    head_sha = "newcommit1" * 4
+    tag_sha = "releasesha" * 4
+
+    outputs = [
+        "",  # 0: git clone
+        "",  # 1: git fetch --tags
+        "2026.4.14.1",  # 2: git tag --list
+        head_sha,  # 3: git rev-parse origin/main
+        "",  # 4: git branch -r → no in-flight branch
+        tag_sha,  # 5: git rev-list -n1
+        "dev@example.com\nalice@example.com",  # 6: git log
+    ]
+    idx = 0
+
+    def run_side_effect(cmd, **kwargs):
+        nonlocal idx
+        out = outputs[idx]
+        idx += 1
+        return out
+
+    mock_run.side_effect = run_side_effect
+    resource = make_resource()
+
+    with patch("concourse.datetime") as mock_dt:
+        mock_dt.now.return_value.date.return_value = datetime(
+            2026, 4, 14, tzinfo=UTC
+        ).date()
+        versions = resource.fetch_new_versions(None)
+
+    assert len(versions) == 1
+    # New commits → next version
+    assert versions[0].version == "2026.4.14.2"
+    assert versions[0].head_sha == head_sha
+
+
+# ---------------------------------------------------------------------------
+# publish_new_version — action=abandon
+# ---------------------------------------------------------------------------
+
+
+@patch("concourse._run")
+def test_publish_new_version_abandon(mock_run, tmp_path):
+    """Abandon deletes the release branch and tag from the remote."""
+    version_str = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    main_sha = "mainshaa1" * 5
+    calls: list[list[str]] = []
+
+    def track_run(cmd, **kw):
+        calls.append(list(cmd))
+        if "rev-parse" in cmd:
+            return main_sha
+        return ""
+
+    mock_run.side_effect = track_run
+
+    resource = make_resource()
+    returned_version, metadata = resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="abandon",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    assert returned_version.version == version_str
+    assert metadata["action"] == "abandon"
+    assert returned_version.head_sha == main_sha
+
+    push_cmds = [c for c in calls if "push" in c and "--delete" in c]
+    deleted_refs = {" ".join(c) for c in push_cmds}
+    assert any(f"releases/{version_str}" in r for r in deleted_refs), (
+        "Abandon must delete the releases/ branch"
+    )
+    assert any(f"refs/tags/{version_str}" in r for r in deleted_refs), (
+        "Abandon must delete the version tag"
+    )
+
+
+@patch("concourse._run")
+def test_publish_new_version_abandon_idempotent(mock_run, tmp_path):
+    """Abandon is idempotent — CalledProcessError from missing refs is silenced."""
+    import subprocess
+
+    version_str = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    main_sha = "mainshaa1" * 5
+
+    def track_run(cmd, **kw):
+        if "push" in cmd and "--delete" in cmd:
+            raise subprocess.CalledProcessError(1, cmd, "", "remote ref not found")
+        if "rev-parse" in cmd:
+            return main_sha
+        return ""
+
+    mock_run.side_effect = track_run
+
+    resource = make_resource()
+    # Must not raise even though all push --delete calls fail
+    returned_version, metadata = resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="abandon",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    assert returned_version.version == version_str
+    assert metadata["action"] == "abandon"
+
+
+@patch("concourse._run")
+def test_publish_new_version_invalid_action_includes_abandon(mock_run, tmp_path):
+    """Error message for invalid action mentions all three valid actions."""
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text("2026.4.14.1")
+
+    resource = make_resource()
+    with pytest.raises(ValueError, match="abandon"):
+        resource.publish_new_version(
+            tmp_path,
+            MagicMock(),
+            action="deploy",  # type: ignore[arg-type]
+            repo_dir="app-source",
+            version_file="release/version",
+        )

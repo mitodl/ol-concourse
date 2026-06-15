@@ -25,7 +25,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -169,6 +169,35 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             cwd=repo_path,
             env=env,
         ).strip()
+
+        in_flight = _get_in_flight_release_version(repo_path, env=env)
+        if in_flight and in_flight in tags:
+            # Return the in-flight version so the pipeline does not advance
+            # until the release is finished or abandoned.
+            in_flight_sha = _run(
+                ["git", "rev-list", "-n1", in_flight],
+                cwd=repo_path,
+                env=env,
+            ).strip()
+            idx = tags.index(in_flight)
+            prev_tag = tags[idx - 1] if idx > 0 else ""
+            since = prev_tag
+            if not since and self.semver_tag_fallback:
+                semver_tags = _get_semver_tags(repo_path, env=env)
+                if semver_tags:
+                    since = semver_tags[-1]
+            count, authors = _commit_info_range(
+                repo_path, since, in_flight_sha, env=env
+            )
+            return [
+                ReleaseVersion(
+                    version=in_flight,
+                    head_sha=in_flight_sha,
+                    since=since,
+                    commit_count=str(count),
+                    authors=authors,
+                )
+            ]
 
         if latest_tag:
             tag_sha = _run(
@@ -320,7 +349,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         sources_dir: Path,
         build_metadata: BuildMetadata,
         *,
-        action: Literal["create", "finish"],
+        action: Literal["create", "finish", "abandon"],
         repo_dir: str,
         version_file: str,
         commit_hash: str | None = None,
@@ -338,15 +367,21 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         action=finish:
           1. Fetch the configured branch and the release branch.
           2. Merge release/YYYY.MM.DD.N into the configured branch (--no-ff).
-          3. Push.
+          3. Push, then delete the release branch from the remote.
+
+        action=abandon:
+          1. Delete the release branch and version tag from the remote.
+          2. Subsequent check calls will recompute the next version normally.
 
         ``repo_dir`` is the path within the Concourse workspace to the
         checked-out git repository (i.e. the ``get`` output directory name).
         This is intentionally distinct from the source-level ``repository``
         field (which holds ``owner/repo`` for GitHub API calls).
         """
-        if action not in ("create", "finish"):
-            msg = f"Invalid action '{action}'. Must be 'create' or 'finish'."
+        if action not in ("create", "finish", "abandon"):
+            msg = (
+                f"Invalid action '{action}'. Must be 'create', 'finish', or 'abandon'."
+            )
             raise ValueError(msg)
 
         version_str = (sources_dir / version_file).read_text().strip()
@@ -363,8 +398,11 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 head_sha, since = self._create_release(
                     repo_path, version_str, commit_hash, env=env
                 )
-            else:
+            elif action == "finish":
                 head_sha = self._finish_release(repo_path, version_str, env=env)
+                since = ""
+            else:  # abandon
+                head_sha = self._abandon_release(repo_path, version_str, env=env)
                 since = ""
 
         return (
@@ -536,7 +574,42 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             env=env,
         )
         _run(["git", "push", "origin", self.branch], cwd=repo_path, env=env)
+        # Remove the release branch so subsequent check calls no longer
+        # see a release as in-flight.
+        _run(
+            ["git", "push", "origin", "--delete", branch_name],
+            cwd=repo_path,
+            env=env,
+        )
         return _run(["git", "rev-parse", "HEAD"], cwd=repo_path, env=env).strip()
+
+    def _abandon_release(
+        self, repo_path: Path, version: str, env: dict[str, str]
+    ) -> str:
+        """Delete the in-flight release branch and version tag.
+
+        Cancels a release that was cut but never finalised.  After abandonment
+        ``check`` sees no in-flight branch and recomputes the next version
+        normally, allowing a corrected release to be cut from the same commits.
+
+        Deletions are best-effort: a ``CalledProcessError`` from either push is
+        silenced so the operation is idempotent — abandoning an already-abandoned
+        release (or one where the branch/tag was already deleted) is safe.
+        """
+        branch_name = f"releases/{version}"
+        _run(["git", "fetch", "origin", "--tags"], cwd=repo_path, env=env)
+        for ref in (branch_name, f"refs/tags/{version}"):
+            with suppress(subprocess.CalledProcessError):
+                _run(
+                    ["git", "push", "origin", "--delete", ref],
+                    cwd=repo_path,
+                    env=env,
+                )
+        return _run(
+            ["git", "rev-parse", f"origin/{self.branch}"],
+            cwd=repo_path,
+            env=env,
+        ).strip()
 
     def _collect_commits_range(
         self, repo_path: Path, since_ref: str, until_ref: str, env: dict[str, str]
@@ -701,6 +774,32 @@ def _get_semver_tags(repo_path: Path, *, env: dict[str, str]) -> list[str]:
     output = _run(["git", "tag", "--list"], cwd=repo_path, env=env)
     tags = [t.strip() for t in output.splitlines() if SEMVER_PATTERN.match(t.strip())]
     return sorted(tags, key=_parse_semver_tuple)
+
+
+def _get_in_flight_release_version(
+    repo_path: Path, *, env: dict[str, str]
+) -> str | None:
+    """Return the version string of the in-flight release branch, or None.
+
+    A release is in-flight while its ``releases/YYYY.M.D.N`` branch exists on
+    the remote — created by ``action=create`` and removed by ``action=finish``
+    or ``action=abandon``.
+    """
+    output = _run(
+        ["git", "branch", "-r", "--list", "origin/releases/*"],
+        cwd=repo_path,
+        env=env,
+    )
+    prefix = "origin/releases/"
+    versions = [
+        branch[len(prefix) :]
+        for line in output.splitlines()
+        if (branch := line.strip()).startswith(prefix)
+        and VERSION_PATTERN.match(branch[len(prefix) :])
+    ]
+    if not versions:
+        return None
+    return sorted(versions, key=_parse_version_tuple)[-1]
 
 
 def _parse_semver_tuple(tag: str) -> tuple[int, int, int]:

@@ -104,7 +104,7 @@ class PipelineFragment(BaseModel):
             fragment's resource types, resources, and jobs.
         """
         return Pipeline(
-            resource_types=self.resource_types,
-            resources=self.resources,
-            jobs=self.jobs,
+            resource_types=self.resource_types or None,
+            resources=self.resources or None,
+            jobs=self.jobs or None,
         )
