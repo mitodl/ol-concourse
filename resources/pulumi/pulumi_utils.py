@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import re
 import sys
+from datetime import datetime, UTC
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 from pulumi import automation as auto
@@ -209,11 +211,12 @@ def cancel_stack_lock(
     Uses an inline no-op program so no source directory is required.
     Intended for explicit pipeline ``ensure``/``on_abort`` cancel steps.
     """
+    opts = _workspace_opts(env_pulumi)
+    opts.project_settings = auto.ProjectSettings(name=project_name, runtime="python")
     stack = auto.select_stack(
         stack_name=stack_name,
-        project_name=project_name,
         program=lambda *_args: None,
-        opts=_workspace_opts(env_pulumi),
+        opts=opts,
     )
     stack.cancel()
 
@@ -258,18 +261,43 @@ def _parse_lock_holders(exc: auto.ConcurrentUpdateError) -> list[dict[str, str]]
     return [m.groupdict() for m in _LOCK_HOLDER_RE.finditer(str(exc))]
 
 
-def _is_recoverable_lock(holders: list[dict[str, str]]) -> bool:
-    """Return True only when every lock holder is a Concourse worker container.
+_LOCK_MIN_AGE_MINUTES = 15
 
-    Concourse worker containers run as root with UUID hostnames.  Developer
-    machines have human-readable hostnames, so we must not auto-cancel those.
+
+def _is_recoverable_lock(
+    holders: list[dict[str, str]],
+    *,
+    min_age_minutes: int = _LOCK_MIN_AGE_MINUTES,
+) -> bool:
+    """Return True only when every lock holder is a stale Concourse worker lock.
+
+    Two conditions must both hold for every holder:
+    - ``user == "root"`` and hostname matches the UUID pattern used by Concourse
+      worker containers (developer machines have human-readable hostnames).
+    - The lock is older than ``min_age_minutes`` (default 15 min) to avoid
+      cancelling a legitimately running deployment on another Concourse worker
+      that also happens to have a UUID hostname.
     """
     if not holders:
         return False
-    return all(h["user"] == "root" and _UUID_RE.match(h["host"]) for h in holders)
+    now = datetime.now(UTC)
+    for h in holders:
+        if h["user"] != "root" or not _UUID_RE.match(h["host"]):
+            return False
+        if min_age_minutes > 0:
+            try:
+                lock_time = datetime.fromisoformat(h["at"].replace("Z", "+00:00"))
+                age_minutes = (now - lock_time).total_seconds() / 60
+                if age_minutes < min_age_minutes:
+                    return False
+            except ValueError:
+                return False
+    return True
 
 
-def _with_lock_recovery(operation, stack: auto.Stack, stack_name: str):
+def _with_lock_recovery(
+    operation: Callable[[], Any], stack: auto.Stack, stack_name: str
+) -> Any:
     """Run *operation*, recovering automatically from a stale Concourse lock.
 
     If ConcurrentUpdateError is raised and every lock holder looks like a

@@ -124,7 +124,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
     # put
     # ------------------------------------------------------------------
 
-    def publish_new_version(  # noqa: PLR0913
+    def publish_new_version(  # noqa: PLR0912, PLR0913
         self,
         sources_dir: Path,
         build_metadata: BuildMetadata,
@@ -159,6 +159,11 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
                 env_pulumi=env_pulumi,
                 env_os=env_os,
             )
+            if env_vars_from_files:
+                for var_name, file_path in env_vars_from_files.items():
+                    os.environ[var_name] = io_utils.read_value_from_file(
+                        file_path, working_dir=str(sources_dir)
+                    )
             _apply_os_env(effective["env_os"])
             pulumi_utils.cancel_stack_lock(
                 stack_name=effective["stack_name"],

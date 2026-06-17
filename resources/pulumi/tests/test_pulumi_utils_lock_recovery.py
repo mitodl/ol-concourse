@@ -24,7 +24,7 @@ _CONCOURSE_LOCK_MSG = (
     "s3://mitol-pulumi-state/.pulumi/locks/organization/ol-application-edxapp/"
     "mitx.Production/22d8693a-7bae-4563-bc98-27045e703b9f.json: "
     "created by root@6d33034d-39d7-41de-80a3-b03e008d0ea2 (pid 285) "
-    "at 2026-06-17T18:46:42Z"
+    "at 2020-01-01T00:00:00Z"
 )
 
 _DEVELOPER_LOCK_MSG = (
@@ -32,23 +32,23 @@ _DEVELOPER_LOCK_MSG = (
     "s3://mitol-pulumi-state/.pulumi/locks/organization/ol-application-edxapp/"
     "mitx.Production/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.json: "
     "created by tmacey@tmacey-laptop.local (pid 12345) "
-    "at 2026-06-17T17:00:00Z"
+    "at 2020-01-01T00:00:00Z"
 )
 
 _MULTI_LOCK_ALL_CONCOURSE_MSG = (
     "error: the stack is currently locked by 2 lock(s).\n"
     "lock1.json: created by root@aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee (pid 1) "
-    "at 2026-06-17T10:00:00Z\n"
+    "at 2020-01-01T00:00:00Z\n"
     "lock2.json: created by root@bbbbbbbb-cccc-dddd-eeee-ffffffffffff (pid 2) "
-    "at 2026-06-17T10:01:00Z"
+    "at 2020-01-01T00:01:00Z"
 )
 
 _MIXED_LOCK_MSG = (
     "error: the stack is currently locked by 2 lock(s).\n"
     "lock1.json: created by root@aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee (pid 1) "
-    "at 2026-06-17T10:00:00Z\n"
+    "at 2020-01-01T00:00:00Z\n"
     "lock2.json: created by tmacey@my-workstation (pid 9999) "
-    "at 2026-06-17T10:01:00Z"
+    "at 2020-01-01T00:01:00Z"
 )
 
 
@@ -68,7 +68,7 @@ class TestParseLockHolders:
         assert holders[0]["user"] == "root"
         assert holders[0]["host"] == "6d33034d-39d7-41de-80a3-b03e008d0ea2"
         assert holders[0]["pid"] == "285"
-        assert holders[0]["at"] == "2026-06-17T18:46:42Z"
+        assert holders[0]["at"] == "2020-01-01T00:00:00Z"
 
     def test_parses_developer_lock(self) -> None:
         holders = _parse_lock_holders(_concurrent_error(_DEVELOPER_LOCK_MSG))
@@ -87,47 +87,94 @@ class TestParseLockHolders:
         assert holders == []
 
 
+# Timestamps clearly in the past (> 15 min) so age check always passes in tests
+_OLD_TS = "2020-01-01T00:00:00Z"
+# Timestamp a few seconds ago — always younger than the 15-min threshold
+_FRESH_TS = "2099-12-31T23:59:59Z"
+
+
+def _stale_holder(
+    user: str = "root", host: str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+) -> dict[str, str]:
+    return {"user": user, "host": host, "pid": "1", "at": _OLD_TS}
+
+
+def _fresh_holder(
+    user: str = "root", host: str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+) -> dict[str, str]:
+    return {"user": user, "host": host, "pid": "1", "at": _FRESH_TS}
+
+
 # ---------------------------------------------------------------------------
 # _is_recoverable_lock
 # ---------------------------------------------------------------------------
 
 
 class TestIsRecoverableLock:
-    def test_concourse_uuid_hostname_root_user_is_recoverable(self) -> None:
-        holders = _parse_lock_holders(_concurrent_error(_CONCOURSE_LOCK_MSG))
-        assert _is_recoverable_lock(holders) is True
+    # --- hostname / user checks (age bypassed with min_age_minutes=0) ---
 
-    def test_developer_hostname_is_not_recoverable(self) -> None:
-        holders = _parse_lock_holders(_concurrent_error(_DEVELOPER_LOCK_MSG))
-        assert _is_recoverable_lock(holders) is False
+    def test_concourse_root_uuid_hostname_passes_identity_check(self) -> None:
+        assert _is_recoverable_lock([_stale_holder()], min_age_minutes=0) is True
 
-    def test_all_concourse_multiple_locks_are_recoverable(self) -> None:
-        holders = _parse_lock_holders(_concurrent_error(_MULTI_LOCK_ALL_CONCOURSE_MSG))
-        assert _is_recoverable_lock(holders) is True
+    def test_developer_hostname_fails_identity_check(self) -> None:
+        holders = [_stale_holder(host="tmacey-laptop.local")]
+        assert _is_recoverable_lock(holders, min_age_minutes=0) is False
 
-    def test_mixed_locks_are_not_recoverable(self) -> None:
-        holders = _parse_lock_holders(_concurrent_error(_MIXED_LOCK_MSG))
-        assert _is_recoverable_lock(holders) is False
+    def test_non_root_user_fails_identity_check(self) -> None:
+        holders = [_stale_holder(user="ubuntu")]
+        assert _is_recoverable_lock(holders, min_age_minutes=0) is False
 
-    def test_empty_holders_are_not_recoverable(self) -> None:
+    def test_all_concourse_multiple_locks_pass_identity_check(self) -> None:
+        holders = [
+            _stale_holder(host="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            _stale_holder(host="bbbbbbbb-cccc-dddd-eeee-ffffffffffff"),
+        ]
+        assert _is_recoverable_lock(holders, min_age_minutes=0) is True
+
+    def test_mixed_locks_fail_identity_check(self) -> None:
+        holders = [
+            _stale_holder(host="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            _stale_holder(user="tmacey", host="my-workstation"),
+        ]
+        assert _is_recoverable_lock(holders, min_age_minutes=0) is False
+
+    def test_empty_holders_not_recoverable(self) -> None:
         assert _is_recoverable_lock([]) is False
 
-    def test_non_root_user_uuid_hostname_is_not_recoverable(self) -> None:
+    # --- age threshold checks ---
+
+    def test_stale_lock_is_recoverable(self) -> None:
+        # _OLD_TS is years in the past, comfortably older than any threshold
+        assert _is_recoverable_lock([_stale_holder()]) is True
+
+    def test_fresh_lock_is_not_recoverable(self) -> None:
+        # _FRESH_TS is far in the future — always "not yet old enough"
+        assert _is_recoverable_lock([_fresh_holder()]) is False
+
+    def test_custom_min_age_zero_bypasses_age_check(self) -> None:
+        assert _is_recoverable_lock([_fresh_holder()], min_age_minutes=0) is True
+
+    def test_unparseable_timestamp_blocks_recovery_with_age_check(self) -> None:
         holders = [
             {
-                "user": "ubuntu",
+                "user": "root",
                 "host": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "pid": "1",
-                "at": "t",
+                "at": "not-a-timestamp",
             }
         ]
         assert _is_recoverable_lock(holders) is False
 
-    def test_root_user_non_uuid_hostname_is_not_recoverable(self) -> None:
+    def test_unparseable_timestamp_passes_when_age_check_disabled(self) -> None:
         holders = [
-            {"user": "root", "host": "my-server.example.com", "pid": "1", "at": "t"}
+            {
+                "user": "root",
+                "host": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "pid": "1",
+                "at": "not-a-timestamp",
+            }
         ]
-        assert _is_recoverable_lock(holders) is False
+        assert _is_recoverable_lock(holders, min_age_minutes=0) is True
 
 
 # ---------------------------------------------------------------------------

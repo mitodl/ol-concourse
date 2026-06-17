@@ -550,6 +550,26 @@ class TestPublishNewVersion:
         mock_update.assert_not_called()
         mock_create.assert_not_called()
 
+    def test_cancel_action_applies_env_vars_from_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("PULUMI_ACCESS_TOKEN", raising=False)
+        resource = _make_resource(stack_name="org.proj.dev", source_dir="infra")
+
+        token_file = tmp_path / "token"
+        token_file.write_text("s-my-token\n")
+        build_metadata = MagicMock()
+
+        with patch("pulumi_utils.cancel_stack_lock"):
+            resource.publish_new_version(
+                tmp_path,
+                build_metadata,
+                action="cancel",
+                env_vars_from_files={"PULUMI_ACCESS_TOKEN": "token"},
+            )
+
+        assert os.environ["PULUMI_ACCESS_TOKEN"] == "s-my-token"
+
 
 # ---------------------------------------------------------------------------
 # pulumi_utils.serialize_resource_event
