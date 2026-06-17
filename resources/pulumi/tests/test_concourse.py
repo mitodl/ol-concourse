@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 from pulumi.automation.events import (
     DiffKind,
     EngineEvent,
@@ -34,8 +37,8 @@ def _make_resource(
     stack_name: str = "org.proj.dev",
     project_name: str = "my-project",
     source_dir: str = "infra/myapp",
-    env_pulumi: dict | None = None,
-    env_os: dict | None = None,
+    env_pulumi: dict[str, str] | None = None,
+    env_os: dict[str, str] | None = None,
 ) -> PulumiResource:
     return PulumiResource(
         stack_name=stack_name,
@@ -51,7 +54,7 @@ def _make_step_metadata(
     urn: str = "urn:pulumi:dev::proj::aws:s3/bucket:Bucket::my-bucket",
     resource_type: str = "aws:s3/bucket:Bucket",
     diffs: list[str] | None = None,
-    detailed_diff: dict | None = None,
+    detailed_diff: dict[str, Any] | None = None,
 ) -> StepEventMetadata:
     return StepEventMetadata(
         op=op,
@@ -73,8 +76,8 @@ def _make_engine_event(metadata: StepEventMetadata) -> EngineEvent:
     )
 
 
-def _make_mock_stack(outputs: dict | None = None) -> MagicMock:
-    """Return a mock pulumi Stack with sensible defaults for preview tests."""
+def _make_mock_stack(outputs: dict[str, Any] | None = None) -> MagicMock:
+    """Return a mock pulumi Stack with sensible defaults."""
     stack = MagicMock()
     stack.outputs.return_value = {
         k: MagicMock(value=v)
@@ -85,6 +88,15 @@ def _make_mock_stack(outputs: dict | None = None) -> MagicMock:
     preview_result.stdout = "preview output"
     preview_result.change_summary = {OpType.UPDATE: 1, OpType.SAME: 5}
     stack.preview.return_value = preview_result
+
+    up_result = MagicMock()
+    up_result.summary.result = "succeeded"
+    up_result.summary.resource_changes = {OpType.UPDATE: 1}
+    stack.up.return_value = up_result
+
+    destroy_result = MagicMock()
+    destroy_result.summary.result = "succeeded"
+    stack.destroy.return_value = destroy_result
 
     return stack
 
@@ -237,7 +249,9 @@ class TestDownloadVersion:
         (tmp_path / "ol-infra").mkdir()
         build_metadata = MagicMock()
 
-        with patch("pulumi_utils.read_stack", return_value={"url": "https://x.com"}) as mock_read:
+        with patch(
+            "pulumi_utils.read_stack", return_value={"url": "https://x.com"}
+        ) as mock_read:
             resource.download_version(
                 PulumiVersion(), destination_dir, build_metadata, output_key="url"
             )
@@ -266,8 +280,10 @@ class TestDownloadVersion:
         (tmp_path / "infra").mkdir()
         build_metadata = MagicMock()
 
-        with patch("pulumi_utils.read_stack", return_value={}), \
-             patch("pulumi_utils.run_preview") as mock_run_preview:
+        with (
+            patch("pulumi_utils.read_stack", return_value={}),
+            patch("pulumi_utils.run_preview") as mock_run_preview,
+        ):
             _, metadata = resource.download_version(
                 PulumiVersion(), destination_dir, build_metadata, run_preview=True
             )
@@ -291,7 +307,9 @@ class TestDownloadVersion:
         with patch("pulumi_utils.read_stack", return_value={}) as mock_read:
             resource.download_version(PulumiVersion(), destination_dir, build_metadata)
 
-        assert mock_read.call_args.kwargs["env_pulumi"] == {"PULUMI_CONFIG_PASSPHRASE": "secret"}
+        assert mock_read.call_args.kwargs["env_pulumi"] == {
+            "PULUMI_CONFIG_PASSPHRASE": "secret"
+        }
 
     def test_env_os_applied_before_read_stack(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -335,20 +353,26 @@ class TestPublishNewVersion:
         (tmp_path / "infra").mkdir()
         build_metadata = MagicMock()
 
-        with patch("pulumi_utils.create_stack", return_value=1) as mock_create, \
-             patch("pulumi_utils.update_stack") as mock_update:
+        with (
+            patch("pulumi_utils.create_stack", return_value=1) as mock_create,
+            patch("pulumi_utils.update_stack") as mock_update,
+        ):
             resource.publish_new_version(tmp_path, build_metadata, action="create")
 
         mock_create.assert_called_once()
         mock_update.assert_not_called()
 
-    def test_update_calls_update_stack_and_refreshes_by_default(self, tmp_path: Path) -> None:
+    def test_update_calls_update_stack_and_refreshes_by_default(
+        self, tmp_path: Path
+    ) -> None:
         resource = _make_resource(stack_name="org.proj.dev", source_dir="infra")
         (tmp_path / "infra").mkdir()
         build_metadata = MagicMock()
 
-        with patch("pulumi_utils.update_stack", return_value=5) as mock_update, \
-             patch("pulumi_utils.create_stack") as mock_create:
+        with (
+            patch("pulumi_utils.update_stack", return_value=5) as mock_update,
+            patch("pulumi_utils.create_stack") as mock_create,
+        ):
             resource.publish_new_version(tmp_path, build_metadata, action="update")
 
         mock_create.assert_not_called()
@@ -412,7 +436,9 @@ class TestPublishNewVersion:
         def fake_update(**kwargs):
             if kwargs.get("preview_file"):
                 kwargs["preview_file"].write_text(
-                    json.dumps({"change_summary": {"update": 1}, "changes": [], "stdout": ""})
+                    json.dumps(
+                        {"change_summary": {"update": 1}, "changes": [], "stdout": ""}
+                    )
                 )
             return 0
 
@@ -492,6 +518,38 @@ class TestPublishNewVersion:
         assert metadata["stack"] == "org.proj.dev"
         assert metadata["result"] == "succeeded"
 
+    def test_cancel_action_calls_cancel_stack_lock(self, tmp_path: Path) -> None:
+        resource = _make_resource(stack_name="org.proj.dev", source_dir="infra")
+        build_metadata = MagicMock()
+
+        with patch("pulumi_utils.cancel_stack_lock") as mock_cancel:
+            version, metadata = resource.publish_new_version(
+                tmp_path, build_metadata, action="cancel"
+            )
+
+        mock_cancel.assert_called_once_with(
+            stack_name="org.proj.dev",
+            project_name="my-project",
+            env_pulumi={},
+        )
+        assert version == PulumiVersion(id="0")
+        assert metadata["action"] == "cancel"
+        assert metadata["result"] == "cancelled"
+
+    def test_cancel_action_does_not_call_update_or_create(self, tmp_path: Path) -> None:
+        resource = _make_resource(stack_name="org.proj.dev", source_dir="infra")
+        build_metadata = MagicMock()
+
+        with (
+            patch("pulumi_utils.cancel_stack_lock"),
+            patch("pulumi_utils.update_stack") as mock_update,
+            patch("pulumi_utils.create_stack") as mock_create,
+        ):
+            resource.publish_new_version(tmp_path, build_metadata, action="cancel")
+
+        mock_update.assert_not_called()
+        mock_create.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # pulumi_utils.serialize_resource_event
@@ -516,7 +574,10 @@ class TestSerializeResourceEvent:
         assert result["urn"] == "urn:pulumi:dev::proj::aws:s3/bucket:Bucket::my-bucket"
         assert result["type"] == "aws:s3/bucket:Bucket"
         assert result["diffs"] == ["tags", "versioning"]
-        assert result["detailed_diff"]["tags"] == {"diff_kind": "update", "input_diff": True}
+        assert result["detailed_diff"]["tags"] == {
+            "diff_kind": "update",
+            "input_diff": True,
+        }
         assert result["detailed_diff"]["versioning"] == {
             "diff_kind": "update",
             "input_diff": False,
@@ -533,7 +594,9 @@ class TestSerializeResourceEvent:
     def test_delete_replace_diff_kind(self) -> None:
         meta = _make_step_metadata(
             op=OpType.DELETE,
-            detailed_diff={"id": PropertyDiff(DiffKind.DELETE_REPLACE, input_diff=True)},
+            detailed_diff={
+                "id": PropertyDiff(DiffKind.DELETE_REPLACE, input_diff=True)
+            },
         )
         result = pulumi_utils.serialize_resource_event(ResourcePreEvent(metadata=meta))
 
@@ -619,7 +682,9 @@ class TestRunPreviewOnStack:
 
     def test_stdout_included_in_output(self, tmp_path: Path) -> None:
         mock_stack = _make_mock_stack()
-        mock_stack.preview.return_value.stdout = "  ~ aws:s3:Bucket  my-bucket  update\n"
+        mock_stack.preview.return_value.stdout = (
+            "  ~ aws:s3:Bucket  my-bucket  update\n"
+        )
         output_file = tmp_path / "preview.json"
 
         pulumi_utils._run_preview_on_stack(mock_stack, output_file)
@@ -627,7 +692,9 @@ class TestRunPreviewOnStack:
         data = json.loads(output_file.read_text())
         assert data["stdout"] == "  ~ aws:s3:Bucket  my-bucket  update\n"
 
-    def test_no_output_file_returns_payload_without_writing(self, tmp_path: Path) -> None:
+    def test_no_output_file_returns_payload_without_writing(
+        self, tmp_path: Path
+    ) -> None:
         mock_stack = _make_mock_stack()
         payload = pulumi_utils._run_preview_on_stack(mock_stack, output_file=None)
 
@@ -635,78 +702,3 @@ class TestRunPreviewOnStack:
         assert "changes" in payload
         assert "stdout" in payload
         assert not list(tmp_path.iterdir())
-
-
-
-# ---------------------------------------------------------------------------
-# Helpers / factories
-# ---------------------------------------------------------------------------
-
-
-def _make_resource(
-    stack_name: str = "org.proj.dev",
-    project_name: str = "my-project",
-    source_dir: str = "infra/myapp",
-    env_pulumi: dict | None = None,
-    env_os: dict | None = None,
-) -> PulumiResource:
-    return PulumiResource(
-        stack_name=stack_name,
-        project_name=project_name,
-        source_dir=source_dir,
-        env_pulumi=env_pulumi,
-        env_os=env_os,
-    )
-
-
-def _make_step_metadata(
-    op: OpType = OpType.UPDATE,
-    urn: str = "urn:pulumi:dev::proj::aws:s3/bucket:Bucket::my-bucket",
-    resource_type: str = "aws:s3/bucket:Bucket",
-    diffs: list[str] | None = None,
-    detailed_diff: dict | None = None,
-) -> StepEventMetadata:
-    return StepEventMetadata(
-        op=op,
-        urn=urn,
-        type=resource_type,
-        provider="",
-        diffs=diffs if diffs is not None else ["tags"],
-        detailed_diff=detailed_diff
-        if detailed_diff is not None
-        else {"tags": PropertyDiff(DiffKind.UPDATE, input_diff=True)},
-    )
-
-
-def _make_engine_event(metadata: StepEventMetadata) -> EngineEvent:
-    return EngineEvent(
-        sequence=1,
-        timestamp=0,
-        resource_pre_event=ResourcePreEvent(metadata=metadata),
-    )
-
-
-def _make_mock_stack(outputs: dict | None = None) -> MagicMock:
-    """Return a mock pulumi Stack with sensible defaults."""
-    stack = MagicMock()
-    stack.outputs.return_value = {
-        k: MagicMock(value=v) for k, v in (outputs or {"url": "https://example.com"}).items()
-    }
-
-    preview_result = MagicMock()
-    preview_result.stdout = "preview output"
-    preview_result.change_summary = {OpType.UPDATE: 1, OpType.SAME: 5}
-    stack.preview.return_value = preview_result
-
-    up_result = MagicMock()
-    up_result.summary.result = "succeeded"
-    up_result.summary.resource_changes = {OpType.UPDATE: 1}
-    stack.up.return_value = up_result
-
-    destroy_result = MagicMock()
-    destroy_result.summary.result = "succeeded"
-    stack.destroy.return_value = destroy_result
-
-    return stack
-
-

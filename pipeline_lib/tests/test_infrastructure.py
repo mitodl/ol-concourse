@@ -170,3 +170,32 @@ class TestRefreshStack:
         assert "refresh_stack" not in (put.params or {}), (
             "refresh_stack should be absent when explicitly True"
         )
+
+
+class TestPulumiJobAttempts:
+    """The Pulumi PutStep must set attempts=2 for automatic Concourse-level retry."""
+
+    def test_pulumi_put_step_has_attempts_2(self):
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+        )
+        put = _get_pulumi_put_step(fragment)
+        assert put.attempts == 2, (
+            "Pulumi PutStep must set attempts=2 to allow one retry after worker loss"
+        )
+
+    def test_all_stacks_in_chain_have_attempts_2(self):
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI", "QA", "Production"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+        )
+        for i in range(len(fragment.jobs)):
+            put = _get_pulumi_put_step(fragment, i)
+            assert put.attempts == 2, f"Job {i} Pulumi PutStep must set attempts=2"
