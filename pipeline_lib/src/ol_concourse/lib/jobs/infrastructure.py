@@ -395,6 +395,7 @@ def pulumi_job(  # noqa: PLR0913
                 inputs="all",
                 put=pulumi_resource.name,
                 no_get=True,
+                attempts=2,
                 params={
                     "env_os": {
                         "AWS_DEFAULT_REGION": "us-east-1",

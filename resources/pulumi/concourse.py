@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from concoursetools import BuildMetadata, ConcourseResource, TypedVersion
 
@@ -28,14 +30,15 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
     optional here and can be overridden per-step via params.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         stack_name: str = "",
         project_name: str = "",
         source_dir: str = ".",
         env_pulumi: dict[str, str] | None = None,
         env_os: dict[str, str] | None = None,
-        action: str | None = None,  # accepted for backwards compatibility; use put params instead
+        action: str
+        | None = None,  # accepted for backwards compatibility; use put params instead
     ) -> None:
         super().__init__(PulumiVersion)
         self.stack_name = stack_name
@@ -59,7 +62,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
     # get
     # ------------------------------------------------------------------
 
-    def download_version(
+    def download_version(  # noqa: PLR0913
         self,
         version: PulumiVersion,
         destination_dir: Path,
@@ -121,7 +124,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
     # put
     # ------------------------------------------------------------------
 
-    def publish_new_version(
+    def publish_new_version(  # noqa: PLR0912, PLR0913
         self,
         sources_dir: Path,
         build_metadata: BuildMetadata,
@@ -142,10 +145,36 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         sources_dir is the job working directory containing all fetched inputs.
         """
         effective_action = action or self.action
-        if effective_action not in ("create", "update", "destroy"):
+        if effective_action not in ("cancel", "create", "update", "destroy"):
             raise ValueError(
-                f"Invalid action '{effective_action}'. Must be one of: create, update, destroy"
+                f"Invalid action '{effective_action}'."
+                " Must be one of: cancel, create, update, destroy"
             )
+
+        if effective_action == "cancel":
+            effective = self._resolve_params(
+                stack_name=stack_name,
+                project_name=project_name,
+                source_dir=source_dir,
+                env_pulumi=env_pulumi,
+                env_os=env_os,
+            )
+            if env_vars_from_files:
+                for var_name, file_path in env_vars_from_files.items():
+                    os.environ[var_name] = io_utils.read_value_from_file(
+                        file_path, working_dir=str(sources_dir)
+                    )
+            _apply_os_env(effective["env_os"])
+            pulumi_utils.cancel_stack_lock(
+                stack_name=effective["stack_name"],
+                project_name=effective["project_name"],
+                env_pulumi=effective["env_pulumi"],
+            )
+            return PulumiVersion(id="0"), {
+                "action": "cancel",
+                "stack": effective["stack_name"],
+                "result": "cancelled",
+            }
 
         effective = self._resolve_params(
             stack_name=stack_name,

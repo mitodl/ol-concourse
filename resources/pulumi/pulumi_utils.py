@@ -3,12 +3,28 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Any
+import re
+import sys
+from datetime import datetime, UTC
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
 
 from pulumi import automation as auto
 from pulumi.automation import LocalWorkspaceOptions
 from pulumi.automation.events import EngineEvent, OpType, ResourcePreEvent
+
+# Matches Concourse worker container hostnames, which are random UUIDs.
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+# Parses "created by <user>@<host> (pid <N>) at <timestamp>" from lock error messages.
+_LOCK_HOLDER_RE = re.compile(
+    r"created by (?P<user>[^@]+)@(?P<host>\S+) \(pid (?P<pid>\d+)\) at (?P<at>\S+)"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +57,9 @@ def read_stack(
 
     outputs = stack.outputs()
     if output_key:
-        return {output_key: outputs[output_key].value if output_key in outputs else None}
+        return {
+            output_key: outputs[output_key].value if output_key in outputs else None
+        }
     return {k: v.value for k, v in outputs.items()}
 
 
@@ -51,8 +69,8 @@ def run_preview(
     source_dir: str | Path,
     env_pulumi: dict[str, str],
     output_file: Path,
-) -> dict:
-    """Select a stack, run a preview, write JSON to output_file, and return the payload."""
+) -> dict[str, Any]:
+    """Select a stack, run a preview, write JSON to output_file, and return it."""
     try:
         stack = auto.select_stack(
             stack_name=stack_name,
@@ -66,7 +84,7 @@ def run_preview(
     return _run_preview_on_stack(stack, output_file)
 
 
-def create_stack(
+def create_stack(  # noqa: PLR0913
     stack_name: str,
     project_name: str,
     source_dir: str | Path,
@@ -99,11 +117,11 @@ def create_stack(
         _run_preview_on_stack(stack, preview_file)
         return 0
 
-    result = stack.up(on_output=print)
+    result = _with_lock_recovery(lambda: stack.up(on_output=print), stack, stack_name)
     return result.summary.version
 
 
-def update_stack(
+def update_stack(  # noqa: PLR0913
     stack_name: str,
     project_name: str,
     source_dir: str | Path,
@@ -136,19 +154,13 @@ def update_stack(
     _apply_stack_config(stack, stack_config)
 
     if refresh_stack:
-        stack.refresh(on_output=print)
+        _with_lock_recovery(lambda: stack.refresh(on_output=print), stack, stack_name)
 
     if preview:
         _run_preview_on_stack(stack, preview_file)
         return 0
 
-    try:
-        result = stack.up(on_output=print)
-    except auto.ConcurrentUpdateError as exc:
-        raise auto.ConcurrentUpdateError(
-            f"Stack '{stack_name}' already has an update in progress"
-        ) from exc
-
+    result = _with_lock_recovery(lambda: stack.up(on_output=print), stack, stack_name)
     return result.summary.version
 
 
@@ -180,17 +192,33 @@ def destroy_stack(
         ) from exc
 
     if refresh_stack:
-        stack.refresh(on_output=print)
+        _with_lock_recovery(lambda: stack.refresh(on_output=print), stack, stack_name)
 
-    try:
-        result = stack.destroy(on_output=print)
-    except auto.ConcurrentUpdateError as exc:
-        raise auto.ConcurrentUpdateError(
-            f"Stack '{stack_name}' already has an update in progress"
-        ) from exc
-
+    result = _with_lock_recovery(
+        lambda: stack.destroy(on_output=print), stack, stack_name
+    )
     stack.workspace.remove_stack(stack_name)
     return result.summary.version
+
+
+def cancel_stack_lock(
+    stack_name: str,
+    project_name: str,
+    env_pulumi: dict[str, str],
+) -> None:
+    """Unconditionally cancel any pending operation on the named stack.
+
+    Uses an inline no-op program so no source directory is required.
+    Intended for explicit pipeline ``ensure``/``on_abort`` cancel steps.
+    """
+    opts = _workspace_opts(env_pulumi)
+    opts.project_settings = auto.ProjectSettings(name=project_name, runtime="python")
+    stack = auto.select_stack(
+        stack_name=stack_name,
+        program=lambda *_args: None,
+        opts=opts,
+    )
+    stack.cancel()
 
 
 def serialize_resource_event(event: ResourcePreEvent) -> dict[str, Any]:
@@ -228,7 +256,80 @@ def _apply_stack_config(stack: auto.Stack, config: dict[str, str]) -> None:
         stack.set_config(key, auto.ConfigValue(value=str(value)))
 
 
-def _run_preview_on_stack(stack: auto.Stack, output_file: Path | None) -> dict:
+def _parse_lock_holders(exc: auto.ConcurrentUpdateError) -> list[dict[str, str]]:
+    """Extract lock holder records from a ConcurrentUpdateError message."""
+    return [m.groupdict() for m in _LOCK_HOLDER_RE.finditer(str(exc))]
+
+
+_LOCK_MIN_AGE_MINUTES = 15
+
+
+def _is_recoverable_lock(
+    holders: list[dict[str, str]],
+    *,
+    min_age_minutes: int = _LOCK_MIN_AGE_MINUTES,
+) -> bool:
+    """Return True only when every lock holder is a stale Concourse worker lock.
+
+    Two conditions must both hold for every holder:
+    - ``user == "root"`` and hostname matches the UUID pattern used by Concourse
+      worker containers (developer machines have human-readable hostnames).
+    - The lock is older than ``min_age_minutes`` (default 15 min) to avoid
+      cancelling a legitimately running deployment on another Concourse worker
+      that also happens to have a UUID hostname.
+    """
+    if not holders:
+        return False
+    now = datetime.now(UTC)
+    for h in holders:
+        if h["user"] != "root" or not _UUID_RE.match(h["host"]):
+            return False
+        if min_age_minutes > 0:
+            try:
+                lock_time = datetime.fromisoformat(h["at"].replace("Z", "+00:00"))
+                age_minutes = (now - lock_time).total_seconds() / 60
+                if age_minutes < min_age_minutes:
+                    return False
+            except ValueError:
+                return False
+    return True
+
+
+def _with_lock_recovery(
+    operation: Callable[[], Any], stack: auto.Stack, stack_name: str
+) -> Any:
+    """Run *operation*, recovering automatically from a stale Concourse lock.
+
+    If ConcurrentUpdateError is raised and every lock holder looks like a
+    Concourse worker container (UUID hostname, root user), cancel the lock and
+    retry once.  Any other lock holder pattern is left to the caller.
+    """
+    try:
+        return operation()
+    except auto.ConcurrentUpdateError as exc:
+        holders = _parse_lock_holders(exc)
+        if not _is_recoverable_lock(holders):
+            raise
+        sys.stderr.write(
+            f"Stale Concourse lock detected for '{stack_name}', cancelling...\n"
+        )
+        for h in holders:
+            sys.stderr.write(
+                f"  Was held by {h['user']}@{h['host']}"
+                f" (pid {h['pid']}) since {h['at']}\n"
+            )
+        try:
+            stack.cancel()
+        except Exception as cancel_exc:
+            raise auto.ConcurrentUpdateError(
+                f"Lock recovery failed for '{stack_name}': {cancel_exc}"
+            ) from exc
+        return operation()
+
+
+def _run_preview_on_stack(
+    stack: auto.Stack, output_file: Path | None
+) -> dict[str, Any]:
     """Run pulumi preview on an already-selected stack.
 
     Writes structured JSON to output_file (if given) and returns the payload.
