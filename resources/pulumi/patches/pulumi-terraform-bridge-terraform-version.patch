@@ -1,0 +1,34 @@
+diff --git a/pkg/pf/tfbridge/provider_configure.go b/pkg/pf/tfbridge/provider_configure.go
+index 08def41b..552267f7 100644
+--- a/pkg/pf/tfbridge/provider_configure.go
++++ b/pkg/pf/tfbridge/provider_configure.go
+@@ -17,6 +17,7 @@ package tfbridge
+ import (
+ 	"context"
+ 	"fmt"
++	"os"
+ 
+ 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
+ 	"github.com/opentracing/opentracing-go"
+@@ -84,9 +85,20 @@ func (p *provider) ConfigureWithContext(ctx context.Context, inputs resource.Pro
+ 		return fmt.Errorf("cannot encode provider configuration to call ConfigureProvider: %w", err)
+ 	}
+ 
++	// MIT ODL: allow overriding the reported Terraform version via env var.
++	// Some Terraform providers (e.g. rootlyhq/rootly) parse this field as a
++	// semantic version and panic on the hardcoded, non-semver default below.
++	// See https://github.com/pulumi/pulumi-terraform-bridge/issues/3514 and
++	// https://github.com/rootlyhq/terraform-provider-rootly/issues/379.
++	// Remove this override once those upstream issues are resolved.
++	terraformVersion := "pulumi-terraform-bridge"
++	if v := os.Getenv("PULUMI_TERRAFORM_VERSION"); v != "" {
++		terraformVersion = v
++	}
++
+ 	req := &tfprotov6.ConfigureProviderRequest{
+ 		Config:           config,
+-		TerraformVersion: "pulumi-terraform-bridge",
++		TerraformVersion: terraformVersion,
+ 	}
+ 
+ 	resp, err := p.tfServer.ConfigureProvider(ctx, req)
