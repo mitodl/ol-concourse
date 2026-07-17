@@ -4,30 +4,6 @@ FROM mitodl/ol-infrastructure AS infra
 
 FROM ghcr.io/astral-sh/uv:latest AS uv
 
-# --- Patched pulumi-terraform-bridge dynamic provider host -----------------
-# Works around https://github.com/pulumi/pulumi-terraform-bridge/issues/3514:
-# the dynamic Terraform-provider bridge sends a hardcoded, non-semver
-# TerraformVersion string during ConfigureProvider. Some wrapped Terraform
-# providers parse that field as a semantic version and panic on it, e.g.
-# Rootly: https://github.com/rootlyhq/terraform-provider-rootly/issues/379.
-# This stage builds a patched bridge binary that instead honors the
-# PULUMI_TERRAFORM_VERSION env var (set below), pinned to a specific known-good
-# pulumi-terraform-bridge commit for reproducibility (that project does not tag
-# releases matching the bridge plugin's own version numbers; those are cut in
-# the separate pulumi/pulumi-terraform-provider "release host" repo).
-# Remove this whole stage, patches/pulumi-terraform-bridge-terraform-version.patch,
-# the COPY below, and the PULUMI_TERRAFORM_VERSION env var once both upstream
-# issues are resolved and a released bridge/provider version includes the fix.
-FROM golang:1.26.4-bookworm@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b AS terraform-bridge-builder
-WORKDIR /src
-RUN git init -q && \
-    git remote add origin https://github.com/pulumi/pulumi-terraform-bridge && \
-    git fetch --depth 1 origin b68f4dbe7ae876b3c304eaf96ba17f341ab9ccc8 && \
-    git checkout -q FETCH_HEAD
-COPY patches/pulumi-terraform-bridge-terraform-version.patch /tmp/patch.diff
-RUN git apply /tmp/patch.diff && \
-    go build -o /pulumi-resource-terraform-provider ./dynamic
-
 FROM python:3.14-slim@sha256:d3400aa122fa42cf0af0dbe8ec3091b047eac5c8f7e3539f7135e86d855dc015
 ENV PYTHONUNBUFFERED=1
 
@@ -51,18 +27,6 @@ ARG PULUMI_VERSION=latest
 RUN curl -fsSL https://get.pulumi.com -o pulumi.sh && \
     /bin/sh pulumi.sh --install-root /usr/local --version "${PULUMI_VERSION}" --silent && \
     rm pulumi.sh
-
-# Install the patched terraform-provider bridge binary built above, at the
-# exact plugin cache path Pulumi expects for the "resource-terraform-provider"
-# plugin at the pinned bridge version used by sdks/rootly (v1.1.4). Other
-# dynamic-provider SDKs pinned to a different bridge version (e.g. qdrant-cloud
-# at v1.1.1) are not covered by this and would need their own COPY line if they
-# hit the same upstream bug. See the terraform-bridge-builder stage above for
-# why this exists and when to remove it.
-COPY --from=terraform-bridge-builder /pulumi-resource-terraform-provider \
-    /root/.pulumi/plugins/resource-terraform-provider-v1.1.4/pulumi-resource-terraform-provider
-RUN chmod +x /root/.pulumi/plugins/resource-terraform-provider-v1.1.4/pulumi-resource-terraform-provider
-ENV PULUMI_TERRAFORM_VERSION=1.5.0
 
 # Install kubectl
 RUN curl -fsSL "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl" \
