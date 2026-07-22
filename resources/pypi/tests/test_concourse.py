@@ -1,5 +1,7 @@
 """Tests for the PyPI Concourse resource."""
 
+from typing import Any
+
 import pytest
 import responses as resp_lib
 
@@ -8,7 +10,7 @@ from concourse import PyPIResource, PyPIVersion, _extract_version_from_filenames
 PACKAGE_NAME = "ol-concourse-lib"
 TOKEN = "pypi-test-token-1234"
 
-PYPI_METADATA = {
+PYPI_METADATA: dict[str, Any] = {
     "info": {"name": PACKAGE_NAME, "version": "0.3.0"},
     "releases": {
         "0.1.0": [{"packagetype": "sdist", "filename": f"{PACKAGE_NAME}-0.1.0.tar.gz"}],
@@ -172,6 +174,7 @@ def test_download_version_wheel(resource, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@resp_lib.activate
 def test_publish_new_version(resource, tmp_path):
     """publish_new_version calls twine and returns the version from the filename."""
     dist_dir = tmp_path / "dist"
@@ -188,8 +191,17 @@ def test_publish_new_version(resource, tmp_path):
         ATC_EXTERNAL_URL="http://ci.example.com",
     )
 
+    # Version has never been published -- PyPI's per-version endpoint 404s.
+    resp_lib.add(
+        resp_lib.GET,
+        f"https://pypi.org/pypi/{PACKAGE_NAME}/1.0.0/json",
+        status=404,
+    )
+
     with patch("concourse.subprocess.run") as mock_run:
-        mock_run.return_value.stdout = "Uploading distributions to https://upload.pypi.org/legacy/"
+        mock_run.return_value.stdout = (
+            "Uploading distributions to https://upload.pypi.org/legacy/"
+        )
         mock_run.return_value.returncode = 0
 
         version, metadata = resource.publish_new_version(
@@ -200,11 +212,150 @@ def test_publish_new_version(resource, tmp_path):
 
     assert version.version == "1.0.0"
     assert PACKAGE_NAME in metadata["uploaded_files"]
+    assert "skipped" not in metadata
     mock_run.assert_called_once()
     call_args = mock_run.call_args[0][0]
     assert "twine" in call_args
     assert "upload" in call_args
     assert str(sdist_file) in call_args
+
+
+@resp_lib.activate
+def test_publish_new_version_already_published_skips_upload(resource, tmp_path):
+    """A version whose files are all already on PyPI is skipped, not re-uploaded.
+
+    This is the retriggered-build case: a commit touching this resource's
+    watched paths without bumping pyproject.toml's version reproduces an
+    already-published artifact. twine would crash on PyPI's "already exists"
+    rejection with no visible error text; this should be a clean no-op.
+    """
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    sdist_file = dist_dir / f"{PACKAGE_NAME}-0.3.0.tar.gz"
+    sdist_file.write_bytes(b"fake-sdist")
+
+    from concoursetools import BuildMetadata
+    from unittest.mock import patch
+
+    build_meta = BuildMetadata(
+        BUILD_ID="1",
+        BUILD_TEAM_NAME="main",
+        ATC_EXTERNAL_URL="http://ci.example.com",
+    )
+
+    resp_lib.add(
+        resp_lib.GET,
+        f"https://pypi.org/pypi/{PACKAGE_NAME}/0.3.0/json",
+        json=PYPI_VERSION_METADATA,
+    )
+
+    with patch("concourse.subprocess.run") as mock_run:
+        version, metadata = resource.publish_new_version(
+            tmp_path,
+            build_meta,
+            glob=f"dist/{PACKAGE_NAME}-*.tar.gz",
+        )
+
+    assert version.version == "0.3.0"
+    assert metadata["skipped"] == "already published"
+    mock_run.assert_not_called()
+
+
+@resp_lib.activate
+def test_publish_new_version_partial_upload_only_uploads_missing_files(
+    resource, tmp_path
+):
+    """A version with some but not all files already on PyPI uploads only the rest.
+
+    A prior twine upload can succeed for one file (e.g. the sdist) and fail
+    before reaching another (e.g. the wheel). Retrying must upload only the
+    missing file -- uploading everything would fail again on the file that
+    already succeeded, and skipping entirely would leave the wheel
+    unpublished forever.
+    """
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    sdist_file = dist_dir / f"{PACKAGE_NAME}-0.3.0.tar.gz"
+    wheel_file = dist_dir / f"{PACKAGE_NAME}-0.3.0-py3-none-any.whl"
+    sdist_file.write_bytes(b"fake-sdist")
+    wheel_file.write_bytes(b"fake-wheel")
+
+    from concoursetools import BuildMetadata
+    from unittest.mock import patch
+
+    build_meta = BuildMetadata(
+        BUILD_ID="1",
+        BUILD_TEAM_NAME="main",
+        ATC_EXTERNAL_URL="http://ci.example.com",
+    )
+
+    # Only the sdist made it to PyPI on the prior (partially-failed) attempt.
+    resp_lib.add(
+        resp_lib.GET,
+        f"https://pypi.org/pypi/{PACKAGE_NAME}/0.3.0/json",
+        json={
+            "info": {"name": PACKAGE_NAME, "version": "0.3.0"},
+            "urls": [PYPI_METADATA["releases"]["0.3.0"][0]],  # sdist only
+        },
+    )
+
+    with patch("concourse.subprocess.run") as mock_run:
+        mock_run.return_value.stdout = ""
+        mock_run.return_value.returncode = 0
+
+        version, metadata = resource.publish_new_version(
+            tmp_path,
+            build_meta,
+            glob=f"dist/{PACKAGE_NAME}-*",
+        )
+
+    assert version.version == "0.3.0"
+    assert "skipped" not in metadata
+    mock_run.assert_called_once()
+    call_args = mock_run.call_args[0][0]
+    assert str(wheel_file) in call_args
+    assert str(sdist_file) not in call_args
+
+
+@resp_lib.activate
+def test_publish_new_version_twine_failure_surfaces_output(resource, tmp_path):
+    """A genuine twine failure raises with the captured stdout/stderr visible.
+
+    Previously used check=True, which raised CalledProcessError without ever
+    printing the captured output -- the real failure reason never made it
+    into the Concourse build log.
+    """
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    sdist_file = dist_dir / f"{PACKAGE_NAME}-1.0.0.tar.gz"
+    sdist_file.write_bytes(b"fake-sdist")
+
+    from concoursetools import BuildMetadata
+    from unittest.mock import patch
+
+    build_meta = BuildMetadata(
+        BUILD_ID="1",
+        BUILD_TEAM_NAME="main",
+        ATC_EXTERNAL_URL="http://ci.example.com",
+    )
+
+    resp_lib.add(
+        resp_lib.GET,
+        f"https://pypi.org/pypi/{PACKAGE_NAME}/1.0.0/json",
+        status=404,
+    )
+
+    with patch("concourse.subprocess.run") as mock_run:
+        mock_run.return_value.stdout = ""
+        mock_run.return_value.stderr = "403 Forbidden: Invalid or non-existent token"
+        mock_run.return_value.returncode = 1
+
+        with pytest.raises(RuntimeError, match="403 Forbidden"):
+            resource.publish_new_version(
+                tmp_path,
+                build_meta,
+                glob=f"dist/{PACKAGE_NAME}-*.tar.gz",
+            )
 
 
 def test_publish_new_version_no_match_raises(resource, tmp_path):

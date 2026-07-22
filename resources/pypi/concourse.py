@@ -33,7 +33,9 @@ Example put params:
 """
 
 import subprocess
+import sys
 from pathlib import Path
+from typing import Any
 
 import requests
 from concoursetools import BuildMetadata, ConcourseResource
@@ -43,6 +45,7 @@ from packaging.version import Version as PkgVersion
 
 PYPI_INDEX_URL = "https://pypi.org"
 PYPI_UPLOAD_URL = "https://upload.pypi.org/legacy/"
+_HTTP_NOT_FOUND = 404
 
 
 class PyPIVersion(Version, SortableVersionMixin):
@@ -77,14 +80,14 @@ class PyPIResource(ConcourseResource):
         self.repository_url = repository_url
         self.index_url = index_url.rstrip("/")
 
-    def _get_package_metadata(self) -> dict:
+    def _get_package_metadata(self) -> dict[str, Any]:
         """Query the PyPI JSON API for all package metadata."""
         url = f"{self.index_url}/pypi/{self.package_name}/json"
         response = requests.get(url, timeout=30)
         response.raise_for_status()
         return response.json()
 
-    def _get_version_files(self, version: str) -> list[dict]:
+    def _get_version_files(self, version: str) -> list[dict[str, Any]]:
         """Get file metadata for a specific package version from PyPI."""
         url = f"{self.index_url}/pypi/{self.package_name}/{version}/json"
         response = requests.get(url, timeout=30)
@@ -160,6 +163,23 @@ class PyPIResource(ConcourseResource):
             msg = f"No files matched glob pattern: {glob!r} in {sources_dir}"
             raise FileNotFoundError(msg)
 
+        version_str = _extract_version_from_filenames(matched)
+        files_to_upload = self._files_not_yet_published(version_str, matched)
+
+        if not files_to_upload:
+            # Every matched file is already on PyPI -- e.g. a commit touching
+            # this resource's watched paths didn't bump pyproject.toml's
+            # version, so `uv build` reproduced an already-uploaded artifact.
+            # PyPI rejects re-uploading an existing file outright (twine
+            # surfaces this as a bare non-zero exit with no visible error
+            # text, since the failure isn't printed before the exception
+            # propagates); treat it as already done instead.
+            uploaded_names = ", ".join(Path(f).name for f in matched)
+            return PyPIVersion(version=version_str), {
+                "uploaded_files": uploaded_names,
+                "skipped": "already published",
+            }
+
         cmd = [
             "twine",
             "upload",
@@ -170,14 +190,41 @@ class PyPIResource(ConcourseResource):
             "--password",
             self.password,
             "--non-interactive",
-            *matched,
+            *files_to_upload,
         ]
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)  # noqa: S603
+        result = subprocess.run(cmd, capture_output=True, text=True)  # noqa: S603
         print(result.stdout)  # noqa: T201
+        if result.returncode != 0:
+            print(result.stderr, file=sys.stderr)  # noqa: T201
+            msg = (
+                f"twine upload failed (exit {result.returncode}): "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+            raise RuntimeError(msg)
 
-        version_str = _extract_version_from_filenames(matched)
-        uploaded_names = ", ".join(Path(f).name for f in matched)
+        uploaded_names = ", ".join(Path(f).name for f in files_to_upload)
         return PyPIVersion(version=version_str), {"uploaded_files": uploaded_names}
+
+    def _files_not_yet_published(
+        self, version: str, matched_files: list[str]
+    ) -> list[str]:
+        """Return the subset of matched_files not already published to PyPI.
+
+        A version can be partially published if a prior twine upload
+        succeeded for some files (e.g. the sdist) but failed before reaching
+        others (e.g. the wheel). Retrying should only upload what's actually
+        missing -- skipping the whole version would leave the missing file
+        unpublished forever, and re-uploading everything would fail again on
+        the files that already succeeded.
+        """
+        try:
+            existing_files = self._get_version_files(version)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == _HTTP_NOT_FOUND:
+                return matched_files
+            raise
+        existing_names = {f["filename"] for f in existing_files}
+        return [f for f in matched_files if Path(f).name not in existing_names]
 
 
 def _extract_version_from_filenames(filenames: list[str]) -> str:
