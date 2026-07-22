@@ -495,6 +495,38 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         # Collect commits for changelog (between last tag and pre-bump HEAD,
         # plus the hotfix commit if present).
         prior_tags = _get_release_tags(repo_path, env=env)
+
+        if version in prior_tags:
+            # This "create" action is a retrigger of a release that already
+            # completed -- e.g. Concourse re-running the job because new
+            # commits landed on the tracked branch while the release was
+            # still in flight, which changes commit_count/authors on an
+            # otherwise-unchanged version and looks like a new resource
+            # version to Concourse. Verify the existing tag points at the
+            # commit we'd have tagged and treat that as already done --
+            # skipping the branch push, commit-range/changelog work, and
+            # re-tagging entirely, so a retrigger is a true no-op. A tag
+            # that exists but points elsewhere is a genuine conflict, not
+            # a retrigger -- surface it loudly.
+            existing_tag_sha = _run(
+                ["git", "rev-list", "-n1", version], cwd=repo_path, env=env
+            ).strip()
+            if existing_tag_sha != pre_bump_sha:
+                msg = (
+                    f"Tag {version!r} already exists at {existing_tag_sha}, which "
+                    f"does not match the commit being released ({pre_bump_sha}). "
+                    "Refusing to overwrite an existing tag with different content."
+                )
+                raise RuntimeError(msg)
+            # since_ref must be the release *before* this one -- prior_tags[-1]
+            # would be `version` itself here, since it's already the latest tag.
+            idx = prior_tags.index(version)
+            since_ref = prior_tags[idx - 1] if idx > 0 else ""
+            if not since_ref and self.semver_tag_fallback:
+                semver_tags = _get_semver_tags(repo_path, env=env)
+                since_ref = semver_tags[-1] if semver_tags else ""
+            return pre_bump_sha, since_ref
+
         if prior_tags:
             since_ref = prior_tags[-1]
         elif self.semver_tag_fallback:
