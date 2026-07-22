@@ -529,16 +529,39 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             )
 
         _run(["git", "push", "origin", branch_name], cwd=repo_path, env=env)
-        _run(
-            ["git", "tag", "-a", version, "-m", f"Release {version}", pre_bump_sha],
-            cwd=repo_path,
-            env=env,
-        )
-        _run(
-            ["git", "push", "origin", f"refs/tags/{version}"],
-            cwd=repo_path,
-            env=env,
-        )
+
+        if version in prior_tags:
+            # This "create" action is a retrigger of a release that already
+            # completed -- e.g. Concourse re-running the job because new
+            # commits landed on the tracked branch while the release was
+            # still in flight, which changes commit_count/authors on an
+            # otherwise-unchanged version and looks like a new resource
+            # version to Concourse. Rather than blindly re-running `git tag`
+            # (which fails outright with "tag already exists"), verify the
+            # existing tag points at the commit we'd have tagged and treat
+            # that as already done. A tag that exists but points elsewhere
+            # is a genuine conflict, not a retrigger -- surface it loudly.
+            existing_tag_sha = _run(
+                ["git", "rev-list", "-n1", version], cwd=repo_path, env=env
+            ).strip()
+            if existing_tag_sha != pre_bump_sha:
+                msg = (
+                    f"Tag {version!r} already exists at {existing_tag_sha}, which "
+                    f"does not match the commit being released ({pre_bump_sha}). "
+                    "Refusing to overwrite an existing tag with different content."
+                )
+                raise RuntimeError(msg)
+        else:
+            _run(
+                ["git", "tag", "-a", version, "-m", f"Release {version}", pre_bump_sha],
+                cwd=repo_path,
+                env=env,
+            )
+            _run(
+                ["git", "push", "origin", f"refs/tags/{version}"],
+                cwd=repo_path,
+                env=env,
+            )
         return pre_bump_sha, since_ref
 
     def _finish_release(

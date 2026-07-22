@@ -816,6 +816,94 @@ def test_publish_new_version_create(mock_run, tmp_path):
 
 
 @patch("concourse._run")
+def test_create_release_retrigger_with_matching_tag_is_idempotent(mock_run, tmp_path):
+    """A retriggered create action for an already-tagged version is a no-op.
+
+    Concourse re-triggers the build job whenever fetch_new_versions returns a
+    changed ReleaseVersion -- including when only commit_count/authors shift
+    because new commits landed on the tracked branch while a release was
+    still in flight, even though the release `version` string itself is
+    unchanged. Without this guard, retrying `create` for a version that
+    already has a matching tag crashes on git tag's "already exists" error.
+    """
+    version_str = "2026.7.22.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    pre_bump_sha = "abc1234" * 5
+
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ["git", "rev-parse"] and cmd[-1] == "HEAD":
+            return pre_bump_sha
+        if "tag" in cmd and "--list" in cmd:
+            return version_str  # the tag already exists remotely
+        if cmd[:3] == ["git", "rev-list", "-n1"]:
+            return pre_bump_sha  # existing tag points at the same commit
+        if "status" in cmd:
+            return ""
+        return ""
+
+    mock_run.side_effect = fake_run
+    resource = make_resource()
+    returned_version, metadata = resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    assert returned_version.version == version_str
+    assert metadata["action"] == "create"
+
+    tag_create_calls = [
+        c for c in mock_run.call_args_list if c.args[0][:3] == ["git", "tag", "-a"]
+    ]
+    assert not tag_create_calls, "Should not re-create an already-existing tag"
+    push_tag_calls = [
+        c for c in mock_run.call_args_list if "refs/tags/" in " ".join(c.args[0])
+    ]
+    assert not push_tag_calls, "Should not push a tag that already exists"
+
+
+@patch("concourse._run")
+def test_create_release_tag_conflict_with_different_sha_raises(mock_run, tmp_path):
+    """A tag pointing at a different commit is a real conflict, not a retrigger."""
+    version_str = "2026.7.22.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    pre_bump_sha = "abc1234" * 5
+    other_sha = "def5678" * 5
+
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ["git", "rev-parse"] and cmd[-1] == "HEAD":
+            return pre_bump_sha
+        if "tag" in cmd and "--list" in cmd:
+            return version_str
+        if cmd[:3] == ["git", "rev-list", "-n1"]:
+            return other_sha  # existing tag points at a different commit
+        if "status" in cmd:
+            return ""
+        return ""
+
+    mock_run.side_effect = fake_run
+    resource = make_resource()
+    with pytest.raises(RuntimeError, match="does not match the commit being released"):
+        resource.publish_new_version(
+            tmp_path,
+            MagicMock(),
+            action="create",
+            repo_dir="app-source",
+            version_file="release/version",
+        )
+
+
+@patch("concourse._run")
 def test_publish_new_version_create_stashes_dirty_files(mock_run, tmp_path):
     """Dirty files from bump_version_task are stashed before git reset --hard.
 
