@@ -866,6 +866,55 @@ def test_create_release_retrigger_with_matching_tag_is_idempotent(mock_run, tmp_
         c for c in mock_run.call_args_list if "refs/tags/" in " ".join(c.args[0])
     ]
     assert not push_tag_calls, "Should not push a tag that already exists"
+    branch_push_calls = [
+        c
+        for c in mock_run.call_args_list
+        if c.args[0][:3] == ["git", "push", "origin"]
+        and c.args[0][3].startswith("releases/")
+    ]
+    assert not branch_push_calls, "A retrigger should skip the branch push too"
+
+
+@patch("concourse._run")
+def test_create_release_retrigger_since_ref_excludes_self(mock_run, tmp_path):
+    """since_ref on a retrigger is the prior release tag, not `version` itself.
+
+    prior_tags[-1] is `version` once it is already tagged (it's the latest
+    tag), so naively using that as since_ref would make the commit/changelog
+    range for this release measure zero commits against itself instead of
+    the actual prior release.
+    """
+    version_str = "2026.7.22.1"
+    prior_version = "2026.7.21.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    pre_bump_sha = "abc1234" * 5
+
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ["git", "rev-parse"] and cmd[-1] == "HEAD":
+            return pre_bump_sha
+        if "tag" in cmd and "--list" in cmd:
+            return f"{prior_version}\n{version_str}"
+        if cmd[:3] == ["git", "rev-list", "-n1"]:
+            return pre_bump_sha  # existing tag points at the same commit
+        if "status" in cmd:
+            return ""
+        return ""
+
+    mock_run.side_effect = fake_run
+    resource = make_resource()
+    returned_version, _ = resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    assert returned_version.since == prior_version
 
 
 @patch("concourse._run")
