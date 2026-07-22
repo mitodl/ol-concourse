@@ -164,16 +164,17 @@ class PyPIResource(ConcourseResource):
             raise FileNotFoundError(msg)
 
         version_str = _extract_version_from_filenames(matched)
-        uploaded_names = ", ".join(Path(f).name for f in matched)
+        files_to_upload = self._files_not_yet_published(version_str, matched)
 
-        if self._version_already_published(version_str, matched):
-            # A retriggered/duplicate publish for a version already on PyPI --
-            # e.g. a commit touching this resource's watched paths didn't bump
-            # pyproject.toml's version, so `uv build` reproduces an
-            # already-uploaded artifact. PyPI rejects re-uploading an existing
-            # file outright (twine surfaces this as a bare non-zero exit with
-            # no visible error text, since the failure isn't printed before
-            # the exception propagates); treat it as already done instead.
+        if not files_to_upload:
+            # Every matched file is already on PyPI -- e.g. a commit touching
+            # this resource's watched paths didn't bump pyproject.toml's
+            # version, so `uv build` reproduced an already-uploaded artifact.
+            # PyPI rejects re-uploading an existing file outright (twine
+            # surfaces this as a bare non-zero exit with no visible error
+            # text, since the failure isn't printed before the exception
+            # propagates); treat it as already done instead.
+            uploaded_names = ", ".join(Path(f).name for f in matched)
             return PyPIVersion(version=version_str), {
                 "uploaded_files": uploaded_names,
                 "skipped": "already published",
@@ -189,7 +190,7 @@ class PyPIResource(ConcourseResource):
             "--password",
             self.password,
             "--non-interactive",
-            *matched,
+            *files_to_upload,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)  # noqa: S603
         print(result.stdout)  # noqa: T201
@@ -201,20 +202,29 @@ class PyPIResource(ConcourseResource):
             )
             raise RuntimeError(msg)
 
+        uploaded_names = ", ".join(Path(f).name for f in files_to_upload)
         return PyPIVersion(version=version_str), {"uploaded_files": uploaded_names}
 
-    def _version_already_published(
+    def _files_not_yet_published(
         self, version: str, matched_files: list[str]
-    ) -> bool:
-        """Return True if every file about to be uploaded is already on PyPI."""
+    ) -> list[str]:
+        """Return the subset of matched_files not already published to PyPI.
+
+        A version can be partially published if a prior twine upload
+        succeeded for some files (e.g. the sdist) but failed before reaching
+        others (e.g. the wheel). Retrying should only upload what's actually
+        missing -- skipping the whole version would leave the missing file
+        unpublished forever, and re-uploading everything would fail again on
+        the files that already succeeded.
+        """
         try:
             existing_files = self._get_version_files(version)
         except requests.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == _HTTP_NOT_FOUND:
-                return False
+                return matched_files
             raise
         existing_names = {f["filename"] for f in existing_files}
-        return all(Path(f).name in existing_names for f in matched_files)
+        return [f for f in matched_files if Path(f).name not in existing_names]
 
 
 def _extract_version_from_filenames(filenames: list[str]) -> str:
