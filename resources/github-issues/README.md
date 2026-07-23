@@ -41,6 +41,7 @@ Marks the issue as consumed by prefixing the title with `[CONSUMED #<build_numbe
 | `assignees` | No | List of GitHub usernames to assign |
 | `labels` | No | List of label names to apply |
 | `body_file` | No | Path to a file whose contents are used as the issue body, overriding `issue_body_template` |
+| `title_template` | No | Overrides the source-level `issue_title_template` for this put. Use this to embed a value only known at build time, e.g. a release version loaded via `load_var` earlier in the same job -- put an unresolved `((.:my_var))` reference in the params value; Concourse resolves it to a plain string before this resource ever runs, so `title_template` arrives here already containing the concrete value. |
 
 The issue title and body are generated from configurable templates:
 - `issue_title_template` — default: `[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed`

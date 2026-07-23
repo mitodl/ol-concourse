@@ -332,17 +332,31 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             return resolved.read_text()
         return self.issue_body_template.format(**build_metadata_dict(build_metadata))
 
-    def get_title_from_build(self, build_metadata: BuildMetadata) -> str:
-        """Return the issue title rendered from the configured template."""
-        return self.issue_title_template.format(**build_metadata_dict(build_metadata))
+    def get_title_from_build(
+        self, build_metadata: BuildMetadata, title_template: str | None = None
+    ) -> str:
+        """Return the issue title rendered from a template.
 
-    def publish_new_version(
+        *title_template* overrides the source-level ``issue_title_template``
+        for this call. This is how a caller embeds a value the resource has
+        no other way to know, like a release version: Concourse resolves any
+        ``((.:var))`` reference in a put step's *params* (e.g. a version
+        loaded via ``load_var`` earlier in the same job) before this script
+        ever runs, so the override arrives here as a plain, fully-resolved
+        string -- ``.format()`` only touches ``{BUILD_*}`` placeholders that
+        remain, so this is safe to call even when the override has none.
+        """
+        template = title_template or self.issue_title_template
+        return template.format(**build_metadata_dict(build_metadata))
+
+    def publish_new_version(  # noqa: PLR0913
         self,
         sources_dir,
         build_metadata: BuildMetadata,
         assignees: list[str] | None = None,
         labels: list[str] | None = None,
         body_file: str | None = None,
+        title_template: str | None = None,
     ) -> tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
         """Create or comment on a GitHub Issue and return its version."""
         # Assume that: title is enough uniqueness to discern whether the issue
@@ -353,7 +367,9 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         )
 
         # Use GitHub Search API for efficiency instead of listing all issues
-        candidate_issue_title = self.get_title_from_build(build_metadata)
+        candidate_issue_title = self.get_title_from_build(
+            build_metadata, title_template=title_template
+        )
         # Ensure title is properly quoted for the search query
         safe_title = candidate_issue_title.replace('"', '\\"')
         query = (

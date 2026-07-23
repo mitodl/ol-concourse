@@ -542,6 +542,40 @@ def test_publish_new_version_updates_existing(mock_github):
     assert metadata == {}
 
 
+def test_publish_new_version_title_template_overrides_source_default(mock_github):
+    """A per-call title_template (e.g. Concourse-resolved with a version) wins."""
+    mock_gh_instance, mock_repo = mock_github
+    mock_gh_instance.search_issues.return_value = []
+    created_mock_issue = create_mock_issue(
+        number=11, title="Release my-app 2026.7.22.1", state="open", created_at=NOW
+    )
+    mock_repo.create_issue.return_value = created_mock_issue
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_title_template="Release {BUILD_PIPELINE_NAME}",
+    )
+    build_meta = mock_build_metadata(pipeline_name="my-app")
+
+    resource.publish_new_version(
+        sources_dir="dummy",
+        build_metadata=build_meta,
+        # Stands in for what Concourse would have already resolved from
+        # "Release {BUILD_PIPELINE_NAME} ((.:image_tag))" via a put step's
+        # params -- this resource never sees the ((.:var)) syntax itself.
+        title_template="Release my-app 2026.7.22.1",
+    )
+
+    expected_title = "Release my-app 2026.7.22.1"
+    expected_query = f'repo:test/repo state:open "{expected_title}" in:title is:issue'
+    mock_gh_instance.search_issues.assert_called_once_with(expected_query)
+    mock_repo.create_issue.assert_called_once()
+    _, kwargs = mock_repo.create_issue.call_args
+    assert kwargs["title"] == expected_title
+
+
 # ---------------------------------------------------------------------------
 # skip_if_labeled (issue #15)
 # ---------------------------------------------------------------------------
