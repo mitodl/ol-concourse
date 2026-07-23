@@ -34,6 +34,7 @@ Example put params:
 
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +95,38 @@ class PyPIResource(ConcourseResource):
         response.raise_for_status()
         return response.json()["urls"]
 
+    def _get_version_files_with_retry(
+        self,
+        version: str,
+        *,
+        max_attempts: int = 5,
+        base_delay_seconds: float = 1.0,
+    ) -> list[dict[str, Any]]:
+        """Fetch version file metadata, retrying a 404 with exponential backoff.
+
+        PyPI's JSON index can lag a few seconds behind an upload actually
+        landing. Concourse performs an implicit `get` right after a `put`
+        succeeds so later steps can use the artifact -- that get can race
+        this index lag and fail the whole build even though the upload
+        itself genuinely succeeded (confirmed live on pypi.org, just not
+        yet reflected in the JSON API). Only retries on 404, since that's
+        the specific "not indexed yet" signal; any other error propagates
+        immediately as a real failure.
+        """
+        for attempt in range(max_attempts):
+            try:
+                return self._get_version_files(version)
+            except requests.HTTPError as exc:
+                is_not_found = (
+                    exc.response is not None
+                    and exc.response.status_code == _HTTP_NOT_FOUND
+                )
+                if not is_not_found or attempt == max_attempts - 1:
+                    raise
+                time.sleep(base_delay_seconds * (2**attempt))
+        msg = "unreachable"  # loop above always returns or raises
+        raise AssertionError(msg)
+
     def fetch_new_versions(
         self, previous_version: PyPIVersion | None = None
     ) -> set[PyPIVersion]:
@@ -128,7 +161,7 @@ class PyPIResource(ConcourseResource):
         download_wheel: bool = False,
     ) -> tuple[PyPIVersion, dict[str, str]]:
         """Download distribution files for a specific version from PyPI."""
-        files = self._get_version_files(version.version)
+        files = self._get_version_files_with_retry(version.version)
         dest = Path(destination_dir)
         downloaded: list[str] = []
 
