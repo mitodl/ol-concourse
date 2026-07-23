@@ -22,12 +22,23 @@ resources:
     issue_prefix: "[bot]"           # optional: filter issues by title prefix
     labels: [pipeline-workflow]     # optional: filter by labels
     skip_if_labeled: [skip-ci]      # optional: skip issues that have any of these labels
+    auto_check_authors:             # optional: auto-check bot-authored checklist lines
+      - concourse@example.com
 ```
 
 ## `check` — Fetch versions
 
 Returns issues matching the configured `issue_state` and `issue_prefix`.
 Issues that carry any label listed in `skip_if_labeled` are excluded from results.
+
+If `auto_check_authors` is set, every open matching issue's body is scanned for
+release-resource-style checklist lines (`- [ ] ... by <author>`) and any
+unchecked line whose author is in the list is flipped to `- [x]`, mirroring
+the deprecated release-script bot self-checking boxes for commits it
+authored itself (e.g. automated version bumps) since there's no human
+available to check those off manually. Already-checked lines and lines from
+other authors are left untouched; the issue is only edited when a line
+actually changes.
 
 ## `in` — Download version
 

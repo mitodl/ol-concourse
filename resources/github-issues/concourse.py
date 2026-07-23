@@ -1,6 +1,7 @@
 """Concourse resource for managing GitHub Issues as pipeline gate signals."""
 
 from pathlib import Path
+import re
 import textwrap
 import json
 from datetime import datetime, timedelta
@@ -12,6 +13,40 @@ from github.GithubObject import NotSet
 from github.Issue import Issue
 
 ISO_8601_FORMAT = "%Y-%m-%dT%H:%M:%S"
+
+# Matches a single checklist line produced by ol-concourse's release resource,
+# e.g. "- [ ] `abc1234` fix: thing by bot@example.com" or
+# "- [ ] **PR title** (#12) by bot@example.com". Captures the checkbox mark
+# and the trailing author token so bot-authored lines can be auto-checked.
+_CHECKLIST_ITEM_RE = re.compile(r"^- \[(?P<mark> |x)\](?P<rest>.* by (?P<author>\S+))$")
+
+
+def _auto_check_bot_lines(body: str, auto_check_authors: set[str]) -> tuple[str, bool]:
+    """Check off checklist lines whose author is in *auto_check_authors*.
+
+    Mirrors the deprecated release-script's behavior of self-checking boxes
+    for bot-authored commits (e.g. automated version bumps) that have no
+    human available to check them off manually. Returns the (possibly
+    unchanged) body and whether any line was modified.
+    """
+    changed = False
+    new_lines = []
+    for line in body.splitlines():
+        match = _CHECKLIST_ITEM_RE.match(line)
+        if (
+            match
+            and match.group("mark") == " "
+            and match.group("author") in auto_check_authors
+        ):
+            line = f"- [x]{match.group('rest')}"
+            changed = True
+        new_lines.append(line)
+    if not changed:
+        return body, False
+    new_body = "\n".join(new_lines)
+    if body.endswith("\n"):
+        new_body += "\n"
+    return new_body, True
 
 
 def build_metadata_dict(build_metadata: BuildMetadata) -> dict[str, str]:
@@ -92,6 +127,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         ),
         skip_if_labeled: list[str] | None = None,
         timeout: int = 30,
+        auto_check_authors: list[str] | None = None,
     ):
         """Initialize with GitHub API credentials and issue configuration."""
         super().__init__(ConcourseGithubIssuesVersion)
@@ -110,6 +146,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         self.issue_body_template = issue_body_template
         self.limit_old_versions = limit_old_versions
         self.skip_if_labeled: list[str] = skip_if_labeled or []
+        self.auto_check_authors: set[str] = set(auto_check_authors or [])
 
     def auth_token(self, access_token):
         """Return a token-based GitHub Auth object."""
@@ -206,6 +243,24 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             return issue
         return None
 
+    def _maybe_auto_check(self, issue: Issue) -> None:
+        """Check off this issue's bot-authored checklist lines, if configured.
+
+        Mirrors the deprecated release-script bot self-checking its own
+        boxes for commits it authored (e.g. automated version bumps), since
+        there's no human available to check those off manually. Only open
+        issues are edited; a closed issue's checklist state no longer
+        matters. No-ops if `auto_check_authors` wasn't configured or the
+        issue has no matching unchecked lines.
+        """
+        if not self.auto_check_authors or issue.state != "open":
+            return
+        new_body, changed = _auto_check_bot_lines(
+            issue.body or "", self.auto_check_authors
+        )
+        if changed:
+            issue.edit(body=new_body)
+
     def fetch_new_versions(
         self, previous_version: ConcourseGithubIssuesVersion | None = None
     ) -> set[ConcourseGithubIssuesVersion]:
@@ -219,6 +274,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         if previous_version is None:
             latest = self._get_latest_matching_issue()
             if latest:
+                self._maybe_auto_check(latest)
                 return {self._to_version(latest)}
             return set()
 
@@ -240,6 +296,8 @@ class ConcourseGithubIssuesResource(ConcourseResource):
                 print(f"Warning: Could not parse timestamp {timestamp_str}")  # noqa: T201
 
         matching_issues = self.get_matching_issues(since=since_datetime)
+        for issue in matching_issues:
+            self._maybe_auto_check(issue)
         versions = {self._to_version(issue) for issue in matching_issues}
         # Filter out the previous_version itself if it happens to be included
         if previous_version in versions:
