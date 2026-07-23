@@ -9,6 +9,7 @@ from concourse import (
     ConcourseGithubIssuesResource,
     ConcourseGithubIssuesVersion,
     ISO_8601_FORMAT,
+    _merge_checklist_preserving_checked,
 )
 from concoursetools import BuildMetadata  # Import the actual class
 from concoursetools.testing import SimpleTestResourceWrapper
@@ -488,8 +489,8 @@ def test_publish_new_version_creates_new_issue(mock_github):
     assert metadata == {}
 
 
-def test_publish_new_version_comments_on_existing(mock_github):
-    """Test publish comments on an existing issue if found."""
+def test_publish_new_version_updates_existing(mock_github):
+    """Test publish edits an existing issue's body in place if found."""
     mock_gh_instance, mock_repo = mock_github
     existing_mock_issue = create_mock_issue(
         number=9,
@@ -497,8 +498,8 @@ def test_publish_new_version_comments_on_existing(mock_github):
         state="open",
         created_at=T_MINUS_1,
     )
-    # Mock the create_comment method on the existing issue
-    existing_mock_issue.create_comment = MagicMock()
+    existing_mock_issue.body = ""
+    existing_mock_issue.edit = MagicMock()
     mock_gh_instance.search_issues.return_value = [
         existing_mock_issue
     ]  # Found existing
@@ -529,9 +530,10 @@ def test_publish_new_version_comments_on_existing(mock_github):
     # Check create_issue was NOT called
     mock_repo.create_issue.assert_not_called()
 
-    # Check create_comment was called on the existing issue
-    expected_comment_body = "Build b456 finished."
-    existing_mock_issue.create_comment.assert_called_once_with(expected_comment_body)
+    # Check the existing issue's body was edited in place, not commented on
+    expected_body = "Build b456 finished."
+    existing_mock_issue.edit.assert_called_once_with(body=expected_body)
+    existing_mock_issue.create_comment.assert_not_called()
 
     # Check returned version matches the existing issue
     assert version.issue_number == 9
@@ -667,10 +669,10 @@ def test_publish_new_version_body_file_creates_with_file_contents(
     assert version.issue_number == 20
 
 
-def test_publish_new_version_body_file_comments_with_file_contents(
+def test_publish_new_version_body_file_updates_existing_with_file_contents(
     mock_github, tmp_path
 ):
-    """body_file is also used for comment body when issue already exists."""
+    """body_file is also used to edit an existing issue's body in place."""
     mock_gh_instance, mock_repo = mock_github
     expected_body = "Updated release notes.\n"
     body_path = tmp_path / "notes.md"
@@ -679,7 +681,8 @@ def test_publish_new_version_body_file_comments_with_file_contents(
     existing_issue = create_mock_issue(
         number=19, title="Release test-pipeline", state="open", created_at=T_MINUS_1
     )
-    existing_issue.create_comment = MagicMock()
+    existing_issue.body = ""
+    existing_issue.edit = MagicMock()
     mock_gh_instance.search_issues.return_value = [existing_issue]
 
     resource = ConcourseGithubIssuesResource(
@@ -696,7 +699,8 @@ def test_publish_new_version_body_file_comments_with_file_contents(
         body_file="notes.md",
     )
 
-    existing_issue.create_comment.assert_called_once_with(expected_body)
+    existing_issue.edit.assert_called_once_with(body=expected_body)
+    existing_issue.create_comment.assert_not_called()
 
 
 def test_timeout_default(mock_github):
@@ -722,3 +726,62 @@ def test_timeout_configurable(mock_github):
         )
         _, kwargs = MockGithub.call_args
         assert kwargs["timeout"] == 60
+
+
+OLD_MERGE_BODY = """## Release 1.2.3
+
+### Changes
+
+- [x] `abc1234` chore: bump version by bot@example.com
+- [ ] **fix: real bug** (#5) by human@example.com
+"""
+
+NEW_MERGE_BODY = """## Release 1.2.3
+
+### Changes
+
+- [ ] `abc1234` chore: bump version by bot@example.com
+- [ ] **fix: real bug** (#5) by human@example.com
+- [ ] **new: another change** (#6) by human@example.com
+"""
+
+
+def test_merge_checklist_preserving_checked_keeps_already_checked_lines():
+    """A line checked in the old body stays checked in the merged result."""
+    merged = _merge_checklist_preserving_checked(OLD_MERGE_BODY, NEW_MERGE_BODY)
+
+    lines = merged.splitlines()
+    assert "- [x] `abc1234` chore: bump version by bot@example.com" in lines
+
+
+def test_merge_checklist_preserving_checked_leaves_unchecked_lines_unchecked():
+    """A line that wasn't checked before stays unchecked after merging."""
+    merged = _merge_checklist_preserving_checked(OLD_MERGE_BODY, NEW_MERGE_BODY)
+
+    lines = merged.splitlines()
+    assert "- [ ] **fix: real bug** (#5) by human@example.com" in lines
+
+
+def test_merge_checklist_preserving_checked_adds_genuinely_new_lines_unchecked():
+    """A line with no match in the old body is a new item -- stays unchecked."""
+    merged = _merge_checklist_preserving_checked(OLD_MERGE_BODY, NEW_MERGE_BODY)
+
+    lines = merged.splitlines()
+    assert "- [ ] **new: another change** (#6) by human@example.com" in lines
+
+
+def test_merge_checklist_preserving_checked_empty_old_body_is_passthrough():
+    """No prior body (e.g. body attribute was empty) -- new body passes through."""
+    merged = _merge_checklist_preserving_checked("", NEW_MERGE_BODY)
+
+    assert merged == NEW_MERGE_BODY
+
+
+def test_merge_checklist_preserving_checked_preserves_trailing_newline():
+    """Trailing newline follows new_body's own ending, not old_body's."""
+    assert NEW_MERGE_BODY.endswith("\n")
+
+    merged = _merge_checklist_preserving_checked(OLD_MERGE_BODY, NEW_MERGE_BODY)
+
+    assert merged.endswith("\n")
+    assert not merged.endswith("\n\n")

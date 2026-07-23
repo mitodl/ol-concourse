@@ -1,6 +1,7 @@
 """Concourse resource for managing GitHub Issues as pipeline gate signals."""
 
 from pathlib import Path
+import re
 import textwrap
 import json
 from datetime import datetime, timedelta
@@ -12,6 +13,41 @@ from github.GithubObject import NotSet
 from github.Issue import Issue
 
 ISO_8601_FORMAT = "%Y-%m-%dT%H:%M:%S"
+
+# Generic checklist-line matcher: "- [ ] <anything>" / "- [x] <anything>".
+# Deliberately loose (no assumption about what follows the checkbox) so this
+# works for any checklist-style issue body, not just the release resource's
+# specific "by <author>" format.
+_CHECKLIST_LINE_RE = re.compile(r"^- \[(?P<mark> |x)\](?P<rest>.*)$", re.IGNORECASE)
+
+
+def _merge_checklist_preserving_checked(old_body: str, new_body: str) -> str:
+    """Re-check any new_body checklist line already checked in old_body.
+
+    A put to an already-existing issue regenerates the body from scratch
+    (e.g. a pipeline retrigger with no real change to review), and that
+    fresh body's checklist starts entirely unchecked. Without this, editing
+    the issue in place would silently wipe out whatever a human already
+    reviewed and checked off. Matching is by each line's content *after*
+    the checkbox mark, so re-ordering or the checkbox state itself doesn't
+    break the match -- only genuinely different line content does.
+    """
+    old_checked_content: set[str] = set()
+    for line in old_body.splitlines():
+        match = _CHECKLIST_LINE_RE.match(line)
+        if match and match.group("mark").lower() == "x":
+            old_checked_content.add(match.group("rest"))
+
+    new_lines = []
+    for line in new_body.splitlines():
+        match = _CHECKLIST_LINE_RE.match(line)
+        if match and match.group("rest") in old_checked_content:
+            line = f"- [x]{match.group('rest')}"
+        new_lines.append(line)
+    merged = "\n".join(new_lines)
+    if new_body.endswith("\n"):
+        merged += "\n"
+    return merged
 
 
 def build_metadata_dict(build_metadata: BuildMetadata) -> dict[str, str]:
@@ -340,7 +376,17 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             print(f"created issue: {working_issue=}")  # noqa: T201
         else:
             working_issue = already_exists[0]
-            print(f"about to comment on {working_issue=} with {issue_body=}")  # noqa: T201
-            working_issue.create_comment(issue_body)
+            # Edit in place rather than commenting -- a retrigger with no
+            # real change to review (e.g. an unrelated upstream pipeline
+            # commit) would otherwise post a second, freshly-unchecked
+            # checklist as a new comment, which reads as the issue
+            # reopening even though nothing changed. Re-checking any line
+            # already checked in the current body preserves review
+            # progress across the edit.
+            merged_body = _merge_checklist_preserving_checked(
+                working_issue.body or "", issue_body
+            )
+            print(f"about to update {working_issue=} with {merged_body=}")  # noqa: T201
+            working_issue.edit(body=merged_body)
 
         return self._to_version(working_issue), {}

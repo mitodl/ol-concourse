@@ -46,6 +46,16 @@ The issue title and body are generated from configurable templates:
 - `issue_title_template` — default: `[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed`
 - `issue_body_template` — Markdown body with build details and a link to the build log
 
+If no open issue matches the title, a new one is created. If a matching open
+issue already exists, its body is **edited in place** rather than commented
+on -- this matters for retriggers that produce the same title with no real
+change to review (e.g. an unrelated upstream pipeline commit), which would
+otherwise post a second, freshly-unchecked checklist as a new comment and
+read as the issue reopening. Any checklist line (`- [ ] ...`) already
+checked in the current body stays checked after the edit, matched by the
+line's content after the checkbox mark -- only genuinely new or changed
+lines start unchecked.
+
 ## Authentication
 
 | Method | Source fields |
