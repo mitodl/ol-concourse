@@ -135,6 +135,7 @@ def github_issues(  # noqa: PLR0913
     issue_body_template: str | None = None,
     skip_if_labeled: list[str] | None = None,
     poll_frequency: Duration = Duration("60m"),
+    auto_check_authors: list[str] | None = None,
 ) -> Resource:
     """Generate a github-issue resource for the given owner/repository.
 
@@ -148,6 +149,11 @@ def github_issues(  # noqa: PLR0913
     :param skip_if_labeled: Optional list of label names. Issues closed with any of
         these labels will be skipped by ``check`` (not emitted as new versions).
         Use this to allow release abandonment without triggering a production deploy.
+    :param auto_check_authors: Optional list of commit author identities (as they
+        appear in an issue's "by <author>" checklist lines). Unchecked lines
+        authored by any of these are auto-checked during ``check``, mirroring the
+        deprecated release-script bot self-checking boxes for its own automated
+        commits (e.g. version bumps) since there's no human to check those off.
 
     :returns: A configured Concourse issue object that can be used in a pipeline.
 
@@ -163,6 +169,7 @@ def github_issues(  # noqa: PLR0913
         "labels": labels,
         "repository": repository,
         "skip_if_labeled": skip_if_labeled,
+        "auto_check_authors": auto_check_authors,
     }
     if gh_host:
         issue_config["gh_host"] = gh_host
