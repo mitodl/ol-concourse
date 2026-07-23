@@ -18,6 +18,7 @@ from concourse import (
     _compute_next_version,
     _get_in_flight_release_version,
     _get_semver_tags,
+    _parse_commit_log,
     _parse_semver_tuple,
     _parse_version_tuple,
     _update_cumulative_changelog,
@@ -182,6 +183,51 @@ def test_get_semver_tags_sorted(mock_run, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# _parse_commit_log
+# ---------------------------------------------------------------------------
+
+
+def test_parse_commit_log_extracts_all_fields():
+    output = "abc1234def5|dev@example.com|Dev Person|Fix bug"
+    commits = _parse_commit_log(output)
+
+    assert commits == [
+        {
+            "sha": "abc1234def5",
+            "author": "dev@example.com",
+            "author_name": "Dev Person",
+            "message": "Fix bug",
+            "pr_number": None,
+            "pr_title": None,
+        }
+    ]
+
+
+def test_parse_commit_log_message_with_pipe_stays_intact():
+    """maxsplit=3 keeps a literal '|' in the commit subject from splitting it."""
+    output = "abc1234def5|dev@example.com|Dev Person|fix: a | b thing"
+    commits = _parse_commit_log(output)
+
+    assert commits[0]["message"] == "fix: a | b thing"
+
+
+def test_parse_commit_log_falls_back_to_email_when_name_empty():
+    """An empty %an (e.g. a bot with no configured name) falls back to email."""
+    output = "abc1234def5|bot@example.com||Automated bump"
+    commits = _parse_commit_log(output)
+
+    assert commits[0]["author_name"] == "bot@example.com"
+
+
+def test_parse_commit_log_skips_malformed_lines():
+    output = "\n".join(["not-enough-pipes", "abc1234def5|a@x.com|A|msg"])
+    commits = _parse_commit_log(output)
+
+    assert len(commits) == 1
+    assert commits[0]["sha"] == "abc1234def5"
+
+
+# ---------------------------------------------------------------------------
 # _build_checklist
 # ---------------------------------------------------------------------------
 
@@ -191,6 +237,7 @@ def test_build_checklist_with_prs():
         {
             "sha": "abc1234def5",
             "author": "dev@example.com",
+            "author_name": "Dev Person",
             "message": "Fix bug",
             "pr_number": 42,
             "pr_title": "Fix the bug",
@@ -198,6 +245,7 @@ def test_build_checklist_with_prs():
     ]
     result = _build_checklist("2026.4.14.1", commits)
     assert "## Release 2026.4.14.1" in result
+    assert "### Dev Person" in result
     assert "- [ ] **Fix the bug** (#42) by dev@example.com" in result
     assert "Closing this issue will trigger the production deployment" in result
 
@@ -207,6 +255,7 @@ def test_build_checklist_without_prs():
         {
             "sha": "abc1234def5",
             "author": "dev@example.com",
+            "author_name": "Dev Person",
             "message": "Fix bug",
             "pr_number": None,
             "pr_title": None,
@@ -219,7 +268,65 @@ def test_build_checklist_without_prs():
 def test_build_checklist_empty_commits():
     result = _build_checklist("2026.4.14.1", [])
     assert "## Release 2026.4.14.1" in result
-    assert "### Changes" in result
+    assert "Closing this issue will trigger the production deployment" in result
+
+
+def test_build_checklist_groups_by_author_name():
+    """Commits are grouped under a heading per author, in first-appearance order."""
+    commits = [
+        {
+            "sha": "aaa1111aaaa",
+            "author": "alice@example.com",
+            "author_name": "Alice Author",
+            "message": "First alice commit",
+            "pr_number": None,
+            "pr_title": None,
+        },
+        {
+            "sha": "bbb2222bbbb",
+            "author": "bob@example.com",
+            "author_name": "Bob Builder",
+            "message": "Bob's commit",
+            "pr_number": None,
+            "pr_title": None,
+        },
+        {
+            "sha": "ccc3333cccc",
+            "author": "alice@example.com",
+            "author_name": "Alice Author",
+            "message": "Second alice commit",
+            "pr_number": None,
+            "pr_title": None,
+        },
+    ]
+    result = _build_checklist("2026.4.14.1", commits)
+    lines = result.splitlines()
+
+    alice_idx = lines.index("### Alice Author")
+    bob_idx = lines.index("### Bob Builder")
+    assert alice_idx < bob_idx, "First-appearance author (Alice) heads the list"
+
+    # Both of Alice's commits are grouped together under her single heading,
+    # not split across two "### Alice Author" sections.
+    assert lines.count("### Alice Author") == 1
+    assert "- [ ] `aaa1111` First alice commit by alice@example.com" in result
+    assert "- [ ] `ccc3333` Second alice commit by alice@example.com" in result
+    assert "- [ ] `bbb2222` Bob's commit by bob@example.com" in result
+
+
+def test_build_checklist_falls_back_to_email_without_author_name():
+    """A commit dict with no author_name groups under its raw email instead."""
+    commits = [
+        {
+            "sha": "abc1234def5",
+            "author": "bot@example.com",
+            "message": "Automated bump",
+            "pr_number": None,
+            "pr_title": None,
+        }
+    ]
+    result = _build_checklist("2026.4.14.1", commits)
+    assert "### bot@example.com" in result
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +405,7 @@ def test_download_version_writes_empty_since_when_no_prior_tag(
     """Since file is written even when version.since is empty."""
     mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
     head_sha = "abc" * 13 + "a"
-    outputs = ["", "", f"{head_sha}|dev@example.com|Initial commit"]
+    outputs = ["", "", f"{head_sha}|dev@example.com|Dev Person|Initial commit"]
     idx = 0
 
     def run_side_effect(cmd, **kwargs):
@@ -678,8 +785,8 @@ def test_download_version_writes_all_outputs(
 
     git_log_output = "\n".join(
         [
-            f"{head_sha}|dev@example.com|Fix bug",
-            f"{'b' * 40}|alice@example.com|Add feature",
+            f"{head_sha}|dev@example.com|Dev Person|Fix bug",
+            f"{'b' * 40}|alice@example.com|Alice Author|Add feature",
         ]
     )
     outputs = ["", "", git_log_output]
@@ -713,7 +820,12 @@ def test_download_version_no_since_uses_head_sha(mock_tmpdir, mock_run, tmp_path
     """When version.since is empty, the full commit history up to head_sha is used."""
     mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
     head_sha = "abc" * 13 + "a"
-    outputs = ["", "", head_sha, f"{head_sha}|dev@example.com|Initial commit"]
+    outputs = [
+        "",
+        "",
+        head_sha,
+        f"{head_sha}|dev@example.com|Dev Person|Initial commit",
+    ]
     call_index = 0
 
     def run_side_effect(cmd, **kwargs):
@@ -735,7 +847,9 @@ def test_download_version_no_since_uses_head_sha(mock_tmpdir, mock_run, tmp_path
     log_cmd = log_calls[0].args[0]
     # range spec should be just the SHA, not "..SHA"
     assert head_sha in log_cmd
-    assert ".." not in "".join(c for c in log_cmd if c not in ["--format=%H|%ae|%s"])
+    assert ".." not in "".join(
+        c for c in log_cmd if c not in ["--format=%H|%ae|%an|%s"]
+    )
 
 
 # ---------------------------------------------------------------------------

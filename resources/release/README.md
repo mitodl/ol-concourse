@@ -88,8 +88,8 @@ Clones the repository and generates release artefacts from `version.since..versi
 | File | Description |
 |------|-------------|
 | `version` | Plain version string, e.g. `2026.04.14.1` |
-| `commits.json` | Structured list of `{sha, author, pr_number, pr_title, message}` |
-| `checklist.md` | GitHub Issue body with markdown task list; use as `body_file` in `github-issues` resource |
+| `commits.json` | Structured list of `{sha, author, author_name, pr_number, pr_title, message}` -- `author` is the commit email (matched against `auto_check_authors` by the `github-issues` resource), `author_name` is the git-configured display name |
+| `checklist.md` | GitHub Issue body with a markdown task list grouped by author (`### <author_name>` headings, newest contributor first); use as `body_file` in `github-issues` resource |
 | `changelog_entry.md` | Single [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) entry for this version |
 
 ## `out` — Create or finish a release
