@@ -582,8 +582,22 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         """
         branch_name = f"releases/{version}"
 
+        # Plain `git fetch origin <name>` only creates a `refs/remotes/origin/<name>`
+        # tracking ref if one is already configured for that name. The checkout's
+        # git config only tracks `self.branch` (set up by the initial `git`
+        # resource get), so a release branch fetched here for the first time
+        # would land in FETCH_HEAD with no ref pointing at it -- `origin/<name>`
+        # then fails to resolve at all ("not something we can merge"), not a
+        # real merge conflict. An explicit refspec sidesteps this regardless of
+        # what the checkout's pre-existing remote config looks like.
         _run(
-            ["git", "fetch", "origin", self.branch, branch_name],
+            [
+                "git",
+                "fetch",
+                "origin",
+                self.branch,
+                f"+refs/heads/{branch_name}:refs/remotes/origin/{branch_name}",
+            ],
             cwd=repo_path,
             env=env,
         )

@@ -1098,6 +1098,20 @@ def test_publish_new_version_finish(mock_run, tmp_path):
         "Finish must delete the release branch from the remote"
     )
 
+    # The release branch fetch must use an explicit refspec so
+    # refs/remotes/origin/releases/<version> exists locally regardless of the
+    # checkout's pre-existing remote.origin.fetch config -- a plain branch-name
+    # fetch silently lands in FETCH_HEAD with no ref to merge against when the
+    # branch was never part of that config (concourse/concourse-release-resource
+    # production incident: "not something we can merge" on origin/releases/...).
+    fetch_cmds = [c for c in all_cmds if "fetch" in c]
+    assert fetch_cmds, "Expected a git fetch call"
+    fetch_cmd = fetch_cmds[0]
+    assert (
+        f"+refs/heads/releases/{version_str}:refs/remotes/origin/releases/{version_str}"
+        in fetch_cmd
+    ), "Release branch fetch must use an explicit refspec, not a plain branch name"
+
 
 @patch("concourse._run")
 def test_publish_new_version_finish_uses_configured_branch(mock_run, tmp_path):
