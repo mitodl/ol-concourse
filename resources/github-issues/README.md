@@ -22,6 +22,8 @@ resources:
     issue_prefix: "[bot]"           # optional: filter issues by title prefix
     labels: [pipeline-workflow]     # optional: filter by labels
     skip_if_labeled: [skip-ci]      # optional: skip issues that have any of these labels
+    update_in_place: false          # optional: edit an existing open issue instead of
+                                     # commenting on it (default: false)
 ```
 
 ## `check` — Fetch versions
@@ -48,14 +50,20 @@ The issue title and body are generated from configurable templates:
 - `issue_body_template` — Markdown body with build details and a link to the build log
 
 If no open issue matches the title, a new one is created. If a matching open
-issue already exists, its body is **edited in place** rather than commented
-on -- this matters for retriggers that produce the same title with no real
-change to review (e.g. an unrelated upstream pipeline commit), which would
-otherwise post a second, freshly-unchecked checklist as a new comment and
-read as the issue reopening. Any checklist line (`- [ ] ...`) already
-checked in the current body stays checked after the edit, matched by the
-line's content after the checkbox mark -- only genuinely new or changed
-lines start unchecked.
+issue already exists, the default behavior is to **comment** on it -- for
+most consumers of this resource, a fresh comment on an already-open issue
+*is* the useful signal: it means this gate has been hit again (e.g. deploys
+stacking up) before anyone closed the last one.
+
+Set `update_in_place: true` to instead **edit the issue body in place**.
+This is for cases where re-showing the same content on every hit is noise
+rather than signal -- e.g. the release resource's checklist, where a
+retrigger with no real app change to review (an unrelated upstream pipeline
+commit) would otherwise post a second, freshly-unchecked checklist as a new
+comment and read as the issue reopening. With `update_in_place`, any
+checklist line (`- [ ] ...`) already checked in the current body stays
+checked after the edit, matched by the line's content after the checkbox
+mark -- only genuinely new or changed lines start unchecked.
 
 ## Authentication
 

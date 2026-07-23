@@ -135,6 +135,7 @@ def github_issues(  # noqa: PLR0913
     issue_body_template: str | None = None,
     skip_if_labeled: list[str] | None = None,
     poll_frequency: Duration = Duration("60m"),
+    update_in_place: bool = False,
 ) -> Resource:
     """Generate a github-issue resource for the given owner/repository.
 
@@ -148,6 +149,12 @@ def github_issues(  # noqa: PLR0913
     :param skip_if_labeled: Optional list of label names. Issues closed with any of
         these labels will be skipped by ``check`` (not emitted as new versions).
         Use this to allow release abandonment without triggering a production deploy.
+    :param update_in_place: When a matching open issue already exists, edit its body
+        in place instead of the default behavior of commenting on it. Leave this
+        False for most uses -- a fresh comment on an already-open issue is itself a
+        useful signal (e.g. this gate being hit again before the last one closed).
+        Set True only when re-showing the same content each time is noise rather
+        than signal, e.g. the release resource's checklist.
 
     :returns: A configured Concourse issue object that can be used in a pipeline.
 
@@ -163,6 +170,7 @@ def github_issues(  # noqa: PLR0913
         "labels": labels,
         "repository": repository,
         "skip_if_labeled": skip_if_labeled,
+        "update_in_place": update_in_place,
     }
     if gh_host:
         issue_config["gh_host"] = gh_host

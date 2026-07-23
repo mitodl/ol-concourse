@@ -489,8 +489,48 @@ def test_publish_new_version_creates_new_issue(mock_github):
     assert metadata == {}
 
 
-def test_publish_new_version_updates_existing(mock_github):
-    """Test publish edits an existing issue's body in place if found."""
+def test_publish_new_version_comments_on_existing_by_default(mock_github):
+    """Without update_in_place, publish comments on an existing issue.
+
+    This is the useful default for most consumers of this resource: a fresh
+    comment on an already-open issue is itself a signal (e.g. "this gate has
+    been hit again -- deploys stacking up -- before anyone closed the last
+    one"). update_in_place is an opt-in for the specific case (like the
+    release resource's checklist) where re-showing the same content is noise
+    rather than signal.
+    """
+    mock_gh_instance, mock_repo = mock_github
+    existing_mock_issue = create_mock_issue(
+        number=9,
+        title="[bot] Pipeline my-pipeline task my-job completed",
+        state="open",
+        created_at=T_MINUS_1,
+    )
+    existing_mock_issue.create_comment = MagicMock()
+    existing_mock_issue.edit = MagicMock()
+    mock_gh_instance.search_issues.return_value = [existing_mock_issue]
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_title_template=(
+            "[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed"
+        ),
+        issue_body_template="Build {BUILD_NAME} finished.",
+    )
+    build_meta = mock_build_metadata(
+        pipeline_name="my-pipeline", job_name="my-job", build_name="b456"
+    )
+
+    resource.publish_new_version(sources_dir="dummy", build_metadata=build_meta)
+
+    existing_mock_issue.create_comment.assert_called_once_with("Build b456 finished.")
+    existing_mock_issue.edit.assert_not_called()
+
+
+def test_publish_new_version_updates_existing_when_update_in_place(mock_github):
+    """With update_in_place=True, publish edits an existing issue's body."""
     mock_gh_instance, mock_repo = mock_github
     existing_mock_issue = create_mock_issue(
         number=9,
@@ -512,6 +552,7 @@ def test_publish_new_version_updates_existing(mock_github):
             "[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed"
         ),
         issue_body_template="Build {BUILD_NAME} finished.",
+        update_in_place=True,
     )
     build_meta = mock_build_metadata(
         pipeline_name="my-pipeline", job_name="my-job", build_name="b456"
@@ -703,10 +744,10 @@ def test_publish_new_version_body_file_creates_with_file_contents(
     assert version.issue_number == 20
 
 
-def test_publish_new_version_body_file_updates_existing_with_file_contents(
+def test_publish_new_version_body_file_updates_existing_when_update_in_place(
     mock_github, tmp_path
 ):
-    """body_file is also used to edit an existing issue's body in place."""
+    """With update_in_place=True, body_file content also edits the body."""
     mock_gh_instance, mock_repo = mock_github
     expected_body = "Updated release notes.\n"
     body_path = tmp_path / "notes.md"
@@ -724,6 +765,7 @@ def test_publish_new_version_body_file_updates_existing_with_file_contents(
         access_token="dummy_token",
         issue_state="open",
         issue_title_template="Release {BUILD_PIPELINE_NAME}",
+        update_in_place=True,
     )
     build_meta = mock_build_metadata(pipeline_name="test-pipeline")
 

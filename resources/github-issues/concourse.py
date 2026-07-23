@@ -128,6 +128,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         ),
         skip_if_labeled: list[str] | None = None,
         timeout: int = 30,
+        update_in_place: bool = False,
     ):
         """Initialize with GitHub API credentials and issue configuration."""
         super().__init__(ConcourseGithubIssuesVersion)
@@ -146,6 +147,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         self.issue_body_template = issue_body_template
         self.limit_old_versions = limit_old_versions
         self.skip_if_labeled: list[str] = skip_if_labeled or []
+        self.update_in_place = update_in_place
 
     def auth_token(self, access_token):
         """Return a token-based GitHub Auth object."""
@@ -390,7 +392,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
                 body=issue_body,
             )
             print(f"created issue: {working_issue=}")  # noqa: T201
-        else:
+        elif self.update_in_place:
             working_issue = already_exists[0]
             # Edit in place rather than commenting -- a retrigger with no
             # real change to review (e.g. an unrelated upstream pipeline
@@ -398,11 +400,18 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             # checklist as a new comment, which reads as the issue
             # reopening even though nothing changed. Re-checking any line
             # already checked in the current body preserves review
-            # progress across the edit.
+            # progress across the edit. Opt-in only: for most consumers of
+            # this resource, a fresh comment on an already-open issue *is*
+            # the useful signal -- it means this gate has been hit again
+            # (e.g. deploys stacking up) before anyone closed the last one.
             merged_body = _merge_checklist_preserving_checked(
                 working_issue.body or "", issue_body
             )
             print(f"about to update {working_issue=} with {merged_body=}")  # noqa: T201
             working_issue.edit(body=merged_body)
+        else:
+            working_issue = already_exists[0]
+            print(f"about to comment on {working_issue=} with {issue_body=}")  # noqa: T201
+            working_issue.create_comment(issue_body)
 
         return self._to_version(working_issue), {}
