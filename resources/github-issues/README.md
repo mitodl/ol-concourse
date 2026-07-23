@@ -31,14 +31,22 @@ resources:
 Returns issues matching the configured `issue_state` and `issue_prefix`.
 Issues that carry any label listed in `skip_if_labeled` are excluded from results.
 
-If `auto_check_authors` is set, every open matching issue's body is scanned for
-release-resource-style checklist lines (`- [ ] ... by <author>`) and any
-unchecked line whose author is in the list is flipped to `- [x]`, mirroring
-the deprecated release-script bot self-checking boxes for commits it
-authored itself (e.g. automated version bumps) since there's no human
-available to check those off manually. Already-checked lines and lines from
-other authors are left untouched; the issue is only edited when a line
-actually changes.
+If `auto_check_authors` is set, every open matching issue returned by *this*
+`check` call has its body scanned for release-resource-style checklist lines
+(`- [ ] ... by <author>`), and any unchecked line whose author is in the list
+is flipped to `- [x]` — mirroring the deprecated release-script bot
+self-checking boxes for commits it authored itself (e.g. automated version
+bumps) since there's no human available to check those off manually.
+Already-checked lines and lines from other authors are left untouched; the
+issue is only edited when a line actually changes.
+
+Note this only covers issues `check` actually returns as new versions, not
+every open matching issue that has ever existed: the first-ever check only
+inspects the single most recent matching issue (to seed Concourse's state
+cheaply), and subsequent checks are bounded to issues created/closed since
+the previous version. An older open issue that predates `auto_check_authors`
+being enabled won't be retroactively scanned until it produces a new
+version itself.
 
 ## `in` — Download version
 

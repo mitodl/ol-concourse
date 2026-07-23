@@ -197,7 +197,7 @@ def test_fetch_new_versions_with_previous_closed(mock_github):
     # API should be called with 'since' = closed_at + 1s
     # Replicate the resource logic: parse the string format which drops microseconds
     parsed_closed_at = datetime.strptime(  # noqa: DTZ007
-        previous_version.issue_closed_at,  # type: ignore [arg-type]
+        previous_version.issue_closed_at,
         ISO_8601_FORMAT,
     )
     expected_since = parsed_closed_at + timedelta(seconds=1)
@@ -288,7 +288,7 @@ def test_fetch_new_versions_with_prefix_and_previous(mock_github):
     )
     # Replicate the resource logic: parse the string format which drops microseconds
     parsed_closed_at = datetime.strptime(  # noqa: DTZ007
-        previous_version.issue_closed_at,  # type: ignore [arg-type]
+        previous_version.issue_closed_at,
         ISO_8601_FORMAT,
     )
     expected_since = parsed_closed_at + timedelta(seconds=1)
@@ -353,7 +353,7 @@ def test_fetch_new_versions_limit_old(mock_github):
         issue_url="http://example.com/issue/1",
     )
     parsed_closed_at = datetime.strptime(  # noqa: DTZ007
-        previous_version.issue_closed_at,  # type: ignore[arg-type]
+        previous_version.issue_closed_at,
         ISO_8601_FORMAT,
     )
     expected_since = parsed_closed_at + timedelta(seconds=1)
@@ -757,6 +757,42 @@ def test_auto_check_bot_lines_no_match_reports_unchanged():
 
     assert changed is False
     assert new_body == CHECKLIST_BODY
+
+
+def test_auto_check_bot_lines_preserves_trailing_newline():
+    """The body's trailing newline survives even when a line is changed."""
+    assert CHECKLIST_BODY.endswith("\n")
+
+    new_body, changed = _auto_check_bot_lines(CHECKLIST_BODY, {"bot@example.com"})
+
+    assert changed is True
+    assert new_body.endswith("\n")
+    assert not new_body.endswith("\n\n")
+
+
+def test_auto_check_bot_lines_no_trailing_newline_stays_without_one():
+    """A body with no trailing newline doesn't gain one from the join/rebuild."""
+    body_no_trailing_newline = CHECKLIST_BODY.rstrip("\n")
+
+    new_body, changed = _auto_check_bot_lines(
+        body_no_trailing_newline, {"bot@example.com"}
+    )
+
+    assert changed is True
+    assert not new_body.endswith("\n")
+
+
+def test_auto_check_bot_lines_is_idempotent():
+    """Running the function again on its own output changes nothing further."""
+    first_body, first_changed = _auto_check_bot_lines(
+        CHECKLIST_BODY, {"bot@example.com"}
+    )
+    assert first_changed is True
+
+    second_body, second_changed = _auto_check_bot_lines(first_body, {"bot@example.com"})
+
+    assert second_changed is False
+    assert second_body == first_body
 
 
 def test_maybe_auto_check_edits_open_issue_with_matching_lines(mock_github):
