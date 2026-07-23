@@ -1,6 +1,7 @@
 """Concourse resource for managing GitHub Issues as pipeline gate signals."""
 
 from pathlib import Path
+import re
 import textwrap
 import json
 from datetime import datetime, timedelta
@@ -12,6 +13,41 @@ from github.GithubObject import NotSet
 from github.Issue import Issue
 
 ISO_8601_FORMAT = "%Y-%m-%dT%H:%M:%S"
+
+# Generic checklist-line matcher: "- [ ] <anything>" / "- [x] <anything>".
+# Deliberately loose (no assumption about what follows the checkbox) so this
+# works for any checklist-style issue body, not just the release resource's
+# specific "by <author>" format.
+_CHECKLIST_LINE_RE = re.compile(r"^- \[(?P<mark> |x)\](?P<rest>.*)$", re.IGNORECASE)
+
+
+def _merge_checklist_preserving_checked(old_body: str, new_body: str) -> str:
+    """Re-check any new_body checklist line already checked in old_body.
+
+    A put to an already-existing issue regenerates the body from scratch
+    (e.g. a pipeline retrigger with no real change to review), and that
+    fresh body's checklist starts entirely unchecked. Without this, editing
+    the issue in place would silently wipe out whatever a human already
+    reviewed and checked off. Matching is by each line's content *after*
+    the checkbox mark, so re-ordering or the checkbox state itself doesn't
+    break the match -- only genuinely different line content does.
+    """
+    old_checked_content: set[str] = set()
+    for line in old_body.splitlines():
+        match = _CHECKLIST_LINE_RE.match(line)
+        if match and match.group("mark").lower() == "x":
+            old_checked_content.add(match.group("rest"))
+
+    new_lines = []
+    for line in new_body.splitlines():
+        match = _CHECKLIST_LINE_RE.match(line)
+        if match and match.group("rest") in old_checked_content:
+            line = f"- [x]{match.group('rest')}"
+        new_lines.append(line)
+    merged = "\n".join(new_lines)
+    if new_body.endswith("\n"):
+        merged += "\n"
+    return merged
 
 
 def build_metadata_dict(build_metadata: BuildMetadata) -> dict[str, str]:
@@ -92,6 +128,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         ),
         skip_if_labeled: list[str] | None = None,
         timeout: int = 30,
+        update_in_place: bool = False,
     ):
         """Initialize with GitHub API credentials and issue configuration."""
         super().__init__(ConcourseGithubIssuesVersion)
@@ -110,6 +147,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         self.issue_body_template = issue_body_template
         self.limit_old_versions = limit_old_versions
         self.skip_if_labeled: list[str] = skip_if_labeled or []
+        self.update_in_place = update_in_place
 
     def auth_token(self, access_token):
         """Return a token-based GitHub Auth object."""
@@ -296,17 +334,31 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             return resolved.read_text()
         return self.issue_body_template.format(**build_metadata_dict(build_metadata))
 
-    def get_title_from_build(self, build_metadata: BuildMetadata) -> str:
-        """Return the issue title rendered from the configured template."""
-        return self.issue_title_template.format(**build_metadata_dict(build_metadata))
+    def get_title_from_build(
+        self, build_metadata: BuildMetadata, title_template: str | None = None
+    ) -> str:
+        """Return the issue title rendered from a template.
 
-    def publish_new_version(
+        *title_template* overrides the source-level ``issue_title_template``
+        for this call. This is how a caller embeds a value the resource has
+        no other way to know, like a release version: Concourse resolves any
+        ``((.:var))`` reference in a put step's *params* (e.g. a version
+        loaded via ``load_var`` earlier in the same job) before this script
+        ever runs, so the override arrives here as a plain, fully-resolved
+        string -- ``.format()`` only touches ``{BUILD_*}`` placeholders that
+        remain, so this is safe to call even when the override has none.
+        """
+        template = title_template or self.issue_title_template
+        return template.format(**build_metadata_dict(build_metadata))
+
+    def publish_new_version(  # noqa: PLR0913
         self,
         sources_dir,
         build_metadata: BuildMetadata,
         assignees: list[str] | None = None,
         labels: list[str] | None = None,
         body_file: str | None = None,
+        title_template: str | None = None,
     ) -> tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
         """Create or comment on a GitHub Issue and return its version."""
         # Assume that: title is enough uniqueness to discern whether the issue
@@ -317,7 +369,9 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         )
 
         # Use GitHub Search API for efficiency instead of listing all issues
-        candidate_issue_title = self.get_title_from_build(build_metadata)
+        candidate_issue_title = self.get_title_from_build(
+            build_metadata, title_template=title_template
+        )
         # Ensure title is properly quoted for the search query
         safe_title = candidate_issue_title.replace('"', '\\"')
         query = (
@@ -338,6 +392,23 @@ class ConcourseGithubIssuesResource(ConcourseResource):
                 body=issue_body,
             )
             print(f"created issue: {working_issue=}")  # noqa: T201
+        elif self.update_in_place:
+            working_issue = already_exists[0]
+            # Edit in place rather than commenting -- a retrigger with no
+            # real change to review (e.g. an unrelated upstream pipeline
+            # commit) would otherwise post a second, freshly-unchecked
+            # checklist as a new comment, which reads as the issue
+            # reopening even though nothing changed. Re-checking any line
+            # already checked in the current body preserves review
+            # progress across the edit. Opt-in only: for most consumers of
+            # this resource, a fresh comment on an already-open issue *is*
+            # the useful signal -- it means this gate has been hit again
+            # (e.g. deploys stacking up) before anyone closed the last one.
+            merged_body = _merge_checklist_preserving_checked(
+                working_issue.body or "", issue_body
+            )
+            print(f"about to update {working_issue=} with {merged_body=}")  # noqa: T201
+            working_issue.edit(body=merged_body)
         else:
             working_issue = already_exists[0]
             print(f"about to comment on {working_issue=} with {issue_body=}")  # noqa: T201

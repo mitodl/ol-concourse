@@ -315,29 +315,11 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         else:
             range_spec = version.head_sha
         output = _run(
-            ["git", "log", "--format=%H|%ae|%s", range_spec],
+            ["git", "log", "--format=%H|%ae|%an|%s", range_spec],
             cwd=repo_path,
             env=env,
         )
-
-        commits: list[dict[str, Any]] = []
-        for line in output.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("|", 2)
-            if len(parts) < 3:  # noqa: PLR2004
-                continue
-            sha, author_email, message = parts
-            commits.append(
-                {
-                    "sha": sha.strip(),
-                    "author": author_email.strip(),
-                    "message": message.strip(),
-                    "pr_number": None,
-                    "pr_title": None,
-                }
-            )
+        commits = _parse_commit_log(output)
 
         if self.access_token and self.repository:
             commits = _enrich_with_github(commits, self.access_token, self.repository)
@@ -663,29 +645,11 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         """Return enriched commit list between two refs."""
         range_spec = f"{since_ref}..{until_ref}" if since_ref else until_ref
         output = _run(
-            ["git", "log", "--format=%H|%ae|%s", range_spec],
+            ["git", "log", "--format=%H|%ae|%an|%s", range_spec],
             cwd=repo_path,
             env=env,
         )
-
-        commits: list[dict[str, Any]] = []
-        for line in output.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("|", 2)
-            if len(parts) < 3:  # noqa: PLR2004
-                continue
-            sha, author_email, message = parts
-            commits.append(
-                {
-                    "sha": sha.strip(),
-                    "author": author_email.strip(),
-                    "message": message.strip(),
-                    "pr_number": None,
-                    "pr_title": None,
-                }
-            )
+        commits = _parse_commit_log(output)
 
         if self.access_token and self.repository:
             commits = _enrich_with_github(commits, self.access_token, self.repository)
@@ -920,6 +884,42 @@ def _configure_https_auth(
 
 
 # ---------------------------------------------------------------------------
+# Commit log parsing
+# ---------------------------------------------------------------------------
+
+
+def _parse_commit_log(output: str) -> list[dict[str, Any]]:
+    """Parse ``git log --format=%H|%ae|%an|%s`` output into commit dicts.
+
+    ``author`` is the commit author's email (used as the checklist line's
+    "by <author>" identity, matched against ``auto_check_authors`` by the
+    github-issues resource); ``author_name`` is their git-configured display
+    name, used only for grouping the checklist by author. maxsplit=3 keeps
+    the commit subject intact even if it happens to contain a literal "|".
+    """
+    commits: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|", 3)
+        if len(parts) < 4:  # noqa: PLR2004
+            continue
+        sha, author_email, author_name, message = parts
+        commits.append(
+            {
+                "sha": sha.strip(),
+                "author": author_email.strip(),
+                "author_name": author_name.strip() or author_email.strip(),
+                "message": message.strip(),
+                "pr_number": None,
+                "pr_title": None,
+            }
+        )
+    return commits
+
+
+# ---------------------------------------------------------------------------
 # GitHub API enrichment
 # ---------------------------------------------------------------------------
 
@@ -990,25 +990,41 @@ def _compute_next_version(existing_tags: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _checklist_item_line(commit: dict[str, Any]) -> str:
+    """Render one commit as a single checklist item line."""
+    sha_short = commit["sha"][:7]
+    author = commit["author"]
+    if commit.get("pr_number"):
+        title = commit.get("pr_title") or commit["message"]
+        return f"- [ ] **{title}** (#{commit['pr_number']}) by {author}"
+    return f"- [ ] `{sha_short}` {commit['message']} by {author}"
+
+
 def _build_checklist(version: str, commits: list[dict[str, Any]]) -> str:
-    """Build a GitHub Issue body with a markdown task checklist."""
+    """Build a GitHub Issue body with a markdown task checklist grouped by author.
+
+    Grouping (mirroring the deprecated release-script bot's PR format) makes
+    it easy for each person to find and check off just their own commits.
+    Author order follows first appearance in *commits* (newest-first, same
+    as the flat list this replaces), not alphabetical, so the most recent
+    contributor's section reads first.
+    """
     lines = [
         f"## Release {version}",
         "",
-        "### Changes",
-        "",
     ]
+    by_author: dict[str, list[dict[str, Any]]] = {}
     for commit in commits:
-        sha_short = commit["sha"][:7]
-        author = commit["author"]
-        if commit.get("pr_number"):
-            title = commit.get("pr_title") or commit["message"]
-            lines.append(f"- [ ] **{title}** (#{commit['pr_number']}) by {author}")
-        else:
-            lines.append(f"- [ ] `{sha_short}` {commit['message']} by {author}")
+        author_name = commit.get("author_name") or commit["author"]
+        by_author.setdefault(author_name, []).append(commit)
+
+    for author_name, author_commits in by_author.items():
+        lines.append(f"### {author_name}")
+        lines.append("")
+        lines.extend(_checklist_item_line(c) for c in author_commits)
+        lines.append("")
 
     lines += [
-        "",
         "---",
         "*This release was automatically generated by the Concourse release pipeline.*",
         "*Closing this issue will trigger the production deployment.*",

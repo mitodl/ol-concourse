@@ -9,6 +9,7 @@ from concourse import (
     ConcourseGithubIssuesResource,
     ConcourseGithubIssuesVersion,
     ISO_8601_FORMAT,
+    _merge_checklist_preserving_checked,
 )
 from concoursetools import BuildMetadata  # Import the actual class
 from concoursetools.testing import SimpleTestResourceWrapper
@@ -488,8 +489,16 @@ def test_publish_new_version_creates_new_issue(mock_github):
     assert metadata == {}
 
 
-def test_publish_new_version_comments_on_existing(mock_github):
-    """Test publish comments on an existing issue if found."""
+def test_publish_new_version_comments_on_existing_by_default(mock_github):
+    """Without update_in_place, publish comments on an existing issue.
+
+    This is the useful default for most consumers of this resource: a fresh
+    comment on an already-open issue is itself a signal (e.g. "this gate has
+    been hit again -- deploys stacking up -- before anyone closed the last
+    one"). update_in_place is an opt-in for the specific case (like the
+    release resource's checklist) where re-showing the same content is noise
+    rather than signal.
+    """
     mock_gh_instance, mock_repo = mock_github
     existing_mock_issue = create_mock_issue(
         number=9,
@@ -497,8 +506,40 @@ def test_publish_new_version_comments_on_existing(mock_github):
         state="open",
         created_at=T_MINUS_1,
     )
-    # Mock the create_comment method on the existing issue
     existing_mock_issue.create_comment = MagicMock()
+    existing_mock_issue.edit = MagicMock()
+    mock_gh_instance.search_issues.return_value = [existing_mock_issue]
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_title_template=(
+            "[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed"
+        ),
+        issue_body_template="Build {BUILD_NAME} finished.",
+    )
+    build_meta = mock_build_metadata(
+        pipeline_name="my-pipeline", job_name="my-job", build_name="b456"
+    )
+
+    resource.publish_new_version(sources_dir="dummy", build_metadata=build_meta)
+
+    existing_mock_issue.create_comment.assert_called_once_with("Build b456 finished.")
+    existing_mock_issue.edit.assert_not_called()
+
+
+def test_publish_new_version_updates_existing_when_update_in_place(mock_github):
+    """With update_in_place=True, publish edits an existing issue's body."""
+    mock_gh_instance, mock_repo = mock_github
+    existing_mock_issue = create_mock_issue(
+        number=9,
+        title="[bot] Pipeline my-pipeline task my-job completed",
+        state="open",
+        created_at=T_MINUS_1,
+    )
+    existing_mock_issue.body = ""
+    existing_mock_issue.edit = MagicMock()
     mock_gh_instance.search_issues.return_value = [
         existing_mock_issue
     ]  # Found existing
@@ -511,6 +552,7 @@ def test_publish_new_version_comments_on_existing(mock_github):
             "[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed"
         ),
         issue_body_template="Build {BUILD_NAME} finished.",
+        update_in_place=True,
     )
     build_meta = mock_build_metadata(
         pipeline_name="my-pipeline", job_name="my-job", build_name="b456"
@@ -529,15 +571,50 @@ def test_publish_new_version_comments_on_existing(mock_github):
     # Check create_issue was NOT called
     mock_repo.create_issue.assert_not_called()
 
-    # Check create_comment was called on the existing issue
-    expected_comment_body = "Build b456 finished."
-    existing_mock_issue.create_comment.assert_called_once_with(expected_comment_body)
+    # Check the existing issue's body was edited in place, not commented on
+    expected_body = "Build b456 finished."
+    existing_mock_issue.edit.assert_called_once_with(body=expected_body)
+    existing_mock_issue.create_comment.assert_not_called()
 
     # Check returned version matches the existing issue
     assert version.issue_number == 9
     assert version.issue_title == expected_title
     assert version.issue_state == "open"
     assert metadata == {}
+
+
+def test_publish_new_version_title_template_overrides_source_default(mock_github):
+    """A per-call title_template (e.g. Concourse-resolved with a version) wins."""
+    mock_gh_instance, mock_repo = mock_github
+    mock_gh_instance.search_issues.return_value = []
+    created_mock_issue = create_mock_issue(
+        number=11, title="Release my-app 2026.7.22.1", state="open", created_at=NOW
+    )
+    mock_repo.create_issue.return_value = created_mock_issue
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_title_template="Release {BUILD_PIPELINE_NAME}",
+    )
+    build_meta = mock_build_metadata(pipeline_name="my-app")
+
+    resource.publish_new_version(
+        sources_dir="dummy",
+        build_metadata=build_meta,
+        # Stands in for what Concourse would have already resolved from
+        # "Release {BUILD_PIPELINE_NAME} ((.:image_tag))" via a put step's
+        # params -- this resource never sees the ((.:var)) syntax itself.
+        title_template="Release my-app 2026.7.22.1",
+    )
+
+    expected_title = "Release my-app 2026.7.22.1"
+    expected_query = f'repo:test/repo state:open "{expected_title}" in:title is:issue'
+    mock_gh_instance.search_issues.assert_called_once_with(expected_query)
+    mock_repo.create_issue.assert_called_once()
+    _, kwargs = mock_repo.create_issue.call_args
+    assert kwargs["title"] == expected_title
 
 
 # ---------------------------------------------------------------------------
@@ -667,10 +744,10 @@ def test_publish_new_version_body_file_creates_with_file_contents(
     assert version.issue_number == 20
 
 
-def test_publish_new_version_body_file_comments_with_file_contents(
+def test_publish_new_version_body_file_updates_existing_when_update_in_place(
     mock_github, tmp_path
 ):
-    """body_file is also used for comment body when issue already exists."""
+    """With update_in_place=True, body_file content also edits the body."""
     mock_gh_instance, mock_repo = mock_github
     expected_body = "Updated release notes.\n"
     body_path = tmp_path / "notes.md"
@@ -679,7 +756,8 @@ def test_publish_new_version_body_file_comments_with_file_contents(
     existing_issue = create_mock_issue(
         number=19, title="Release test-pipeline", state="open", created_at=T_MINUS_1
     )
-    existing_issue.create_comment = MagicMock()
+    existing_issue.body = ""
+    existing_issue.edit = MagicMock()
     mock_gh_instance.search_issues.return_value = [existing_issue]
 
     resource = ConcourseGithubIssuesResource(
@@ -687,6 +765,7 @@ def test_publish_new_version_body_file_comments_with_file_contents(
         access_token="dummy_token",
         issue_state="open",
         issue_title_template="Release {BUILD_PIPELINE_NAME}",
+        update_in_place=True,
     )
     build_meta = mock_build_metadata(pipeline_name="test-pipeline")
 
@@ -696,7 +775,8 @@ def test_publish_new_version_body_file_comments_with_file_contents(
         body_file="notes.md",
     )
 
-    existing_issue.create_comment.assert_called_once_with(expected_body)
+    existing_issue.edit.assert_called_once_with(body=expected_body)
+    existing_issue.create_comment.assert_not_called()
 
 
 def test_timeout_default(mock_github):
@@ -722,3 +802,62 @@ def test_timeout_configurable(mock_github):
         )
         _, kwargs = MockGithub.call_args
         assert kwargs["timeout"] == 60
+
+
+OLD_MERGE_BODY = """## Release 1.2.3
+
+### Changes
+
+- [x] `abc1234` chore: bump version by bot@example.com
+- [ ] **fix: real bug** (#5) by human@example.com
+"""
+
+NEW_MERGE_BODY = """## Release 1.2.3
+
+### Changes
+
+- [ ] `abc1234` chore: bump version by bot@example.com
+- [ ] **fix: real bug** (#5) by human@example.com
+- [ ] **new: another change** (#6) by human@example.com
+"""
+
+
+def test_merge_checklist_preserving_checked_keeps_already_checked_lines():
+    """A line checked in the old body stays checked in the merged result."""
+    merged = _merge_checklist_preserving_checked(OLD_MERGE_BODY, NEW_MERGE_BODY)
+
+    lines = merged.splitlines()
+    assert "- [x] `abc1234` chore: bump version by bot@example.com" in lines
+
+
+def test_merge_checklist_preserving_checked_leaves_unchecked_lines_unchecked():
+    """A line that wasn't checked before stays unchecked after merging."""
+    merged = _merge_checklist_preserving_checked(OLD_MERGE_BODY, NEW_MERGE_BODY)
+
+    lines = merged.splitlines()
+    assert "- [ ] **fix: real bug** (#5) by human@example.com" in lines
+
+
+def test_merge_checklist_preserving_checked_adds_genuinely_new_lines_unchecked():
+    """A line with no match in the old body is a new item -- stays unchecked."""
+    merged = _merge_checklist_preserving_checked(OLD_MERGE_BODY, NEW_MERGE_BODY)
+
+    lines = merged.splitlines()
+    assert "- [ ] **new: another change** (#6) by human@example.com" in lines
+
+
+def test_merge_checklist_preserving_checked_empty_old_body_is_passthrough():
+    """No prior body (e.g. body attribute was empty) -- new body passes through."""
+    merged = _merge_checklist_preserving_checked("", NEW_MERGE_BODY)
+
+    assert merged == NEW_MERGE_BODY
+
+
+def test_merge_checklist_preserving_checked_preserves_trailing_newline():
+    """Trailing newline follows new_body's own ending, not old_body's."""
+    assert NEW_MERGE_BODY.endswith("\n")
+
+    merged = _merge_checklist_preserving_checked(OLD_MERGE_BODY, NEW_MERGE_BODY)
+
+    assert merged.endswith("\n")
+    assert not merged.endswith("\n\n")
