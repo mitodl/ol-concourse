@@ -1,7 +1,7 @@
 """Tests for the GitHub Deployments Concourse resource."""
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,9 +18,9 @@ from concoursetools import BuildMetadata
 # Helpers
 # ---------------------------------------------------------------------------
 
-NOW = datetime(2025, 4, 14, 12, 0, 0)
-EARLIER = datetime(2025, 4, 13, 10, 0, 0)
-EARLIEST = datetime(2025, 4, 12, 8, 0, 0)
+NOW = datetime(2025, 4, 14, 12, 0, 0, tzinfo=UTC)
+EARLIER = datetime(2025, 4, 13, 10, 0, 0, tzinfo=UTC)
+EARLIEST = datetime(2025, 4, 12, 8, 0, 0, tzinfo=UTC)
 
 
 def mock_build_metadata(**kwargs) -> BuildMetadata:
@@ -192,7 +192,9 @@ def test_fetch_passes_environment_to_api(mock_github):
 
 def test_download_version_writes_deployment_json(mock_github, tmp_path):
     _, mock_repo = mock_github
-    status = make_mock_status(1, "in_progress", environment_url="https://rc.example.com")
+    status = make_mock_status(
+        1, "in_progress", environment_url="https://rc.example.com"
+    )
     dep = make_mock_deployment(42, statuses=[status])
     mock_repo.get_deployment.return_value = dep
 
@@ -468,5 +470,60 @@ def test_publish_invalid_action(mock_github):
         resource.publish_new_version(
             sources_dir="/workspace",
             build_metadata=mock_build_metadata(),
-            action="deploy",
+            action="deploy",  # type: ignore[arg-type]
         )
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+
+def test_token_auth_is_the_default(mock_github):
+    with patch("concourse.Auth") as mock_auth:
+        ConcourseGithubDeploymentsResource(
+            repository="mitodl/my-app",
+            environment="RC",
+            access_token="dummy",
+        )
+    mock_auth.Token.assert_called_once_with("dummy")
+    mock_auth.AppAuth.assert_not_called()
+
+
+def test_app_auth_builds_installation_auth(mock_github):
+    with patch("concourse.Auth") as mock_auth:
+        ConcourseGithubDeploymentsResource(
+            repository="mitodl/my-app",
+            environment="RC",
+            auth_method="app",
+            app_id="810341",
+            app_installation_id="46690837",
+            private_ssh_key="-----BEGIN RSA PRIVATE KEY-----",
+        )
+    mock_auth.Token.assert_not_called()
+    mock_auth.AppAuth.assert_called_once_with(
+        "810341", "-----BEGIN RSA PRIVATE KEY-----"
+    )
+    # Concourse source values arrive as strings; PyGithub asserts an int here.
+    mock_auth.AppAuth.return_value.get_installation_auth.assert_called_once_with(
+        46690837
+    )
+
+
+def test_app_auth_passes_auth_object_to_github_client():
+    """The Auth object, not a bare token, so PyGithub refreshes on expiry."""
+    with (
+        patch("concourse.Github") as mock_github_cls,
+        patch("concourse.Auth") as mock_auth,
+    ):
+        ConcourseGithubDeploymentsResource(
+            repository="mitodl/my-app",
+            environment="RC",
+            auth_method="app",
+            app_id="810341",
+            app_installation_id="46690837",
+            private_ssh_key="key",
+        )
+    app_auth = mock_auth.AppAuth.return_value
+    installation_auth = app_auth.get_installation_auth.return_value
+    assert mock_github_cls.call_args.kwargs["auth"] is installation_auth

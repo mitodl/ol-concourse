@@ -1,6 +1,6 @@
 [project]
 name = "ol-concourse-github-deployments"
-version = "0.1.0"
+version = "0.2.0"
 description = "Concourse resource type for GitHub Deployments API"
 authors = [{ name = "MIT Open Learning", email = "odl-devops@mit.edu" }]
 requires-python = ">=3.13"

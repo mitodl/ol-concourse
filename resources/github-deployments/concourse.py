@@ -16,7 +16,13 @@ Usage example::
         source:
           repository: mitodl/my-app
           environment: RC
+          # Token auth (default):
           access_token: ((github.access_token))
+          # ...or GitHub App auth, which has no expiry to keep track of:
+          # auth_method: app
+          # app_id: ((github_app.app_id))
+          # app_installation_id: ((github_app.installation_id))
+          # private_ssh_key: ((github_app.private_key))
 
     jobs:
       - name: deploy-rc
@@ -91,20 +97,37 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
       creates a final status (``success``, ``failure``, or ``error``).
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         /,
         repository: str,
         environment: str,
-        access_token: str,
+        access_token: str | None = None,
+        app_id: int | str | None = None,
+        app_installation_id: int | str | None = None,
+        private_ssh_key: str | None = None,
+        auth_method: Literal["token", "app"] = "token",
         gh_host: str = Consts.DEFAULT_BASE_URL,
     ):
         """Initialize the resource with repository credentials and environment."""
         super().__init__(GithubDeploymentVersion)
-        auth = Auth.Token(access_token)
+        if auth_method == "token":
+            auth = self.auth_token(access_token)
+        else:
+            auth = self.auth_app(app_id, app_installation_id, private_ssh_key)
         self.gh = Github(base_url=gh_host, auth=auth)
         self.repo = self.gh.get_repo(repository)
         self.environment = environment
+
+    def auth_token(self, access_token):
+        """Return a token-based GitHub Auth object."""
+        return Auth.Token(access_token)
+
+    def auth_app(self, app_id, app_installation_id, private_ssh_key):
+        """Return an app installation-based GitHub Auth object."""
+        return Auth.AppAuth(app_id, private_ssh_key).get_installation_auth(
+            int(app_installation_id)
+        )
 
     def _to_version(self, deployment) -> GithubDeploymentVersion:
         return GithubDeploymentVersion(
@@ -186,9 +209,7 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
                 else ""
             ),
             "log_url": (
-                latest_status.log_url
-                if latest_status and latest_status.log_url
-                else ""
+                latest_status.log_url if latest_status and latest_status.log_url else ""
             ),
         }
         Path(destination_dir).joinpath("deployment.json").write_text(
