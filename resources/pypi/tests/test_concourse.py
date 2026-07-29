@@ -268,6 +268,19 @@ def test_get_version_files_with_retry_does_not_retry_non_404_errors(resource):
     mock_sleep.assert_not_called()
 
 
+@pytest.mark.parametrize("max_attempts", [0, -1])
+def test_get_version_files_with_retry_rejects_non_positive_max_attempts(
+    resource, max_attempts
+):
+    with pytest.raises(ValueError, match="max_attempts"):
+        resource._get_version_files_with_retry("0.3.0", max_attempts=max_attempts)
+
+
+def test_get_version_files_with_retry_rejects_negative_base_delay(resource):
+    with pytest.raises(ValueError, match="base_delay_seconds"):
+        resource._get_version_files_with_retry("0.3.0", base_delay_seconds=-1.0)
+
+
 # ---------------------------------------------------------------------------
 # publish_new_version
 # ---------------------------------------------------------------------------

@@ -113,6 +113,12 @@ class PyPIResource(ConcourseResource):
         the specific "not indexed yet" signal; any other error propagates
         immediately as a real failure.
         """
+        if max_attempts < 1:
+            msg = f"max_attempts must be >= 1, got {max_attempts}"
+            raise ValueError(msg)
+        if base_delay_seconds < 0:
+            msg = f"base_delay_seconds must be >= 0, got {base_delay_seconds}"
+            raise ValueError(msg)
         for attempt in range(max_attempts):
             try:
                 return self._get_version_files(version)

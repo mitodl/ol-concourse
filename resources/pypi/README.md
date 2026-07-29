@@ -34,13 +34,13 @@ ordered by PEP 440 precedence.
 
 Downloads distribution files for the pinned version to the destination directory.
 
-Fetching a version's file metadata retries up to 5 times with exponential
-backoff (1s, 2s, 4s, 8s) if PyPI's JSON index 404s. This specifically covers
-the implicit `get` Concourse performs right after a `put` succeeds: PyPI's
-index can lag a few seconds behind an upload actually landing, and without
-the retry that race failed the whole build even though the upload itself had
-genuinely already succeeded. Any non-404 error, or a 404 that persists past
-all attempts, still raises immediately.
+Fetching a version's file metadata makes up to 5 attempts, backing off
+exponentially (1s, 2s, 4s, 8s) between them, if PyPI's JSON index 404s. This
+specifically covers the implicit `get` Concourse performs right after a `put`
+succeeds: PyPI's index can lag a few seconds behind an upload actually
+landing, and without the retry that race failed the whole build even though
+the upload itself had genuinely already succeeded. Any non-404 error raises
+immediately; a 404 only raises once all 5 attempts are exhausted.
 
 **Parameters**
 
