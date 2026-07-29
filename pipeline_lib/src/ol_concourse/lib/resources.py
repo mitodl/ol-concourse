@@ -285,7 +285,6 @@ def pulumi_provisioner(
         type="pulumi-provisioner",
         icon="cloud-braces",
         source={
-            "env_pulumi": {"AWS_SHARED_CREDENTIALS_FILE": "aws_creds/credentials"},
             "action": "update",
             "project_name": project_name,
             "source_dir": project_path,

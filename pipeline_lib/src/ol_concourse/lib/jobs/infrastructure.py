@@ -4,22 +4,14 @@ from collections.abc import Iterable
 from copy import deepcopy
 from pathlib import Path
 
-from ol_concourse.lib.constants import REGISTRY_IMAGE
 from ol_concourse.lib.models.fragment import PipelineFragment
 from ol_concourse.lib.models.pipeline import (
-    AnonymousResource,
-    Command,
     GetStep,
     Identifier,
     InParallelStep,
-    Input,
     Job,
-    Output,
-    Platform,
     PutStep,
-    RegistryImage,
     Resource,
-    TaskConfig,
     TaskStep,
 )
 from ol_concourse.lib.notifications import notification
@@ -361,7 +353,6 @@ def pulumi_job(  # noqa: PLR0913
         project_path=f"{pulumi_code.name}/{project_source_path}",
     )
     passed_job = [previous_job.name] if previous_job else None
-    aws_creds_path = Output(name=Identifier("aws_creds"))
     pulumi_job_object = Job(
         name=Identifier(f"deploy-{project_name}-{stack_name.lower()}"),
         max_in_flight=1,  # Only allow 1 Pulumi task at a time since they lock anyway.
@@ -372,24 +363,6 @@ def pulumi_job(  # noqa: PLR0913
                 trigger=passed_job is None
                 and not stack_name.lower().endswith("production"),
                 passed=passed_job,
-            ),
-            TaskStep(
-                task=Identifier("set-aws-creds"),
-                config=TaskConfig(
-                    platform=Platform.linux,
-                    image_resource=AnonymousResource(
-                        type=REGISTRY_IMAGE,
-                        source=RegistryImage(repository="amazon/aws-cli"),
-                    ),
-                    inputs=[Input(name=pulumi_code.name)],
-                    outputs=[aws_creds_path],
-                    run=Command(
-                        path=(
-                            f"{pulumi_code.name}/pipelines/infrastructure/scripts/"
-                            "generate_aws_config_from_instance_profile.sh"
-                        )
-                    ),
-                ),
             ),
             PutStep(
                 inputs="all",
