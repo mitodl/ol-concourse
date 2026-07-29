@@ -30,6 +30,13 @@ resources:
       branch: main              # default: main
       private_key: ((github.private_key))
       access_token: ((github.token))   # optional; enables PR enrichment
+      # ...or GitHub App auth instead of access_token (preferred — no token
+      # expiry to track).  Use an https:// uri so that git pushes authenticate
+      # with the minted installation token and private_key is not needed:
+      # auth_method: app
+      # app_id: ((github_app.app_id))
+      # app_installation_id: ((github_app.installation_id))
+      # private_ssh_key: ((github_app.private_key))
       repository: mitodl/my-app        # optional; required for PR enrichment
       git_user_name: Concourse CI
       git_user_email: concourse@mit.edu
@@ -43,9 +50,13 @@ resources:
 |-------|----------|---------|-------------|
 | `uri` | Yes | — | Git repository URI (SSH or HTTPS) |
 | `branch` | No | `main` | Branch to track for new commits |
-| `private_key` | No | — | SSH private key for git operations |
-| `access_token` | No | — | GitHub token; enables PR number/title enrichment |
-| `repository` | No | — | `owner/repo`; required when `access_token` is set |
+| `private_key` | No | — | SSH private key for git transport; not needed when `uri` is HTTPS |
+| `auth_method` | No | `token` | `token` or `app` — see [Authentication](#authentication) |
+| `access_token` | No | — | GitHub token; enables PR enrichment and authenticates HTTPS git operations |
+| `app_id` | With `auth_method: app` | — | GitHub App ID |
+| `app_installation_id` | With `auth_method: app` | — | ID of the App's installation on the target organization |
+| `private_ssh_key` | With `auth_method: app` | — | The GitHub App's PEM private key (distinct from `private_key`) |
+| `repository` | No | — | `owner/repo`; required for PR enrichment |
 | `git_user_name` | No | `Concourse CI` | Git committer name for release commits |
 | `git_user_email` | No | `concourse@example.com` | Git committer email |
 | `changelog_style` | No | `null` | `"cumulative"` or `"per_release"`; omit to disable |
@@ -166,6 +177,37 @@ header if it does not yet exist.
 ### `changelog_style: per_release`
 
 Writes a standalone `RELEASE_<version>.md` file to `changelog_dir` (default `releases/`).
+
+## Authentication
+
+| Method | Source fields |
+|--------|--------------|
+| Token | `access_token` |
+| GitHub App | `auth_method: app`, `app_id`, `app_installation_id`, `private_ssh_key` |
+
+Prefer GitHub App auth. The resource mints an installation access token per run,
+so there is no PAT expiry to monitor — an expired fine-grained PAT fails a
+release pipeline with an opaque `401 Bad credentials`. Grant the App
+`contents: write` (release branches and tags) and `pull_requests: read` (PR
+enrichment) on the target repositories.
+
+Two distinct keys are involved, and the naming is easy to trip over:
+
+- `private_key` — an **SSH** key, used only for git transport when `uri` is an
+  `ssh://` / `git@` URL.
+- `private_ssh_key` — the **GitHub App's** PEM private key, used to sign the JWT
+  that mints installation tokens. Named for consistency with the
+  `github-issues` resource.
+
+The token (static or App-minted) is embedded into the git remote URL as
+`https://x-access-token:TOKEN@host/...` for clone, push, and tag operations, so
+with an `https://` *uri* App auth alone is sufficient and no SSH key is needed.
+With a `git@` *uri*, git transport still requires `private_key`.
+
+The `release`, `github-issues`, and `github-deployments` resources are all meant
+to authenticate as the *same* GitHub App, so that a release workflow has one
+registration to manage and one private key to rotate. The `ol_concourse.lib`
+DSL wrappers default to that shared App's credential references.
 
 ## Docker Image
 

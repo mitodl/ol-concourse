@@ -10,6 +10,13 @@ resources:
       private_key: ((github.private_key))
       access_token: ((github.token))
       repository: mitodl/my-app
+      # ...or GitHub App auth instead of access_token, which has no expiry to
+      # keep track of.  Use an https:// uri so that git pushes authenticate with
+      # the minted installation token rather than needing an SSH private_key:
+      # auth_method: app
+      # app_id: ((github_app.app_id))
+      # app_installation_id: ((github_app.installation_id))
+      # private_ssh_key: ((github_app.private_key))
       changelog_style: cumulative   # or "per_release", or omit to disable
       changelog_file: CHANGELOG.md  # only used when changelog_style=cumulative
       changelog_dir: releases        # only used when changelog_style=per_release
@@ -35,7 +42,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 from concoursetools import BuildMetadata, ConcourseResource, TypedVersion
-from github import Auth, Github
+from github import Auth, Github, GithubIntegration
 
 VERSION_PATTERN = re.compile(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})\.(\d+)$")
 SEMVER_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
@@ -105,6 +112,10 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         branch: str = "main",
         private_key: str | None = None,
         access_token: str | None = None,
+        app_id: int | str | None = None,
+        app_installation_id: int | str | None = None,
+        private_ssh_key: str | None = None,
+        auth_method: Literal["token", "app"] = "token",
         repository: str | None = None,
         git_user_name: str = "Concourse CI",
         git_user_email: str = "concourse@example.com",
@@ -115,6 +126,15 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         semver_tag_fallback: bool = False,
     ) -> None:
         """Initialize the release resource with git and GitHub configuration.
+
+        Two authentication methods are supported.  ``auth_method: token`` (the
+        default) uses the static *access_token* source field.  ``auth_method:
+        app`` authenticates as a GitHub App installation, minting a short-lived
+        installation access token from *app_id*, *app_installation_id* and the
+        App's PEM private key (*private_ssh_key*) — preferred, since there is no
+        token expiry to track.  Note that *private_ssh_key* is the GitHub App's
+        private key and is unrelated to *private_key*, which is an SSH key used
+        for git transport when *uri* is an ``ssh://``/``git@`` URL.
 
         When *semver_tag_fallback* is ``True`` and no date-format (YYYY.M.D.N)
         tags exist in the repository, the resource falls back to the most recent
@@ -128,6 +148,11 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         self.branch = branch
         self.private_key = private_key
         self.access_token = access_token
+        self.app_id = app_id
+        self.app_installation_id = app_installation_id
+        self.private_ssh_key = private_ssh_key
+        self.auth_method = auth_method
+        self._installation_token: str | None = None
         self.repository = repository
         self.git_user_name = git_user_name
         self.git_user_email = git_user_email
@@ -136,6 +161,34 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         self.changelog_dir = changelog_dir
         self.clone_depth = clone_depth
         self.semver_tag_fallback = semver_tag_fallback
+
+    @property
+    def github_token(self) -> str | None:
+        """Return the token for GitHub API calls and HTTPS git operations.
+
+        Under ``auth_method: app`` this mints a GitHub App installation access
+        token on first use and caches it for the life of the process.  A single
+        ``check``/``in``/``out`` invocation runs in its own container, well
+        inside the token's one hour validity, so no refresh is needed.
+
+        :raises ValueError: If ``auth_method: app`` is set without the App
+            credentials it needs.
+        """
+        if self.auth_method == "token":
+            return self.access_token
+        if self._installation_token is None:
+            if not (self.app_id and self.app_installation_id and self.private_ssh_key):
+                msg = (
+                    "auth_method: app requires app_id, app_installation_id and "
+                    "private_ssh_key to be set in the resource source"
+                )
+                raise ValueError(msg)
+            self._installation_token = (
+                GithubIntegration(auth=Auth.AppAuth(self.app_id, self.private_ssh_key))
+                .get_access_token(int(self.app_installation_id))
+                .token
+            )
+        return self._installation_token
 
     # ------------------------------------------------------------------
     # check
@@ -155,7 +208,13 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             tempfile.TemporaryDirectory() as tmpdir,
         ):
             repo_path = Path(tmpdir) / "repo"
-            _clone(self.uri, repo_path, env=env, depth=self.clone_depth)
+            _clone(
+                self.uri,
+                repo_path,
+                env=env,
+                depth=self.clone_depth,
+                access_token=self.github_token,
+            )
             return self._compute_versions(repo_path, env=env)
 
     def _compute_versions(
@@ -280,7 +339,13 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             tempfile.TemporaryDirectory() as tmpdir,
         ):
             repo_path = Path(tmpdir) / "repo"
-            _clone(self.uri, repo_path, env=env, depth=self.clone_depth)
+            _clone(
+                self.uri,
+                repo_path,
+                env=env,
+                depth=self.clone_depth,
+                access_token=self.github_token,
+            )
             commits = self._collect_commits(repo_path, version, env=env)
 
         destination_dir.mkdir(parents=True, exist_ok=True)
@@ -321,8 +386,9 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         )
         commits = _parse_commit_log(output)
 
-        if self.access_token and self.repository:
-            commits = _enrich_with_github(commits, self.access_token, self.repository)
+        token = self.github_token
+        if token and self.repository:
+            commits = _enrich_with_github(commits, token, self.repository)
 
         return commits
 
@@ -373,8 +439,8 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             _configure_git_identity(
                 repo_path, self.git_user_name, self.git_user_email, env=env
             )
-            if self.access_token:
-                _configure_https_auth(repo_path, self.access_token, env=env)
+            if token := self.github_token:
+                _configure_https_auth(repo_path, token, env=env)
 
             if action == "create":
                 head_sha, since = self._create_release(
@@ -651,8 +717,9 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         )
         commits = _parse_commit_log(output)
 
-        if self.access_token and self.repository:
-            commits = _enrich_with_github(commits, self.access_token, self.repository)
+        token = self.github_token
+        if token and self.repository:
+            commits = _enrich_with_github(commits, token, self.repository)
 
         return commits
 
@@ -748,13 +815,22 @@ def _run(
 
 
 def _clone(
-    uri: str, target: Path, *, env: dict[str, str], depth: int = _DEFAULT_CLONE_DEPTH
+    uri: str,
+    target: Path,
+    *,
+    env: dict[str, str],
+    depth: int = _DEFAULT_CLONE_DEPTH,
+    access_token: str | None = None,
 ) -> None:
     """Shallow-clone uri into target, fetching all tags.
 
     *depth* defaults to ``_DEFAULT_CLONE_DEPTH``.  Pass ``depth=0`` for a
     full clone, which is more reliable when the previous release tag is older
     than the shallow history.
+
+    *access_token* is embedded in the clone URL when *uri* is HTTPS, so that
+    private repositories can be read without an SSH key.  It is redacted from
+    any error output.
     """
     depth_args = [f"--depth={depth}"] if depth > 0 else []
     _run(
@@ -763,10 +839,11 @@ def _clone(
             "clone",
             *depth_args,
             "--no-single-branch",
-            uri,
+            _authed_uri(uri, access_token),
             str(target),
         ],
         env=env,
+        redact=access_token,
     )
     tag_depth_args = [f"--depth={depth}"] if depth > 0 else []
     _run(["git", "fetch", "--tags", *tag_depth_args], cwd=target, env=env)
@@ -846,35 +923,50 @@ def _configure_git_identity(
     _run(["git", "config", "user.email", email], cwd=repo_path, env=env)
 
 
+def _authed_uri(uri: str, access_token: str | None) -> str:
+    """Return *uri* with *access_token* embedded as HTTP basic-auth credentials.
+
+    Uses the ``x-access-token`` username, which GitHub documents for both
+    personal access tokens and GitHub App installation access tokens.
+
+    Any credentials already present in the URL are stripped before the new ones
+    are written, so this is safe to apply to an already-authenticated URL.
+
+    Returned unchanged when there is no token, or when *uri* is not HTTPS (SSH
+    remotes authenticate via the private key passed through ``_git_ssh_env``).
+    """
+    if not access_token or not uri.startswith("https://"):
+        return uri
+
+    from urllib.parse import urlparse
+
+    parsed = urlparse(uri)
+    host = parsed.hostname or "github.com"
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return parsed._replace(netloc=f"x-access-token:{access_token}@{host}").geturl()
+
+
 def _configure_https_auth(
     repo_path: Path, access_token: str, *, env: dict[str, str]
 ) -> None:
     """Configure git HTTPS authentication by rewriting the remote URL.
 
-    Embeds the token directly in the remote URL
-    (``https://x-token-auth:TOKEN@github.com/...``) rather than relying on
+    Embeds the token directly in the remote URL rather than relying on
     ``http.extraheader``, which can be silently overridden by system or global
     git credential helpers present in the container.
-
-    Strips any previously embedded credentials from the URL before writing the
-    new one, so this is safe to call on repos already cloned with a token URL.
 
     Only applied when the remote URL is HTTPS; SSH remotes are authenticated
     via the private key passed through ``_git_ssh_env``.
     """
-    from urllib.parse import urlparse
-
     current_url = _run(
         ["git", "remote", "get-url", "origin"], cwd=repo_path, env=env
     ).strip()
-    if not current_url.startswith("https://"):
-        return  # SSH remote — auth is handled by _git_ssh_env private key
-
-    parsed = urlparse(current_url)
-    host = parsed.hostname or "github.com"
-    if parsed.port:
-        host = f"{host}:{parsed.port}"
-    authed_url = parsed._replace(netloc=f"x-token-auth:{access_token}@{host}").geturl()
+    authed_url = _authed_uri(current_url, access_token)
+    if authed_url == current_url:
+        # An SSH remote (auth comes from the _git_ssh_env private key), or a
+        # remote already carrying these credentials.
+        return
     _run(
         ["git", "remote", "set-url", "origin", authed_url],
         cwd=repo_path,
