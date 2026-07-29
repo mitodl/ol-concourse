@@ -3,6 +3,7 @@
 from typing import Any
 
 import pytest
+import requests
 import responses as resp_lib
 
 from concourse import PyPIResource, PyPIVersion, _extract_version_from_filenames
@@ -167,6 +168,117 @@ def test_download_version_wheel(resource, tmp_path):
     assert (tmp_path / f"{PACKAGE_NAME}-0.3.0.tar.gz").exists()
     assert (tmp_path / f"{PACKAGE_NAME}-0.3.0-py3-none-any.whl").exists()
     assert returned_version.version == "0.3.0"
+
+
+# ---------------------------------------------------------------------------
+# _get_version_files_with_retry (index-lag retry after a fresh upload)
+# ---------------------------------------------------------------------------
+
+
+@resp_lib.activate
+def test_get_version_files_with_retry_succeeds_immediately(resource):
+    """No retry needed when the version is already indexed."""
+    resp_lib.add(
+        resp_lib.GET,
+        f"https://pypi.org/pypi/{PACKAGE_NAME}/0.3.0/json",
+        json=PYPI_VERSION_METADATA,
+    )
+
+    from unittest.mock import patch
+
+    with patch("concourse.time.sleep") as mock_sleep:
+        files = resource._get_version_files_with_retry("0.3.0")
+
+    assert files == PYPI_VERSION_METADATA["urls"]
+    mock_sleep.assert_not_called()
+
+
+@resp_lib.activate
+def test_get_version_files_with_retry_recovers_after_404s(resource):
+    """A version that 404s a few times (index lag) succeeds once it's indexed.
+
+    Regression test: Concourse's implicit get-after-put previously failed
+    the whole build on this exact race, even though the upload itself had
+    genuinely already succeeded on PyPI (confirmed live at pypi.org, just
+    not yet reflected in the JSON API the resource queries).
+    """
+    for _ in range(2):
+        resp_lib.add(
+            resp_lib.GET,
+            f"https://pypi.org/pypi/{PACKAGE_NAME}/0.3.0/json",
+            status=404,
+        )
+    resp_lib.add(
+        resp_lib.GET,
+        f"https://pypi.org/pypi/{PACKAGE_NAME}/0.3.0/json",
+        json=PYPI_VERSION_METADATA,
+    )
+
+    from unittest.mock import patch
+
+    with patch("concourse.time.sleep") as mock_sleep:
+        files = resource._get_version_files_with_retry("0.3.0", base_delay_seconds=1.0)
+
+    assert files == PYPI_VERSION_METADATA["urls"]
+    # Two retries before success -- backoff delays for attempts 0 and 1.
+    assert mock_sleep.call_args_list == [((1.0,),), ((2.0,),)]
+
+
+@resp_lib.activate
+def test_get_version_files_with_retry_raises_after_exhausting_attempts(resource):
+    """A version that never becomes indexed raises after max_attempts."""
+    for _ in range(3):
+        resp_lib.add(
+            resp_lib.GET,
+            f"https://pypi.org/pypi/{PACKAGE_NAME}/0.3.0/json",
+            status=404,
+        )
+
+    from unittest.mock import patch
+
+    with (
+        patch("concourse.time.sleep") as mock_sleep,
+        pytest.raises(requests.HTTPError),
+    ):
+        resource._get_version_files_with_retry(
+            "0.3.0", max_attempts=3, base_delay_seconds=1.0
+        )
+
+    # Slept between attempts, but not after the final (raising) attempt.
+    assert mock_sleep.call_count == 2
+
+
+@resp_lib.activate
+def test_get_version_files_with_retry_does_not_retry_non_404_errors(resource):
+    """A non-404 error (a real failure) propagates immediately, no retries."""
+    resp_lib.add(
+        resp_lib.GET,
+        f"https://pypi.org/pypi/{PACKAGE_NAME}/0.3.0/json",
+        status=500,
+    )
+
+    from unittest.mock import patch
+
+    with (
+        patch("concourse.time.sleep") as mock_sleep,
+        pytest.raises(requests.HTTPError),
+    ):
+        resource._get_version_files_with_retry("0.3.0")
+
+    mock_sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("max_attempts", [0, -1])
+def test_get_version_files_with_retry_rejects_non_positive_max_attempts(
+    resource, max_attempts
+):
+    with pytest.raises(ValueError, match="max_attempts"):
+        resource._get_version_files_with_retry("0.3.0", max_attempts=max_attempts)
+
+
+def test_get_version_files_with_retry_rejects_negative_base_delay(resource):
+    with pytest.raises(ValueError, match="base_delay_seconds"):
+        resource._get_version_files_with_retry("0.3.0", base_delay_seconds=-1.0)
 
 
 # ---------------------------------------------------------------------------
