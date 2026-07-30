@@ -14,9 +14,9 @@ resources:
       # keep track of.  Use an https:// uri so that git pushes authenticate with
       # the minted installation token rather than needing an SSH private_key:
       # auth_method: app
-      # app_id: ((github_app.app_id))
-      # app_installation_id: ((github_app.installation_id))
-      # private_ssh_key: ((github_app.private_key))
+      # app_id: ((github.release_bot_app_id))
+      # app_installation_id: ((github.release_bot_app_installation_id))
+      # private_ssh_key: ((github.release_bot_app_pem))
       changelog_style: cumulative   # or "per_release", or omit to disable
       changelog_file: CHANGELOG.md  # only used when changelog_style=cumulative
       changelog_dir: releases        # only used when changelog_style=per_release

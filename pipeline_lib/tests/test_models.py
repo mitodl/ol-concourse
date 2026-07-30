@@ -5,9 +5,6 @@ from pydantic import ValidationError
 
 from ol_concourse.lib.constants import (
     GH_ISSUES_DEFAULT_REPOSITORY,
-    GITHUB_APP_ID,
-    GITHUB_APP_INSTALLATION_ID,
-    GITHUB_APP_PRIVATE_KEY,
     REGISTRY_IMAGE,
 )
 from ol_concourse.lib.models.fragment import PipelineFragment
@@ -608,20 +605,18 @@ class TestResourceTypes:
         assert rt1 == rt2
 
 
-SHARED_APP_SOURCE = {
-    "auth_method": "app",
-    "app_id": GITHUB_APP_ID,
-    "app_installation_id": GITHUB_APP_INSTALLATION_ID,
-    "private_ssh_key": GITHUB_APP_PRIVATE_KEY,
+APP_CREDS = {
+    "app_id": "((my_app.app_id))",
+    "app_installation_id": "((my_app.installation_id))",
+    "private_ssh_key": "((my_app.private_key))",
 }
 
 
 class TestGithubAppAuth:
-    """All three release-workflow resources share one GitHub App definition.
-
-    Each wrapper must emit the same app_id/app_installation_id/private_ssh_key
-    references under ``auth_method: app``, and must not leak an access_token
-    into a source that authenticates as the App.
+    """No wrapper bakes in a default GitHub App -- each pipeline supplies its
+    own app_id/app_installation_id/private_ssh_key via function parameters,
+    and a source built with ``auth_method: app`` must not leak an
+    access_token.
     """
 
     def _release(self, **kwargs) -> Resource:
@@ -648,14 +643,23 @@ class TestGithubAppAuth:
         )
 
     @pytest.mark.parametrize("builder", ["_release", "_deployment", "_issues"])
-    def test_app_auth_emits_shared_app_credentials(self, builder):
-        resource = getattr(self, builder)(auth_method="app")
-        for key, value in SHARED_APP_SOURCE.items():
+    def test_app_auth_emits_the_caller_supplied_credentials(self, builder):
+        resource = getattr(self, builder)(auth_method="app", **APP_CREDS)
+        for key, value in APP_CREDS.items():
             assert resource.source[key] == value
 
     @pytest.mark.parametrize("builder", ["_release", "_deployment", "_issues"])
-    def test_app_auth_omits_access_token(self, builder):
+    def test_app_auth_without_credentials_omits_them(self, builder):
+        """No library-wide default -- omitted creds stay out of source so the
+        resource type's own validation catches the missing fields.
+        """
         resource = getattr(self, builder)(auth_method="app")
+        for key in ("app_id", "app_installation_id", "private_ssh_key"):
+            assert key not in resource.source
+
+    @pytest.mark.parametrize("builder", ["_release", "_deployment", "_issues"])
+    def test_app_auth_omits_access_token(self, builder):
+        resource = getattr(self, builder)(auth_method="app", **APP_CREDS)
         assert "access_token" not in resource.source
 
     @pytest.mark.parametrize("builder", ["_release", "_deployment", "_issues"])
@@ -672,6 +676,6 @@ class TestGithubAppAuth:
 
     def test_release_app_auth_keeps_ssh_private_key_separate(self):
         """``private_key`` (git transport) is independent of the App's key."""
-        resource = self._release(auth_method="app", private_key="SSH-KEY")
+        resource = self._release(auth_method="app", private_key="SSH-KEY", **APP_CREDS)
         assert resource.source["private_key"] == "SSH-KEY"
-        assert resource.source["private_ssh_key"] == GITHUB_APP_PRIVATE_KEY
+        assert resource.source["private_ssh_key"] == APP_CREDS["private_ssh_key"]

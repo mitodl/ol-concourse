@@ -23,9 +23,9 @@ resources:
       access_token: ((github.access_token))
       # ...or GitHub App auth (preferred — no token expiry to track):
       # auth_method: app
-      # app_id: ((github_app.app_id))
-      # app_installation_id: ((github_app.installation_id))
-      # private_ssh_key: ((github_app.private_key))
+      # app_id: ((github.release_bot_app_id))
+      # app_installation_id: ((github.release_bot_app_installation_id))
+      # private_ssh_key: ((github.release_bot_app_pem))
 ```
 
 | Source field | Required | Description |
@@ -139,7 +139,10 @@ release pipeline with an opaque `401 Bad credentials`. Grant the App
 The `release`, `github-issues`, and `github-deployments` resources are all meant
 to authenticate as the *same* GitHub App, so that a release workflow has one
 registration to manage and one private key to rotate. The `ol_concourse.lib`
-DSL wrappers default to that shared App's credential references.
+DSL wrappers (`release_resource`, `github_issues`, `github_deployment`) accept
+`app_id`/`app_installation_id`/`private_ssh_key` as explicit parameters --
+there is no library-wide default, so each pipeline passes its own credential
+references for those three fields.
 
 For GitHub Enterprise, set `gh_host` to your instance's API URL (e.g.
 `https://github.example.com/api/v3`). Note that a GitHub App registration is
