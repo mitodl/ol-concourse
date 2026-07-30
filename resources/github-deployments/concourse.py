@@ -113,18 +113,41 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
         super().__init__(GithubDeploymentVersion)
         if auth_method == "token":
             auth = self.auth_token(access_token)
-        else:
+        elif auth_method == "app":
             auth = self.auth_app(app_id, app_installation_id, private_ssh_key)
+        else:
+            msg = f"Invalid auth_method '{auth_method}'. Must be 'token' or 'app'."
+            raise ValueError(msg)
         self.gh = Github(base_url=gh_host, auth=auth)
         self.repo = self.gh.get_repo(repository)
         self.environment = environment
 
     def auth_token(self, access_token):
-        """Return a token-based GitHub Auth object."""
+        """Return a token-based GitHub Auth object.
+
+        :raises ValueError: If ``auth_method: token`` is set without an
+            *access_token*.
+        """
+        if not access_token:
+            msg = (
+                "auth_method: token requires access_token to be set in the "
+                "resource source"
+            )
+            raise ValueError(msg)
         return Auth.Token(access_token)
 
     def auth_app(self, app_id, app_installation_id, private_ssh_key):
-        """Return an app installation-based GitHub Auth object."""
+        """Return an app installation-based GitHub Auth object.
+
+        :raises ValueError: If ``auth_method: app`` is set without the App
+            credentials it needs.
+        """
+        if not (app_id and app_installation_id and private_ssh_key):
+            msg = (
+                "auth_method: app requires app_id, app_installation_id and "
+                "private_ssh_key to be set in the resource source"
+            )
+            raise ValueError(msg)
         return Auth.AppAuth(app_id, private_ssh_key).get_installation_auth(
             int(app_installation_id)
         )

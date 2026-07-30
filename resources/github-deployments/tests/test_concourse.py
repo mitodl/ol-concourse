@@ -527,3 +527,47 @@ def test_app_auth_passes_auth_object_to_github_client():
     app_auth = mock_auth.AppAuth.return_value
     installation_auth = app_auth.get_installation_auth.return_value
     assert mock_github_cls.call_args.kwargs["auth"] is installation_auth
+
+
+@pytest.mark.parametrize("access_token", [None, ""])
+def test_token_auth_without_a_token_raises(mock_github, access_token):
+    """A clear error beats PyGithub choking on Auth.Token(None) later."""
+    with pytest.raises(ValueError, match="requires access_token"):
+        ConcourseGithubDeploymentsResource(
+            repository="mitodl/my-app",
+            environment="RC",
+            access_token=access_token,
+        )
+
+
+@pytest.mark.parametrize(
+    ("app_id", "app_installation_id", "private_ssh_key"),
+    [
+        (None, "46690837", "key"),
+        ("810341", None, "key"),
+        ("810341", "46690837", None),
+    ],
+)
+def test_app_auth_without_full_credentials_raises(
+    mock_github, app_id, app_installation_id, private_ssh_key
+):
+    """Otherwise int(None) blows up with an opaque TypeError at runtime."""
+    with pytest.raises(ValueError, match="requires app_id"):
+        ConcourseGithubDeploymentsResource(
+            repository="mitodl/my-app",
+            environment="RC",
+            auth_method="app",
+            app_id=app_id,
+            app_installation_id=app_installation_id,
+            private_ssh_key=private_ssh_key,
+        )
+
+
+def test_unknown_auth_method_raises(mock_github):
+    with pytest.raises(ValueError, match="Invalid auth_method 'oauth'"):
+        ConcourseGithubDeploymentsResource(
+            repository="mitodl/my-app",
+            environment="RC",
+            auth_method="oauth",  # type: ignore[arg-type]
+            access_token="dummy",
+        )
