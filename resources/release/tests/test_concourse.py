@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from concourse import (
     _parse_commit_log,
     _parse_semver_tuple,
     _parse_version_tuple,
+    _run,
     _update_cumulative_changelog,
     CHANGELOG_HEADER,
 )
@@ -1695,6 +1697,32 @@ def test_clone_embeds_token_and_redacts_it(mock_run):
     authed = "https://x-access-token:tok@github.com/mitodl/my-app.git"
     assert authed in clone_cmd.args[0]
     assert clone_cmd.kwargs["redact"] == "tok"
+
+
+@patch("concourse.subprocess.run")
+def test_run_redacts_the_token_from_the_raised_cmd(mock_subprocess_run):
+    """CalledProcessError stringifies cmd, so an authed URL would leak there."""
+    mock_subprocess_run.return_value = MagicMock(
+        returncode=128, stdout="", stderr="fatal: repository not found"
+    )
+    secret = "ghs_installationtoken"
+    authed = f"https://x-access-token:{secret}@github.com/mitodl/my-app.git"
+
+    with pytest.raises(subprocess.CalledProcessError) as excinfo:
+        _run(["git", "clone", authed, "/tmp/repo"], redact=secret)  # noqa: S108
+
+    assert secret not in str(excinfo.value)
+    assert "x-access-token:***@github.com" in excinfo.value.cmd[2]
+
+
+@patch("concourse.subprocess.run")
+def test_run_leaves_cmd_alone_without_redact(mock_subprocess_run):
+    mock_subprocess_run.return_value = MagicMock(returncode=1, stdout="", stderr="boom")
+
+    with pytest.raises(subprocess.CalledProcessError) as excinfo:
+        _run(["git", "status"])
+
+    assert excinfo.value.cmd == ["git", "status"]
 
 
 @patch("concourse._run")

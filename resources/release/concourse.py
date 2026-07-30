@@ -791,7 +791,9 @@ def _run(
     included in the error message.
 
     *redact* — if provided, this value is replaced with ``***`` in the
-    CalledProcessError message so that secrets do not leak via exceptions.
+    CalledProcessError's cmd, stdout, and stderr so that secrets embedded in
+    the command line (e.g. a token in an HTTPS remote URL) do not leak via
+    exception messages or tracebacks.
     """
     result = subprocess.run(  # noqa: S603
         cmd,
@@ -803,14 +805,18 @@ def _run(
     if result.returncode != 0:
         stdout = result.stdout
         stderr = result.stderr
+        error_cmd = cmd
         if redact:
             stdout = stdout.replace(redact, "***")
             stderr = stderr.replace(redact, "***")
+            error_cmd = [arg.replace(redact, "***") for arg in cmd]
         if stderr:
             print(f"[git stderr] {stderr.rstrip()}", file=sys.stderr)  # noqa: T201
         if stdout:
             print(f"[git stdout] {stdout.rstrip()}", file=sys.stderr)  # noqa: T201
-        raise subprocess.CalledProcessError(result.returncode, cmd, stdout, stderr)
+        raise subprocess.CalledProcessError(
+            result.returncode, error_cmd, stdout, stderr
+        )
     return result.stdout
 
 
