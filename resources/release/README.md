@@ -34,9 +34,9 @@ resources:
       # expiry to track).  Use an https:// uri so that git pushes authenticate
       # with the minted installation token and private_key is not needed:
       # auth_method: app
-      # app_id: ((github_app.app_id))
-      # app_installation_id: ((github_app.installation_id))
-      # private_ssh_key: ((github_app.private_key))
+      # app_id: ((github.release_bot_app_id))
+      # app_installation_id: ((github.release_bot_app_installation_id))
+      # private_ssh_key: ((github.release_bot_app_pem))
       repository: mitodl/my-app        # optional; required for PR enrichment
       git_user_name: Concourse CI
       git_user_email: concourse@mit.edu
