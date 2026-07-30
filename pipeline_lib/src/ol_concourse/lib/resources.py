@@ -147,10 +147,11 @@ def github_issues(  # noqa: PLR0913
     :param name: The name of the resource.  This will get used across subsequent
         pipeline steps that reference this resource.
     :param repository: The name of the repository as it appears in GitHub
-    :param github_token: A personal access token with `public_repo` scope to increase
-        the rate limit for checking versions.
-    :param issue_prefix: A string tobe used to match an issue in the repository for
-     the workflow to detect or act upon.
+    :param issue_prefix: A string to be used to match an issue in the repository for
+        the workflow to detect or act upon.
+    :param access_token: A personal access token with `public_repo` scope to increase
+        the rate limit for checking versions.  Only used when
+        ``auth_method="token"``.
     :param auth_method: ``"token"`` to authenticate with *access_token*, or
         ``"app"`` to authenticate as an installation of the shared GitHub App
         (see :data:`~ol_concourse.lib.constants.GITHUB_APP_ID`).  Prefer
