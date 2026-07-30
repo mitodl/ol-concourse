@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -13,14 +15,17 @@ from concourse import (
     ReleaseResource,
     ReleaseVersion,
     SEMVER_PATTERN,
+    _authed_uri,
     _build_changelog_entry,
     _build_checklist,
+    _clone,
     _compute_next_version,
     _get_in_flight_release_version,
     _get_semver_tags,
     _parse_commit_log,
     _parse_semver_tuple,
     _parse_version_tuple,
+    _run,
     _update_cumulative_changelog,
     CHANGELOG_HEADER,
 )
@@ -1563,3 +1568,199 @@ def test_publish_new_version_invalid_action_includes_abandon(mock_run, tmp_path)
             repo_dir="app-source",
             version_file="release/version",
         )
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+
+def test_github_token_defaults_to_static_access_token():
+    resource = make_resource(access_token="static-tok")
+    assert resource.github_token == "static-tok"
+
+
+def test_github_token_is_none_when_unauthenticated():
+    assert make_resource().github_token is None
+
+
+@patch("concourse.GithubIntegration")
+@patch("concourse.Auth")
+def test_github_token_mints_installation_token(mock_auth, mock_integration):
+    mock_integration.return_value.get_access_token.return_value.token = "ghs_minted"
+
+    resource = make_resource(
+        auth_method="app",
+        access_token=None,
+        app_id="810341",
+        app_installation_id="46690837",
+        private_ssh_key="-----BEGIN RSA PRIVATE KEY-----",
+    )
+
+    assert resource.github_token == "ghs_minted"
+    mock_auth.AppAuth.assert_called_once_with(
+        "810341", "-----BEGIN RSA PRIVATE KEY-----"
+    )
+    # Concourse source values arrive as strings; PyGithub asserts an int here.
+    mock_integration.return_value.get_access_token.assert_called_once_with(46690837)
+
+
+@patch("concourse.GithubIntegration")
+@patch("concourse.Auth")
+def test_installation_token_is_minted_once_and_cached(mock_auth, mock_integration):
+    """Repeated use within one invocation must not burn extra API calls."""
+    mock_integration.return_value.get_access_token.return_value.token = "ghs_minted"
+
+    resource = make_resource(
+        auth_method="app",
+        app_id="810341",
+        app_installation_id="46690837",
+        private_ssh_key="key",
+    )
+    tokens = {resource.github_token for _ in range(3)}
+
+    assert tokens == {"ghs_minted"}
+    assert mock_integration.return_value.get_access_token.call_count == 1
+
+
+@patch("concourse.GithubIntegration")
+@patch("concourse.Auth")
+def test_app_auth_ignores_stale_access_token(mock_auth, mock_integration):
+    """An access_token left in source must not shadow app auth."""
+    mock_integration.return_value.get_access_token.return_value.token = "ghs_minted"
+
+    resource = make_resource(
+        auth_method="app",
+        access_token="expired-pat",
+        app_id="810341",
+        app_installation_id="46690837",
+        private_ssh_key="key",
+    )
+
+    assert resource.github_token == "ghs_minted"
+
+
+# ---------------------------------------------------------------------------
+# _authed_uri
+# ---------------------------------------------------------------------------
+
+
+def test_authed_uri_embeds_token_for_https():
+    assert (
+        _authed_uri("https://github.com/mitodl/my-app.git", "tok")
+        == "https://x-access-token:tok@github.com/mitodl/my-app.git"
+    )
+
+
+def test_authed_uri_replaces_existing_credentials():
+    assert (
+        _authed_uri("https://x-access-token:old@github.com/mitodl/my-app.git", "new")
+        == "https://x-access-token:new@github.com/mitodl/my-app.git"
+    )
+
+
+def test_authed_uri_preserves_non_default_port():
+    assert (
+        _authed_uri("https://github.example.com:8443/mitodl/my-app.git", "tok")
+        == "https://x-access-token:tok@github.example.com:8443/mitodl/my-app.git"
+    )
+
+
+@pytest.mark.parametrize(
+    ("uri", "token"),
+    [
+        ("git@github.com:mitodl/my-app.git", "tok"),  # SSH remote
+        ("ssh://git@github.com/mitodl/my-app.git", "tok"),  # SSH remote
+        ("https://github.com/mitodl/my-app.git", None),  # no token
+        ("https://github.com/mitodl/my-app.git", ""),  # no token
+    ],
+)
+def test_authed_uri_returns_uri_unchanged(uri, token):
+    assert _authed_uri(uri, token) == uri
+
+
+# ---------------------------------------------------------------------------
+# Token plumbing into git operations
+# ---------------------------------------------------------------------------
+
+
+@patch("concourse._run")
+def test_clone_embeds_token_and_redacts_it(mock_run):
+    _clone(
+        "https://github.com/mitodl/my-app.git",
+        Path("/tmp/repo"),  # noqa: S108
+        env={},
+        access_token="tok",
+    )
+
+    clone_cmd = mock_run.call_args_list[0]
+    authed = "https://x-access-token:tok@github.com/mitodl/my-app.git"
+    assert authed in clone_cmd.args[0]
+    assert clone_cmd.kwargs["redact"] == "tok"
+
+
+@patch("concourse.subprocess.run")
+def test_run_redacts_the_token_from_the_raised_cmd(mock_subprocess_run):
+    """CalledProcessError stringifies cmd, so an authed URL would leak there."""
+    mock_subprocess_run.return_value = MagicMock(
+        returncode=128, stdout="", stderr="fatal: repository not found"
+    )
+    secret = "ghs_installationtoken"
+    authed = f"https://x-access-token:{secret}@github.com/mitodl/my-app.git"
+
+    with pytest.raises(subprocess.CalledProcessError) as excinfo:
+        _run(["git", "clone", authed, "/tmp/repo"], redact=secret)  # noqa: S108
+
+    assert secret not in str(excinfo.value)
+    assert "x-access-token:***@github.com" in excinfo.value.cmd[2]
+
+
+@patch("concourse.subprocess.run")
+def test_run_leaves_cmd_alone_without_redact(mock_subprocess_run):
+    mock_subprocess_run.return_value = MagicMock(returncode=1, stdout="", stderr="boom")
+
+    with pytest.raises(subprocess.CalledProcessError) as excinfo:
+        _run(["git", "status"])
+
+    assert excinfo.value.cmd == ["git", "status"]
+
+
+@patch("concourse._run")
+def test_clone_leaves_ssh_uri_alone(mock_run):
+    _clone(
+        "git@github.com:mitodl/my-app.git",
+        Path("/tmp/repo"),  # noqa: S108
+        env={},
+        access_token="tok",
+    )
+
+    assert "git@github.com:mitodl/my-app.git" in mock_run.call_args_list[0].args[0]
+
+
+@patch("concourse.GithubIntegration")
+@patch("concourse.Auth")
+@patch("concourse._run")
+@patch("concourse.tempfile.TemporaryDirectory")
+def test_check_clones_with_installation_token(
+    mock_tmpdir, mock_run, mock_auth, mock_integration, tmp_path
+):
+    """App auth must reach the clone, so a private repo is readable without SSH."""
+    mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
+    mock_integration.return_value.get_access_token.return_value.token = "ghs_minted"
+    mock_run.return_value = ""
+
+    resource = make_resource(
+        auth_method="app",
+        app_id="810341",
+        app_installation_id="46690837",
+        private_ssh_key="key",
+    )
+    resource.fetch_new_versions(None)
+
+    clone_cmd = next(
+        call for call in mock_run.call_args_list if "clone" in call.args[0]
+    )
+    assert (
+        "https://x-access-token:ghs_minted@github.com/mitodl/my-app.git"
+        in clone_cmd.args[0]
+    )

@@ -2,6 +2,11 @@
 
 from typing import Any, Literal
 
+from ol_concourse.lib.constants import (
+    GITHUB_APP_ID,
+    GITHUB_APP_INSTALLATION_ID,
+    GITHUB_APP_PRIVATE_KEY,
+)
 from ol_concourse.lib.models.pipeline import Duration, Identifier, Resource
 from ol_concourse.lib.models.resource import Git
 
@@ -125,9 +130,9 @@ def github_issues(  # noqa: PLR0913
     auth_method: Literal["token", "app"] = "token",
     gh_host: str | None = "https://github.mit.edu/api/v3",
     access_token: str = "((github.issues_resource_access_token))",  # noqa: S107
-    app_id: str | None = None,
-    app_installation_id: str | None = None,
-    private_ssh_key: str | None = None,
+    app_id: str = GITHUB_APP_ID,
+    app_installation_id: str = GITHUB_APP_INSTALLATION_ID,
+    private_ssh_key: str = GITHUB_APP_PRIVATE_KEY,
     issue_state: Literal["open", "closed"] = "closed",
     labels: list[str] | None = None,
     assignees: list[str] | None = None,
@@ -142,10 +147,21 @@ def github_issues(  # noqa: PLR0913
     :param name: The name of the resource.  This will get used across subsequent
         pipeline steps that reference this resource.
     :param repository: The name of the repository as it appears in GitHub
-    :param github_token: A personal access token with `public_repo` scope to increase
-        the rate limit for checking versions.
-    :param issue_prefix: A string tobe used to match an issue in the repository for
-     the workflow to detect or act upon.
+    :param issue_prefix: A string to be used to match an issue in the repository for
+        the workflow to detect or act upon.
+    :param access_token: A personal access token with `public_repo` scope to increase
+        the rate limit for checking versions.  Only used when
+        ``auth_method="token"``.
+    :param auth_method: ``"token"`` to authenticate with *access_token*, or
+        ``"app"`` to authenticate as an installation of the shared GitHub App
+        (see :data:`~ol_concourse.lib.constants.GITHUB_APP_ID`).  Prefer
+        ``"app"``: installation tokens are minted per run, so there is no PAT
+        expiry to track.
+    :param app_id: GitHub App ID.  Defaults to the shared App.
+    :param app_installation_id: Installation ID of the App on the target
+        organization.  Defaults to the shared App's installation.
+    :param private_ssh_key: PEM private key of the GitHub App.  Defaults to the
+        shared App's key.
     :param skip_if_labeled: Optional list of label names. Issues closed with any of
         these labels will be skipped by ``check`` (not emitted as new versions).
         Use this to allow release abandonment without triggering a production deploy.
@@ -190,11 +206,15 @@ def github_issues(  # noqa: PLR0913
     )
 
 
-def github_deployment(
+def github_deployment(  # noqa: PLR0913
     name: Identifier,
     repository: str,
     environment: str,
+    auth_method: Literal["token", "app"] = "token",
     access_token: str = "((github.access_token))",  # noqa: S107
+    app_id: str = GITHUB_APP_ID,
+    app_installation_id: str = GITHUB_APP_INSTALLATION_ID,
+    private_ssh_key: str = GITHUB_APP_PRIVATE_KEY,
     gh_host: str | None = None,
 ) -> Resource:
     """Generate a github-deployments resource for the given repository and environment.
@@ -207,16 +227,32 @@ def github_deployment(
     :param name: Resource name used across pipeline steps.
     :param repository: GitHub repository in ``owner/repo`` form.
     :param environment: Deployment environment name (e.g. ``RC``, ``Production``).
+    :param auth_method: ``"token"`` to authenticate with *access_token*, or
+        ``"app"`` to authenticate as an installation of the shared GitHub App
+        (see :data:`~ol_concourse.lib.constants.GITHUB_APP_ID`).  Prefer
+        ``"app"``: installation tokens are minted per run, so there is no PAT
+        expiry to track.
     :param access_token: GitHub personal access token with ``repo_deployments``
         scope (default: ``((github.access_token))``).
+    :param app_id: GitHub App ID.  Defaults to the shared App.
+    :param app_installation_id: Installation ID of the App on the target
+        organization.  Defaults to the shared App's installation.
+    :param private_ssh_key: PEM private key of the GitHub App.  Defaults to the
+        shared App's key.
     :param gh_host: GitHub API base URL; override for GitHub Enterprise.
     :returns: A configured Concourse github-deployments resource.
     """
     source: dict[str, Any] = {
         "repository": repository,
         "environment": environment,
-        "access_token": access_token,
+        "auth_method": auth_method,
     }
+    if auth_method == "token":
+        source["access_token"] = access_token
+    else:
+        source["app_id"] = app_id
+        source["app_installation_id"] = app_installation_id
+        source["private_ssh_key"] = private_ssh_key
     if gh_host:
         source["gh_host"] = gh_host
     return Resource(
@@ -497,7 +533,11 @@ def release_resource(  # noqa: PLR0913
     uri: str,
     branch: str = "main",
     private_key: str | None = None,
+    auth_method: Literal["token", "app"] = "token",
     access_token: str | None = None,
+    app_id: str = GITHUB_APP_ID,
+    app_installation_id: str = GITHUB_APP_INSTALLATION_ID,
+    private_ssh_key: str = GITHUB_APP_PRIVATE_KEY,
     repository: str | None = None,
     git_user_name: str = "Concourse CI",
     git_user_email: str = "concourse@example.com",
@@ -516,11 +556,24 @@ def release_resource(  # noqa: PLR0913
     :param name: Resource name used across pipeline steps.
     :param uri: Git repository URI (SSH or HTTPS).
     :param branch: Branch to track for unreleased commits (default: ``main``).
-    :param private_key: SSH private key for git operations.
+    :param private_key: SSH private key for git operations.  Not needed when
+        *uri* is HTTPS -- git then authenticates with the same token used for
+        the GitHub API.
+    :param auth_method: ``"token"`` to authenticate with *access_token*, or
+        ``"app"`` to authenticate as an installation of the shared GitHub App
+        (see :data:`~ol_concourse.lib.constants.GITHUB_APP_ID`).  Prefer
+        ``"app"``: installation tokens are minted per run, so there is no PAT
+        expiry to track.  Pair ``"app"`` with an ``https://`` *uri* so that git
+        pushes use the installation token instead of needing *private_key*.
     :param access_token: GitHub token; enables PR number/title enrichment in
-        ``in`` output files.
-    :param repository: ``owner/repo`` string; required when ``access_token``
-        is set.
+        ``in`` output files and authenticates HTTPS git operations.
+    :param app_id: GitHub App ID.  Defaults to the shared App.
+    :param app_installation_id: Installation ID of the App on the target
+        organization.  Defaults to the shared App's installation.
+    :param private_ssh_key: PEM private key of the GitHub App.  Note this is the
+        App's key, distinct from *private_key* (an SSH transport key).  Defaults
+        to the shared App's key.
+    :param repository: ``owner/repo`` string; required for PR enrichment.
     :param git_user_name: Git committer name written to release commits.
     :param git_user_email: Git committer email written to release commits.
     :param changelog_style: ``"cumulative"`` (prepend to a single file) or
@@ -548,10 +601,15 @@ def release_resource(  # noqa: PLR0913
         "git_user_email": git_user_email,
         "changelog_file": changelog_file,
         "changelog_dir": changelog_dir,
+        "auth_method": auth_method,
     }
     if private_key is not None:
         source["private_key"] = private_key
-    if access_token is not None:
+    if auth_method == "app":
+        source["app_id"] = app_id
+        source["app_installation_id"] = app_installation_id
+        source["private_ssh_key"] = private_ssh_key
+    elif access_token is not None:
         source["access_token"] = access_token
     if repository is not None:
         source["repository"] = repository

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ol-concourse-release"
-version = "0.1.0"
+version = "0.2.0"
 description = "Concourse resource type for git release orchestration"
 readme = "README.md"
 requires-python = ">=3.13"

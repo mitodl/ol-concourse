@@ -3,7 +3,13 @@
 import pytest
 from pydantic import ValidationError
 
-from ol_concourse.lib.constants import GH_ISSUES_DEFAULT_REPOSITORY, REGISTRY_IMAGE
+from ol_concourse.lib.constants import (
+    GH_ISSUES_DEFAULT_REPOSITORY,
+    GITHUB_APP_ID,
+    GITHUB_APP_INSTALLATION_ID,
+    GITHUB_APP_PRIVATE_KEY,
+    REGISTRY_IMAGE,
+)
 from ol_concourse.lib.models.fragment import PipelineFragment
 from ol_concourse.lib.models.pipeline import (
     AcrossVar,
@@ -35,6 +41,11 @@ from ol_concourse.lib.resource_types import (
     github_deployments_resource,
     github_issues_resource,
     release_resource_type,
+)
+from ol_concourse.lib.resources import (
+    github_deployment,
+    github_issues,
+    release_resource,
 )
 
 
@@ -595,3 +606,72 @@ class TestResourceTypes:
         rt2 = release_resource_type()
         assert rt1 is not rt2
         assert rt1 == rt2
+
+
+SHARED_APP_SOURCE = {
+    "auth_method": "app",
+    "app_id": GITHUB_APP_ID,
+    "app_installation_id": GITHUB_APP_INSTALLATION_ID,
+    "private_ssh_key": GITHUB_APP_PRIVATE_KEY,
+}
+
+
+class TestGithubAppAuth:
+    """All three release-workflow resources share one GitHub App definition.
+
+    Each wrapper must emit the same app_id/app_installation_id/private_ssh_key
+    references under ``auth_method: app``, and must not leak an access_token
+    into a source that authenticates as the App.
+    """
+
+    def _release(self, **kwargs) -> Resource:
+        return release_resource(
+            name=Identifier("app-release"),
+            uri="https://github.com/mitodl/my-app.git",
+            **kwargs,
+        )
+
+    def _deployment(self, **kwargs) -> Resource:
+        return github_deployment(
+            name=Identifier("app-deployment"),
+            repository="mitodl/my-app",
+            environment="RC",
+            **kwargs,
+        )
+
+    def _issues(self, **kwargs) -> Resource:
+        return github_issues(
+            name=Identifier("app-issues"),
+            repository="mitodl/my-app",
+            issue_prefix="[bot]",
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("builder", ["_release", "_deployment", "_issues"])
+    def test_app_auth_emits_shared_app_credentials(self, builder):
+        resource = getattr(self, builder)(auth_method="app")
+        for key, value in SHARED_APP_SOURCE.items():
+            assert resource.source[key] == value
+
+    @pytest.mark.parametrize("builder", ["_release", "_deployment", "_issues"])
+    def test_app_auth_omits_access_token(self, builder):
+        resource = getattr(self, builder)(auth_method="app")
+        assert "access_token" not in resource.source
+
+    @pytest.mark.parametrize("builder", ["_release", "_deployment", "_issues"])
+    def test_token_auth_omits_app_credentials(self, builder):
+        resource = getattr(self, builder)(auth_method="token", access_token="tok")
+        assert resource.source["auth_method"] == "token"
+        assert resource.source["access_token"] == "tok"
+        for key in ("app_id", "app_installation_id", "private_ssh_key"):
+            assert key not in resource.source
+
+    @pytest.mark.parametrize("builder", ["_release", "_deployment", "_issues"])
+    def test_token_auth_is_the_default(self, builder):
+        assert getattr(self, builder)().source["auth_method"] == "token"
+
+    def test_release_app_auth_keeps_ssh_private_key_separate(self):
+        """``private_key`` (git transport) is independent of the App's key."""
+        resource = self._release(auth_method="app", private_key="SSH-KEY")
+        assert resource.source["private_key"] == "SSH-KEY"
+        assert resource.source["private_ssh_key"] == GITHUB_APP_PRIVATE_KEY
