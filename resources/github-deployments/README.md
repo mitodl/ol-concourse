@@ -23,9 +23,9 @@ resources:
       access_token: ((github.access_token))
       # ...or GitHub App auth (preferred — no token expiry to track):
       # auth_method: app
-      # app_id: ((github_app.app_id))
-      # app_installation_id: ((github_app.installation_id))
-      # private_ssh_key: ((github_app.private_key))
+      # app_id: ((github.release_bot_app_id))
+      # app_installation_id: ((github.release_bot_app_installation_id))
+      # private_ssh_key: ((github.release_bot_app_pem))
 ```
 
 | Source field | Required | Description |
