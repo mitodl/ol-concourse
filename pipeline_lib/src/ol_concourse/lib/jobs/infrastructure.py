@@ -153,6 +153,7 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
     env_vars_from_files: dict[str, str] | None = None,
     slack_url_path: str | None = None,
     refresh_stack: bool = True,
+    pulumi_put_attempts: int | None = None,
 ) -> PipelineFragment:
     """Create a chained sequence of jobs for running Pulumi tasks.
 
@@ -178,6 +179,10 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
     :param refresh_stack: When ``False``, passes ``refresh_stack: false`` to the
         pulumi-provisioner resource so that ``pulumi refresh`` is skipped before each
         ``pulumi up``.  Defaults to ``True`` (refresh enabled).
+    :param pulumi_put_attempts: ``attempts`` for each pulumi-provisioner put step in
+        the chain.  Defaults to ``None`` (no retry).  Leave it alone here: every job
+        in a chain gates the next environment, which is precisely the case the
+        retry can turn into a fabricated green.  See :func:`pulumi_job`.
     :type custom_dependencies: Dict[int, list[GetStep]]
 
     :returns: A `PipelineFragment` object that can be composed with other fragments to
@@ -274,6 +279,7 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
             env_vars_from_files=env_vars_from_files,
             slack_url_path=slack_url_path,
             refresh_stack=refresh_stack,
+            pulumi_put_attempts=pulumi_put_attempts,
         )
 
         default_github_issue_labels = [
@@ -323,6 +329,7 @@ def pulumi_job(  # noqa: PLR0913
     env_vars_from_files: dict[str, str] | None = None,
     slack_url_path: str | None = None,
     refresh_stack: bool = True,
+    pulumi_put_attempts: int | None = None,
 ) -> PipelineFragment:
     """Create a job definition for running a Pulumi task.
 
@@ -342,6 +349,29 @@ def pulumi_job(  # noqa: PLR0913
     :param refresh_stack: When ``False``, passes ``refresh_stack: false`` to the
         pulumi-provisioner resource so that ``pulumi refresh`` is skipped before
         ``pulumi up``.  Defaults to ``True`` (refresh enabled).
+    :param pulumi_put_attempts: ``attempts`` for the pulumi-provisioner put step.
+        Defaults to ``None`` -- no ``retry`` wrapper is emitted at all, so one
+        Pulumi run produces one verdict.
+
+        **Do not set this on a job whose success gates a promotion.** This
+        previously defaulted to ``2`` (added as layer 3 of the orphaned-lock
+        recovery in #45), and that retry is what let a failed update be reported
+        as a green deploy.  Observed in ol-infrastructure's
+        ``deploy-ol-substructure-keycloak`` build 158: attempt 1 genuinely
+        failed (``2 errored``, ``update failed``), attempt 2 never ran Pulumi at
+        all because the worker holding its input volume had gone away, and
+        Concourse then re-executed the first attempt's step id, which exited 0
+        having emitted no Pulumi output whatsoever -- no ``Refreshing``, no
+        ``Updating``, no ``Resources:``.  The job's ``on_success`` fired and
+        posted the ``[bot] Pulumi <project> <stack> deployed.`` issue that is
+        the gate to the next environment.  The retry wrapper is what creates
+        that code path; worker loss during input-volume streaming triggers it.
+
+        Layer 1 of #45 -- ``pulumi_utils._with_lock_recovery``, which cancels a
+        provably-orphaned lock inside the resource itself -- is unaffected by
+        this default and still clears a stale lock on the next run.  What is
+        lost is only the automatic same-build second attempt; the recovery now
+        costs a re-trigger instead of costing trust in the deploy signal.
 
     :returns: A `PipelineFragment` object that can be composed with other fragments to
               build a full pipeline.
@@ -368,7 +398,7 @@ def pulumi_job(  # noqa: PLR0913
                 inputs="all",
                 put=pulumi_resource.name,
                 no_get=True,
-                attempts=2,
+                attempts=pulumi_put_attempts,
                 params={
                     "env_os": {
                         "AWS_DEFAULT_REGION": "us-east-1",
