@@ -255,3 +255,86 @@ class TestPulumiJobAttempts:
                 f"Job {job.name} must not post the gate on ensure"
             )
             assert job.on_success is not None, f"Job {job.name} lost its gate put"
+
+
+class TestDeploySummaryInGateIssue:
+    """The promotion-gate issue body must carry the Pulumi resource summary.
+
+    Closing the `[bot] Pulumi <project> <stack> deployed.` issue is what promotes
+    a change to the next environment, and the issue used to carry only a title --
+    so the human closing it was trusting the job's colour rather than evidence.
+    """
+
+    def test_gate_issue_body_reads_the_summary_artifact(self):
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI", "QA"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+        )
+        for job in fragment.jobs:
+            params = job.on_success.params or {}
+            assert (
+                params["body_file"] == "pulumi-ol-application-airbyte/deploy_summary.md"
+            )
+
+    def test_put_enables_implicit_get_to_produce_the_artifact(self):
+        """A put produces no artifacts; only its implicit get does.
+
+        If no_get stayed True the summary would never reach the issue put, and
+        the body_file above would point at a path that does not exist.
+        """
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI", "QA"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+        )
+        for i in range(len(fragment.jobs)):
+            put = _get_pulumi_put_step(fragment, i)
+            assert put.no_get is False
+            assert put.get_params["summary_file"] == "deploy_summary.md"
+
+    def test_implicit_get_does_not_re_read_the_stack(self):
+        """read_outputs must be False on the implicit get.
+
+        This get runs on the success path of every deploy. Leaving the stack read
+        on would add a second Pulumi invocation there, and a failure in it would
+        redden a deploy that actually applied.
+        """
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+        )
+        assert _get_pulumi_put_step(fragment).get_params["read_outputs"] is False
+
+    def test_body_file_path_matches_the_put_resource_name(self):
+        """The artifact is named after the resource, so the two must not drift."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-substructure-keycloak",
+            project_source_path=Path("src/ol_infrastructure/substructure/keycloak"),
+            github_issue_repository="org/repo",
+        )
+        put = _get_pulumi_put_step(fragment)
+        body_file = (fragment.jobs[0].on_success.params or {})["body_file"]
+        assert body_file.split("/")[0] == str(put.put)
+
+    def test_no_summary_wiring_when_issues_are_disabled(self):
+        """Nothing to feed, so don't pay for the extra implicit get."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            enable_github_issue_resource=False,
+        )
+        put = _get_pulumi_put_step(fragment)
+        assert put.no_get is True
+        assert put.get_params is None

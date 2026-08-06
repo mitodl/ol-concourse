@@ -29,6 +29,30 @@ from ol_concourse.lib.resources import (
 )
 
 
+# Filename the pulumi-provisioner's implicit get writes the deploy summary to,
+# inside that resource's own artifact directory.
+DEPLOY_SUMMARY_FILENAME = "deploy_summary.md"
+
+
+def _pulumi_put_step(fragment: PipelineFragment) -> PutStep:
+    """Return the pulumi-provisioner PutStep from a single-job pulumi_job fragment."""
+    for step in fragment.jobs[0].plan:
+        if isinstance(step, PutStep) and str(step.put).startswith("pulumi-"):
+            return step
+    msg = "pulumi_job produced no pulumi-provisioner PutStep"
+    raise ValueError(msg)
+
+
+def _summary_artifact_path(pulumi_put: PutStep) -> str:
+    """Path to the deploy summary, relative to the job working directory.
+
+    A put step produces no artifacts of its own, so the only way the result of
+    the Pulumi run reaches a later step is the put's *implicit get*, which lands
+    under the resource's name.
+    """
+    return f"{pulumi_put.put}/{DEPLOY_SUMMARY_FILENAME}"
+
+
 def packer_jobs(  # noqa: PLR0913
     dependencies: list[GetStep],
     image_code: Resource,
@@ -295,11 +319,27 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
             default_github_issue_labels.append("finalized-deployment")
 
         if enable_github_issue_resource:
+            # The gate issue's body is the Pulumi resource summary, so that
+            # closing it -- which is what promotes the change to the next
+            # environment -- is a decision made on evidence rather than on the
+            # job's colour. The summary reaches here via the Pulumi put's
+            # implicit get; see _summary_artifact_path.
+            pulumi_put = _pulumi_put_step(step_fragment)
+            pulumi_put.no_get = False
+            pulumi_put.get_params = {
+                "summary_file": DEPLOY_SUMMARY_FILENAME,
+                # A normal get exists to read stack outputs. This one exists only
+                # to materialize the summary, and re-reading the stack here would
+                # put a second Pulumi invocation on the success path of every
+                # deploy -- where a failure would redden a deploy that worked.
+                "read_outputs": False,
+            }
             create_gh_issue = PutStep(
                 put=gh_issues_post.name,
                 params={
                     "labels": github_issue_labels or default_github_issue_labels,
                     "assignees": github_issue_assignees or [],
+                    "body_file": _summary_artifact_path(pulumi_put),
                 },
             )
             chain_fragment.resources.append(gh_issues_post)

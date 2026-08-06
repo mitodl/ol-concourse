@@ -33,6 +33,22 @@ from pulumi_concourse import (
 # ---------------------------------------------------------------------------
 
 
+def _stack_update(
+    version: int = 5,
+    result: str = "succeeded",
+    resource_changes: dict[str, int] | None = None,
+    duration_seconds: int | None = 12,
+) -> pulumi_utils.StackUpdate:
+    return pulumi_utils.StackUpdate(
+        version=version,
+        result=result,
+        resource_changes=(
+            {"same": 40, "update": 2} if resource_changes is None else resource_changes
+        ),
+        duration_seconds=duration_seconds,
+    )
+
+
 def _make_resource(
     stack_name: str = "org.proj.dev",
     project_name: str = "my-project",
@@ -354,7 +370,9 @@ class TestPublishNewVersion:
         build_metadata = MagicMock()
 
         with (
-            patch("pulumi_utils.create_stack", return_value=1) as mock_create,
+            patch(
+                "pulumi_utils.create_stack", return_value=_stack_update(1)
+            ) as mock_create,
             patch("pulumi_utils.update_stack") as mock_update,
         ):
             resource.publish_new_version(tmp_path, build_metadata, action="create")
@@ -370,7 +388,9 @@ class TestPublishNewVersion:
         build_metadata = MagicMock()
 
         with (
-            patch("pulumi_utils.update_stack", return_value=5) as mock_update,
+            patch(
+                "pulumi_utils.update_stack", return_value=_stack_update(5)
+            ) as mock_update,
             patch("pulumi_utils.create_stack") as mock_create,
         ):
             resource.publish_new_version(tmp_path, build_metadata, action="update")
@@ -384,7 +404,9 @@ class TestPublishNewVersion:
         (tmp_path / "infra").mkdir()
         build_metadata = MagicMock()
 
-        with patch("pulumi_utils.update_stack", return_value=5) as mock_update:
+        with patch(
+            "pulumi_utils.update_stack", return_value=_stack_update(5)
+        ) as mock_update:
             resource.publish_new_version(
                 tmp_path, build_metadata, action="update", refresh_stack=False
             )
@@ -457,7 +479,9 @@ class TestPublishNewVersion:
         (tmp_path / "infra").mkdir()
         build_metadata = MagicMock()
 
-        with patch("pulumi_utils.update_stack", return_value=5) as mock_update:
+        with patch(
+            "pulumi_utils.update_stack", return_value=_stack_update(5)
+        ) as mock_update:
             resource.publish_new_version(
                 tmp_path,
                 build_metadata,
@@ -482,7 +506,7 @@ class TestPublishNewVersion:
         passphrase_file.write_text("super-secret\n")
         build_metadata = MagicMock()
 
-        with patch("pulumi_utils.update_stack", return_value=5):
+        with patch("pulumi_utils.update_stack", return_value=_stack_update(5)):
             resource.publish_new_version(
                 tmp_path,
                 build_metadata,
@@ -497,19 +521,20 @@ class TestPublishNewVersion:
         (tmp_path / "infra").mkdir()
         build_metadata = MagicMock()
 
-        with patch("pulumi_utils.update_stack", return_value=5):
+        with patch("pulumi_utils.update_stack", return_value=_stack_update(5)):
             version, _ = resource.publish_new_version(
                 tmp_path, build_metadata, action="update"
             )
 
-        assert version == PulumiVersion(id="5")
+        assert version.id == "5"
+        assert json.loads(version.summary)["version"] == "5"
 
     def test_metadata_includes_action_and_stack(self, tmp_path: Path) -> None:
         resource = _make_resource(stack_name="org.proj.dev", source_dir="infra")
         (tmp_path / "infra").mkdir()
         build_metadata = MagicMock()
 
-        with patch("pulumi_utils.update_stack", return_value=5):
+        with patch("pulumi_utils.update_stack", return_value=_stack_update(5)):
             _, metadata = resource.publish_new_version(
                 tmp_path, build_metadata, action="update"
             )
@@ -722,3 +747,173 @@ class TestRunPreviewOnStack:
         assert "changes" in payload
         assert "stdout" in payload
         assert not list(tmp_path.iterdir())
+
+
+class TestDeploySummary:
+    """The deploy summary is what makes a promotion gate judgeable on evidence.
+
+    Closing the `[bot] Pulumi <project> <stack> deployed.` issue promotes the
+    change to the next environment, and until now that issue carried only a
+    title -- so the human closing it was trusting the job's colour. These pin
+    the summary's trip from the Pulumi run to the issue body.
+    """
+
+    def test_publish_carries_summary_on_the_version(self, tmp_path: Path) -> None:
+        """The put's version carries the summary; metadata alone cannot.
+
+        Concourse metadata is only ever displayed in its own UI. Riding on the
+        version is what lets the implicit get hand the summary to a later step.
+        """
+        resource = _make_resource(stack_name="org.proj.dev", source_dir="infra")
+        (tmp_path / "infra").mkdir()
+
+        with patch(
+            "pulumi_utils.update_stack",
+            return_value=_stack_update(9, resource_changes={"update": 2, "same": 40}),
+        ):
+            version, metadata = resource.publish_new_version(
+                tmp_path, MagicMock(), action="update"
+            )
+
+        summary = json.loads(version.summary)
+        assert summary["version"] == "9"
+        assert summary["result"] == "succeeded"
+        assert json.loads(summary["resource_changes"]) == {"update": 2, "same": 40}
+        # ...and in metadata too, so it is visible in the Concourse UI as well.
+        assert metadata["result"] == "succeeded"
+        assert json.loads(metadata["resource_changes"]) == {"update": 2, "same": 40}
+
+    def test_get_writes_summary_file_without_reading_the_stack(
+        self, tmp_path: Path
+    ) -> None:
+        """read_outputs=False must not invoke Pulumi.
+
+        This get runs on the success path of every deploy. A stack read here
+        would be a second Pulumi invocation whose failure would redden a deploy
+        that actually worked.
+        """
+        resource = _make_resource()
+        version = PulumiVersion(
+            id="9", summary=json.dumps(_stack_update(9).to_flat_dict())
+        )
+
+        with patch("pulumi_utils.read_stack") as mock_read:
+            _, metadata = resource.download_version(
+                version,
+                tmp_path,
+                MagicMock(),
+                summary_file="deploy_summary.md",
+                read_outputs=False,
+            )
+
+        mock_read.assert_not_called()
+        body = (tmp_path / "deploy_summary.md").read_text()
+        assert "Pulumi resource summary" in body
+        assert "| update | 2 |" in body
+        assert "| same | 40 |" in body
+        assert metadata["summary_file"].endswith("deploy_summary.md")
+
+    def test_zero_count_ops_are_reported_as_zero(self, tmp_path: Path) -> None:
+        """Pulumi omits zero-count ops, so absence must render as 0, not vanish."""
+        resource = _make_resource()
+        version = PulumiVersion(
+            id="9",
+            summary=json.dumps(
+                _stack_update(9, resource_changes={"same": 40}).to_flat_dict()
+            ),
+        )
+
+        resource.download_version(
+            version,
+            tmp_path,
+            MagicMock(),
+            summary_file="deploy_summary.md",
+            read_outputs=False,
+        )
+
+        body = (tmp_path / "deploy_summary.md").read_text()
+        for op in ("create", "update", "replace", "delete"):
+            assert f"| {op} | 0 |" in body
+
+    def test_missing_summary_renders_a_do_not_promote_warning(
+        self, tmp_path: Path
+    ) -> None:
+        """A green job with no summary is build 158's shape -- it must scream.
+
+        deploy-ol-substructure-keycloak build 158 reported success having run no
+        Pulumi at all. A body that merely omitted the counts would read as
+        "nothing to report"; it has to read as "do not trust this".
+        """
+        resource = _make_resource()
+
+        resource.download_version(
+            PulumiVersion(id="0"),
+            tmp_path,
+            MagicMock(),
+            summary_file="deploy_summary.md",
+            read_outputs=False,
+        )
+
+        body = (tmp_path / "deploy_summary.md").read_text()
+        assert "No Pulumi resource summary was recorded" in body
+        assert "Do not close this issue" in body
+
+    def test_errored_update_says_do_not_promote(self, tmp_path: Path) -> None:
+        """The exact case build 158 hid: `2 errored` must be visible in the body."""
+        resource = _make_resource()
+        version = PulumiVersion(
+            id="0",
+            summary=json.dumps(
+                _stack_update(
+                    0, result="failed", resource_changes={"errored": 2}
+                ).to_flat_dict()
+            ),
+        )
+
+        resource.download_version(
+            version,
+            tmp_path,
+            MagicMock(),
+            summary_file="deploy_summary.md",
+            read_outputs=False,
+        )
+
+        body = (tmp_path / "deploy_summary.md").read_text()
+        assert "| errored | 2 |" in body
+        assert "Do not promote it." in body
+
+    def test_normal_get_still_reads_outputs(self, tmp_path: Path) -> None:
+        """The default get is unchanged -- it exists to fetch stack outputs."""
+        resource = _make_resource(stack_name="org.proj.dev", source_dir="infra")
+
+        with patch("pulumi_utils.read_stack", return_value={"key": "value"}) as mock:
+            _, metadata = resource.download_version(
+                PulumiVersion(id="9"), tmp_path, MagicMock()
+            )
+
+        mock.assert_called_once()
+        assert metadata["outputs_file"].endswith("org.proj.dev_outputs.json")
+
+
+class TestSummarizeUpResult:
+    def test_duration_computed_from_start_and_end(self) -> None:
+        result = MagicMock()
+        result.summary.version = 4
+        result.summary.result = "succeeded"
+        result.summary.resource_changes = {"create": 1}
+        result.summary.start_time = "2020-01-01T00:00:00Z"
+        result.summary.end_time = "2020-01-01T00:02:30Z"
+
+        assert pulumi_utils.summarize_up_result(result).duration_seconds == 150
+
+    def test_missing_timestamps_leave_duration_unset(self) -> None:
+        result = MagicMock()
+        result.summary.version = 4
+        result.summary.result = "succeeded"
+        result.summary.resource_changes = {"create": 1}
+        result.summary.start_time = None
+        result.summary.end_time = None
+
+        summary = pulumi_utils.summarize_up_result(result)
+        assert summary.duration_seconds is None
+        assert "duration_seconds" not in summary.to_flat_dict()

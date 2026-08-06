@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime, UTC
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +26,66 @@ _UUID_RE = re.compile(
 _LOCK_HOLDER_RE = re.compile(
     r"created by (?P<user>[^@]+)@(?P<host>\S+) \(pid (?P<pid>\d+)\) at (?P<at>\S+)"
 )
+
+
+@dataclass
+class StackUpdate:
+    """The outcome of a ``pulumi up``, as much of it as is worth carrying forward.
+
+    ``pulumi up`` already prints all of this to the build log, but the log is not
+    something a later step can read.  A promotion-gate issue is decided by a human
+    who is not reading the log, so the counts have to travel out of here as data.
+    """
+
+    version: int
+    result: str
+    resource_changes: dict[str, int]
+    duration_seconds: int | None = None
+
+    def to_flat_dict(self) -> dict[str, str]:
+        """Flatten to strings, for a Concourse version or metadata payload."""
+        flat = {
+            "version": str(self.version),
+            "result": self.result,
+            "resource_changes": json.dumps(self.resource_changes, sort_keys=True),
+        }
+        if self.duration_seconds is not None:
+            flat["duration_seconds"] = str(self.duration_seconds)
+        return flat
+
+
+def summarize_up_result(result: auto.UpResult) -> StackUpdate:
+    """Extract the resource summary from an UpResult.
+
+    ``resource_changes`` is keyed by Pulumi's own op names (``create``, ``update``,
+    ``delete``, ``replace``, ``same``).  Pulumi omits keys with a zero count rather
+    than reporting them as 0, so absence means none of that op happened.
+    """
+    summary = result.summary
+    duration: int | None = None
+    if summary.start_time and summary.end_time:
+        try:
+            duration = int(
+                (
+                    _parse_pulumi_time(summary.end_time)
+                    - _parse_pulumi_time(summary.start_time)
+                ).total_seconds()
+            )
+        except ValueError:
+            duration = None
+    return StackUpdate(
+        version=summary.version,
+        result=summary.result,
+        resource_changes={
+            k: int(v) for k, v in (summary.resource_changes or {}).items()
+        },
+        duration_seconds=duration,
+    )
+
+
+def _parse_pulumi_time(value: str) -> datetime:
+    """Parse a Pulumi summary timestamp, which is RFC 3339 with a literal Z."""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +154,10 @@ def create_stack(  # noqa: PLR0913
     *,
     preview: bool = False,
     preview_file: Path | None = None,
-) -> int:
+) -> StackUpdate:
     """Create a new stack and run pulumi up (or preview).
 
-    Returns the Pulumi stack version number, or 0 for a preview run.
+    Returns the update's StackUpdate summary, or an empty one for a preview run.
     Raises StackAlreadyExistsError if the stack already exists.
     """
     try:
@@ -115,10 +176,15 @@ def create_stack(  # noqa: PLR0913
 
     if preview:
         _run_preview_on_stack(stack, preview_file)
-        return 0
+        return _preview_stack_update()
 
     result = _with_lock_recovery(lambda: stack.up(on_output=print), stack, stack_name)
-    return result.summary.version
+    return summarize_up_result(result)
+
+
+def _preview_stack_update() -> StackUpdate:
+    """Return the StackUpdate for a preview run, which applies nothing."""
+    return StackUpdate(version=0, result="preview", resource_changes={})
 
 
 def update_stack(  # noqa: PLR0913
@@ -131,10 +197,10 @@ def update_stack(  # noqa: PLR0913
     refresh_stack: bool = True,
     preview: bool = False,
     preview_file: Path | None = None,
-) -> int:
+) -> StackUpdate:
     """Select an existing stack, optionally refresh, then run pulumi up (or preview).
 
-    Returns the Pulumi stack version number, or 0 for a preview run.
+    Returns the update's StackUpdate summary, or an empty one for a preview run.
     Raises StackNotFoundError or ConcurrentUpdateError as appropriate.
     """
     try:
@@ -158,10 +224,10 @@ def update_stack(  # noqa: PLR0913
 
     if preview:
         _run_preview_on_stack(stack, preview_file)
-        return 0
+        return _preview_stack_update()
 
     result = _with_lock_recovery(lambda: stack.up(on_output=print), stack, stack_name)
-    return result.summary.version
+    return summarize_up_result(result)
 
 
 def destroy_stack(

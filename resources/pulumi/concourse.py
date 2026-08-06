@@ -18,9 +18,18 @@ import pulumi_utils
 
 @dataclass
 class PulumiVersion(TypedVersion):
-    """Static version — Pulumi stacks are not polled for external changes."""
+    """Static version — Pulumi stacks are not polled for external changes.
+
+    ``summary`` is the JSON-encoded ``StackUpdate`` produced by the put that
+    emitted this version, and is empty for versions from ``check``.  It rides on
+    the version rather than on metadata because metadata is only ever shown in
+    the Concourse UI, and the point of carrying it is to hand it to a *later
+    step* -- the implicit get writes it to a file that the promotion-gate issue
+    put reads as its body.
+    """
 
     id: str = "0"
+    summary: str = ""
 
 
 class PulumiResource(ConcourseResource[PulumiVersion]):
@@ -75,12 +84,37 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         source_dir: str | None = None,
         env_pulumi: dict[str, str] | None = None,
         env_os: dict[str, str] | None = None,
+        summary_file: str | None = None,
+        read_outputs: bool = True,
     ) -> tuple[PulumiVersion, dict[str, str]]:
         """Read stack outputs and optionally run a preview.
 
         destination_dir is this resource's own output directory; its parent
         is the job working directory that contains all fetched inputs.
+
+        *summary_file* writes the deploy summary carried on *version* to that
+        filename inside destination_dir.  This is how the result of a put escapes
+        the put: a put step produces no artifacts, but its implicit get does, so
+        a pipeline sets ``no_get: false`` plus ``get_params: {summary_file: ...}``
+        and a later step -- the promotion-gate issue put -- reads the file.
+
+        *read_outputs* is True for a normal get, which exists to fetch stack
+        outputs.  Set it False on that implicit get: re-reading the stack there
+        would mean a second Pulumi invocation on the success path of every
+        deploy, and a failure in it would redden a deploy that actually worked.
         """
+        if summary_file:
+            (destination_dir / summary_file).write_text(
+                _render_summary(version, build_metadata)
+            )
+
+        metadata: dict[str, str] = {}
+        if summary_file:
+            metadata["summary_file"] = str(destination_dir / summary_file)
+
+        if not read_outputs:
+            return version, metadata
+
         effective = self._resolve_params(
             stack_name=stack_name,
             project_name=project_name,
@@ -105,7 +139,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         outputs_file = destination_dir / f"{effective['stack_name']}_outputs.json"
         outputs_file.write_text(json.dumps(outputs, indent=2))
 
-        metadata: dict[str, str] = {"outputs_file": str(outputs_file)}
+        metadata["outputs_file"] = str(outputs_file)
 
         if run_preview:
             preview_file = destination_dir / f"{effective['stack_name']}_preview.json"
@@ -200,6 +234,8 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
             "stack": effective["stack_name"],
         }
 
+        stack_update: pulumi_utils.StackUpdate | None = None
+
         if effective_action == "destroy":
             version_id = pulumi_utils.destroy_stack(
                 stack_name=effective["stack_name"],
@@ -239,7 +275,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
 
         else:
             if effective_action == "create":
-                version_id = pulumi_utils.create_stack(
+                stack_update = pulumi_utils.create_stack(
                     stack_name=effective["stack_name"],
                     project_name=effective["project_name"],
                     source_dir=work_dir,
@@ -247,7 +283,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
                     env_pulumi=effective["env_pulumi"],
                 )
             else:
-                version_id = pulumi_utils.update_stack(
+                stack_update = pulumi_utils.update_stack(
                     stack_name=effective["stack_name"],
                     project_name=effective["project_name"],
                     source_dir=work_dir,
@@ -255,9 +291,13 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
                     env_pulumi=effective["env_pulumi"],
                     refresh_stack=refresh_stack,
                 )
-            metadata["result"] = "succeeded"
+            version_id = stack_update.version
+            # Pulumi's own summary.result carries the same succeeded/failed
+            # semantics, so let it be the authority rather than asserting it here.
+            metadata.update(stack_update.to_flat_dict())
 
-        return PulumiVersion(id=str(version_id)), metadata
+        summary_json = json.dumps(stack_update.to_flat_dict()) if stack_update else ""
+        return PulumiVersion(id=str(version_id), summary=summary_json), metadata
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -286,3 +326,73 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
 def _apply_os_env(env_vars: dict[str, str]) -> None:
     for key, value in env_vars.items():
         os.environ[key] = value
+
+
+# Ops worth calling out individually; anything else Pulumi reports falls through
+# to the catch-all loop below so a new op type is never silently dropped.
+_NOTABLE_OPS = ("create", "update", "replace", "delete")
+
+
+def _render_summary(version: PulumiVersion, build_metadata: BuildMetadata) -> str:
+    """Render the deploy summary carried on *version* as Markdown.
+
+    This ends up as the body of the `[bot] Pulumi <project> <stack> deployed.`
+    issue, and closing that issue promotes the change to the next environment.
+    So the reader is a human deciding whether to promote, and the two things
+    they need are what changed and whether anything failed.
+
+    The no-summary branch matters as much as the normal one.  A green Pulumi job
+    that carries no summary is the shape of ol-infrastructure's
+    deploy-ol-substructure-keycloak build 158, where a retried put reported
+    success having run no Pulumi at all.  An issue body that just omitted the
+    counts would read as "nothing to report"; it has to read as "do not trust
+    this".
+    """
+    build_link = f"[build {build_metadata.BUILD_NAME}]({build_metadata.build_url()})"
+
+    if not version.summary:
+        return (
+            "## :warning: No Pulumi resource summary was recorded\n\n"
+            f"This deploy was reported as succeeding by {build_link}, but the job "
+            "produced no Pulumi run summary.\n\n"
+            "**Do not close this issue to promote the change until you have "
+            "confirmed from the build log that Pulumi actually ran.** A job that "
+            "reports success while emitting no summary has not been shown to have "
+            "deployed anything -- check the log for `Updating`, `Resources:` and "
+            "`Duration:` lines before treating this as a real deploy.\n"
+        )
+
+    summary = json.loads(version.summary)
+    changes: dict[str, int] = json.loads(summary.get("resource_changes", "{}"))
+
+    lines = [
+        "## Pulumi resource summary",
+        "",
+        f"- **Result:** `{summary.get('result', 'unknown')}`",
+        f"- **Stack version:** `{summary.get('version', 'unknown')}`",
+    ]
+    if "duration_seconds" in summary:
+        lines.append(f"- **Duration:** {summary['duration_seconds']}s")
+    lines.extend(["", "| Change | Count |", "| --- | --- |"])
+
+    # Pulumi omits zero-count ops entirely, so report the notable ones as 0
+    # rather than leaving the reader to wonder whether the key was dropped or
+    # the op genuinely did not happen.
+    for op in _NOTABLE_OPS:
+        lines.append(f"| {op} | {changes.get(op, 0)} |")
+    for op in sorted(set(changes) - set(_NOTABLE_OPS)):
+        lines.append(f"| {op} | {changes[op]} |")
+
+    errored = changes.get("errored", 0)
+    if errored or summary.get("result") not in ("succeeded", "preview"):
+        lines.extend(
+            [
+                "",
+                f":rotating_light: **This update did not complete cleanly "
+                f"(`result={summary.get('result')}`, errored={errored}).** "
+                "Do not promote it.",
+            ]
+        )
+
+    lines.extend(["", f"Deployed by {build_link}.", ""])
+    return "\n".join(lines)
