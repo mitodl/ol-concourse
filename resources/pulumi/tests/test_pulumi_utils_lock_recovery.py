@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -261,8 +262,10 @@ class TestUpdateStackLockRecovery:
         up_result.summary.version = 7
         up_result.summary.result = "succeeded"
         up_result.summary.resource_changes = {"same": 3}
-        up_result.summary.start_time = "2020-01-01T00:00:00Z"
-        up_result.summary.end_time = "2020-01-01T00:00:09Z"
+        # datetimes, matching UpdateSummary's real type -- not the RFC 3339
+        # strings of the wire format
+        up_result.summary.start_time = datetime(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+        up_result.summary.end_time = datetime(2020, 1, 1, 0, 0, 9, tzinfo=UTC)
         call_count = [0]
 
         def flaky_up(**_kwargs):

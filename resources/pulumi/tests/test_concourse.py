@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pulumi import automation as auto
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -896,15 +898,65 @@ class TestDeploySummary:
 
 
 class TestSummarizeUpResult:
+    """`UpdateSummary.start_time`/`end_time` are datetimes, NOT strings.
+
+    The automation API parses the wire format's RFC 3339 timestamps before we
+    see them (`start_time: datetime`, `end_time: Optional[datetime]` in
+    pulumi 3.253's `UpdateSummary.__init__`). Feeding these tests strings would
+    let a string-parsing implementation pass here and then raise TypeError in
+    production on the success path of every deploy -- after `pulumi up` has
+    already applied. Keep them as real datetimes.
+    """
+
     def test_duration_computed_from_start_and_end(self) -> None:
         result = MagicMock()
         result.summary.version = 4
         result.summary.result = "succeeded"
         result.summary.resource_changes = {"create": 1}
-        result.summary.start_time = "2020-01-01T00:00:00Z"
-        result.summary.end_time = "2020-01-01T00:02:30Z"
+        result.summary.start_time = datetime(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+        result.summary.end_time = datetime(2020, 1, 1, 0, 2, 30, tzinfo=UTC)
 
         assert pulumi_utils.summarize_up_result(result).duration_seconds == 150
+
+    def test_real_pulumi_update_summary_type_is_accepted(self) -> None:
+        """Pin against the actual SDK class, not a MagicMock of it.
+
+        A MagicMock accepts any attribute type, so it cannot catch the
+        wrong-type assumption on its own -- constructing the genuine
+        UpdateSummary is what makes this test load-bearing.
+        """
+        summary = auto.UpdateSummary(
+            kind="update",
+            start_time=datetime(2026, 8, 6, 22, 0, 0, tzinfo=UTC),
+            message="",
+            environment={},
+            config={},
+            result="succeeded",
+            end_time=datetime(2026, 8, 6, 22, 1, 34, tzinfo=UTC),
+            version=42,
+            resource_changes={"update": 3, "same": 118},
+        )
+        result = MagicMock()
+        result.summary = summary
+
+        stack_update = pulumi_utils.summarize_up_result(result)
+        assert stack_update.duration_seconds == 94
+        assert stack_update.version == 42
+        assert stack_update.result == "succeeded"
+        assert stack_update.resource_changes == {"update": 3, "same": 118}
+
+    def test_missing_end_time_leaves_duration_unset(self) -> None:
+        """end_time is Optional -- an update still in progress has none."""
+        result = MagicMock()
+        result.summary.version = 4
+        result.summary.result = "succeeded"
+        result.summary.resource_changes = {"create": 1}
+        result.summary.start_time = datetime(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+        result.summary.end_time = None
+
+        summary = pulumi_utils.summarize_up_result(result)
+        assert summary.duration_seconds is None
+        assert "duration_seconds" not in summary.to_flat_dict()
 
     def test_missing_timestamps_leave_duration_unset(self) -> None:
         result = MagicMock()

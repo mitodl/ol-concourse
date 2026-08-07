@@ -63,16 +63,11 @@ def summarize_up_result(result: auto.UpResult) -> StackUpdate:
     """
     summary = result.summary
     duration: int | None = None
+    # UpdateSummary.start_time/end_time are datetimes, not the RFC 3339 strings
+    # the wire format uses -- the automation API parses them before we see them.
+    # end_time is Optional; an update still in progress has none.
     if summary.start_time and summary.end_time:
-        try:
-            duration = int(
-                (
-                    _parse_pulumi_time(summary.end_time)
-                    - _parse_pulumi_time(summary.start_time)
-                ).total_seconds()
-            )
-        except ValueError:
-            duration = None
+        duration = int((summary.end_time - summary.start_time).total_seconds())
     return StackUpdate(
         version=summary.version,
         result=summary.result,
@@ -81,11 +76,6 @@ def summarize_up_result(result: auto.UpResult) -> StackUpdate:
         },
         duration_seconds=duration,
     )
-
-
-def _parse_pulumi_time(value: str) -> datetime:
-    """Parse a Pulumi summary timestamp, which is RFC 3339 with a literal Z."""
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 # ---------------------------------------------------------------------------
