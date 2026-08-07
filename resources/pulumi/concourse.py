@@ -48,6 +48,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         env_os: dict[str, str] | None = None,
         action: str
         | None = None,  # accepted for backwards compatibility; use put params instead
+        max_carried_changes: int | str = pulumi_utils.DEFAULT_MAX_CARRIED_CHANGES,
     ) -> None:
         super().__init__(PulumiVersion)
         self.stack_name = stack_name
@@ -56,6 +57,10 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         self.env_pulumi: dict[str, str] = env_pulumi or {}
         self.env_os: dict[str, str] = env_os or {}
         self.action = action
+        # How many per-resource changes ride on the emitted version. Settable in
+        # the pipeline's resource `source` (or overridden per-put), so tuning it
+        # is a pipeline re-set rather than a release of this image. 0 = no cap.
+        self.max_carried_changes = int(max_carried_changes)
 
     # ------------------------------------------------------------------
     # check
@@ -173,6 +178,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         env_pulumi: dict[str, str] | None = None,
         env_os: dict[str, str] | None = None,
         env_vars_from_files: dict[str, str] | None = None,
+        max_carried_changes: int | str | None = None,
     ) -> tuple[PulumiVersion, dict[str, str]]:
         """Execute a Pulumi action against a stack.
 
@@ -216,6 +222,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
             source_dir=source_dir,
             env_pulumi=env_pulumi,
             env_os=env_os,
+            max_carried_changes=max_carried_changes,
         )
 
         if env_vars_from_files:
@@ -281,6 +288,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
                     source_dir=work_dir,
                     stack_config=cfg,
                     env_pulumi=effective["env_pulumi"],
+                    max_carried_changes=effective["max_carried_changes"],
                 )
             else:
                 stack_update = pulumi_utils.update_stack(
@@ -290,6 +298,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
                     stack_config=cfg,
                     env_pulumi=effective["env_pulumi"],
                     refresh_stack=refresh_stack,
+                    max_carried_changes=effective["max_carried_changes"],
                 )
             version_id = stack_update.version
             # Pulumi's own summary.result carries the same succeeded/failed
@@ -303,13 +312,14 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _resolve_params(
+    def _resolve_params(  # noqa: PLR0913
         self,
         stack_name: str | None,
         project_name: str | None,
         source_dir: str | None,
         env_pulumi: dict[str, str] | None,
         env_os: dict[str, str] | None,
+        max_carried_changes: int | str | None = None,
     ) -> dict[str, Any]:
         """Merge step-level overrides onto source-level defaults."""
         merged_env_pulumi = {**self.env_pulumi, **(env_pulumi or {})}
@@ -320,6 +330,13 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
             "source_dir": source_dir or self.source_dir,
             "env_pulumi": merged_env_pulumi,
             "env_os": merged_env_os,
+            # `or` would swallow an explicit 0, which is how a caller asks for
+            # no cap at all.
+            "max_carried_changes": (
+                self.max_carried_changes
+                if max_carried_changes is None
+                else int(max_carried_changes)
+            ),
         }
 
 

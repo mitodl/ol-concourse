@@ -55,6 +55,15 @@ def _stack_update(
     )
 
 
+def _make_resource_with_cap(cap: int) -> PulumiResource:
+    return PulumiResource(
+        stack_name="org.proj.dev",
+        project_name="my-project",
+        source_dir="infra",
+        max_carried_changes=cap,
+    )
+
+
 def _make_resource(
     stack_name: str = "org.proj.dev",
     project_name: str = "my-project",
@@ -1165,6 +1174,114 @@ class TestChangeCaptureFromUp:
 
         stack_update = pulumi_utils.summarize_up_result(result, events)
 
-        assert len(stack_update.changes) == pulumi_utils.MAX_CARRIED_CHANGES
+        assert len(stack_update.changes) == pulumi_utils.DEFAULT_MAX_CARRIED_CHANGES
         assert stack_update.changes_total == 500
         assert json.loads(stack_update.to_flat_dict()["changes_total"]) == 500
+
+
+class TestMaxCarriedChangesIsConfigurable:
+    """The cap must be tunable from the pipeline, not only from this code.
+
+    Baked into a constant, changing it would mean editing this image, cutting a
+    release, and bumping the dependency in every consumer. As a `source` field
+    (or per-put param) it is a pipeline re-set instead, which is the difference
+    between "we can try a bigger number tomorrow" and "we can try it next
+    release".
+    """
+
+    def _events(self, count: int) -> list[MagicMock]:
+        events = []
+        for i in range(count):
+            evt = MagicMock()
+            evt.metadata.op = OpType.UPDATE
+            evt.metadata.urn = f"urn:pulumi:CI::proj::aws:s3/bucket:Bucket::b{i}"
+            evt.metadata.type = "aws:s3/bucket:Bucket"
+            evt.metadata.diffs = []
+            evt.metadata.detailed_diff = None
+            events.append(evt)
+        return events
+
+    def _up_result(self) -> MagicMock:
+        result = MagicMock()
+        result.summary.version = 4
+        result.summary.result = "succeeded"
+        result.summary.resource_changes = {"update": 10}
+        result.summary.start_time = None
+        result.summary.end_time = None
+        return result
+
+    def test_source_level_value_is_used(self, tmp_path: Path) -> None:
+        resource = _make_resource_with_cap(3)
+        (tmp_path / "infra").mkdir(exist_ok=True)
+
+        captured: dict[str, Any] = {}
+
+        def fake_update(**kwargs: Any) -> pulumi_utils.StackUpdate:
+            captured.update(kwargs)
+            return _stack_update()
+
+        with patch("pulumi_utils.update_stack", side_effect=fake_update):
+            resource.publish_new_version(tmp_path, MagicMock(), action="update")
+
+        assert captured["max_carried_changes"] == 3
+
+    def test_put_param_overrides_source(self, tmp_path: Path) -> None:
+        resource = _make_resource_with_cap(3)
+        (tmp_path / "infra").mkdir(exist_ok=True)
+
+        captured: dict[str, Any] = {}
+
+        def fake_update(**kwargs: Any) -> pulumi_utils.StackUpdate:
+            captured.update(kwargs)
+            return _stack_update()
+
+        with patch("pulumi_utils.update_stack", side_effect=fake_update):
+            resource.publish_new_version(
+                tmp_path, MagicMock(), action="update", max_carried_changes=50
+            )
+
+        assert captured["max_carried_changes"] == 50
+
+    def test_zero_means_no_cap_and_is_not_swallowed_as_falsy(
+        self, tmp_path: Path
+    ) -> None:
+        """`or`-style defaulting would turn an explicit 0 back into 200."""
+        resource = _make_resource_with_cap(200)
+        (tmp_path / "infra").mkdir(exist_ok=True)
+
+        captured: dict[str, Any] = {}
+
+        def fake_update(**kwargs: Any) -> pulumi_utils.StackUpdate:
+            captured.update(kwargs)
+            return _stack_update()
+
+        with patch("pulumi_utils.update_stack", side_effect=fake_update):
+            resource.publish_new_version(
+                tmp_path, MagicMock(), action="update", max_carried_changes=0
+            )
+
+        assert captured["max_carried_changes"] == 0
+
+    def test_zero_carries_every_change(self) -> None:
+        stack_update = pulumi_utils.summarize_up_result(
+            self._up_result(), self._events(10), max_carried_changes=0
+        )
+        assert len(stack_update.changes) == 10
+        assert stack_update.changes_total == 10
+
+    def test_custom_cap_truncates_but_keeps_total(self) -> None:
+        stack_update = pulumi_utils.summarize_up_result(
+            self._up_result(), self._events(10), max_carried_changes=4
+        )
+        assert len(stack_update.changes) == 4
+        assert stack_update.changes_total == 10
+
+    def test_string_from_pipeline_yaml_is_coerced(self) -> None:
+        """Concourse source/params values can arrive as strings."""
+        resource = PulumiResource(
+            stack_name="org.proj.dev",
+            project_name="p",
+            source_dir="infra",
+            max_carried_changes="7",
+        )
+        assert resource.max_carried_changes == 7

@@ -32,7 +32,12 @@ _LOCK_HOLDER_RE = re.compile(
 # thousand-resource refactor would otherwise put a megabyte there. Cap what is
 # carried; ``changes_total`` keeps the honest count so the rendered body can say
 # how much it is not showing.
-MAX_CARRIED_CHANGES = 200
+#
+# This is only the default. The cap is a pipeline-level setting -- the resource's
+# ``max_carried_changes`` source field or put param -- so raising or disabling it
+# is a pipeline re-set, not a code change plus a package release plus a
+# dependency bump.
+DEFAULT_MAX_CARRIED_CHANGES = 200
 
 
 @dataclass
@@ -67,7 +72,9 @@ class StackUpdate:
 
 
 def summarize_up_result(
-    result: auto.UpResult, changes: list[ResourcePreEvent] | None = None
+    result: auto.UpResult,
+    changes: list[ResourcePreEvent] | None = None,
+    max_carried_changes: int = DEFAULT_MAX_CARRIED_CHANGES,
 ) -> StackUpdate:
     """Extract the resource summary from an UpResult.
 
@@ -80,6 +87,11 @@ def summarize_up_result(
     five and *what* about them changed -- which is what a human deciding whether
     to promote actually needs.  ``UpResult`` does not carry them, so they have
     to be captured via ``on_event`` while ``up`` runs.
+
+    *max_carried_changes* bounds how many of those events ride on the version.
+    ``0`` disables the cap entirely.  ``changes_total`` always records the true
+    count, so a capped list can say how much it is not showing rather than
+    reading as complete.
     """
     summary = result.summary
     duration: int | None = None
@@ -100,7 +112,7 @@ def summarize_up_result(
             k: int(v) for k, v in (summary.resource_changes or {}).items()
         },
         duration_seconds=duration,
-        changes=changed[:MAX_CARRIED_CHANGES],
+        changes=changed if max_carried_changes == 0 else changed[:max_carried_changes],
         changes_total=len(changed),
     )
 
@@ -186,6 +198,7 @@ def create_stack(  # noqa: PLR0913
     *,
     preview: bool = False,
     preview_file: Path | None = None,
+    max_carried_changes: int = DEFAULT_MAX_CARRIED_CHANGES,
 ) -> StackUpdate:
     """Create a new stack and run pulumi up (or preview).
 
@@ -214,7 +227,7 @@ def create_stack(  # noqa: PLR0913
     result = _with_lock_recovery(
         lambda: stack.up(on_output=print, on_event=on_event), stack, stack_name
     )
-    return summarize_up_result(result, events)
+    return summarize_up_result(result, events, max_carried_changes)
 
 
 def _preview_stack_update() -> StackUpdate:
@@ -232,6 +245,7 @@ def update_stack(  # noqa: PLR0913
     refresh_stack: bool = True,
     preview: bool = False,
     preview_file: Path | None = None,
+    max_carried_changes: int = DEFAULT_MAX_CARRIED_CHANGES,
 ) -> StackUpdate:
     """Select an existing stack, optionally refresh, then run pulumi up (or preview).
 
@@ -265,7 +279,7 @@ def update_stack(  # noqa: PLR0913
     result = _with_lock_recovery(
         lambda: stack.up(on_output=print, on_event=on_event), stack, stack_name
     )
-    return summarize_up_result(result, events)
+    return summarize_up_result(result, events, max_carried_changes)
 
 
 def destroy_stack(

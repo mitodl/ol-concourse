@@ -338,3 +338,68 @@ class TestDeploySummaryInGateIssue:
         put = _get_pulumi_put_step(fragment)
         assert put.no_get is True
         assert put.get_params is None
+
+
+def _pulumi_resource(fragment):
+    """Return the pulumi-provisioner Resource from a fragment."""
+    for resource in fragment.resources:
+        if resource.type == "pulumi-provisioner":
+            return resource
+    msg = "no pulumi-provisioner resource in fragment"
+    raise AssertionError(msg)
+
+
+class TestMaxCarriedChangesReachesThePipeline:
+    """The cap must be settable without editing and releasing the resource image.
+
+    It lands in the resource's `source`, so an operator who finds 200 too few
+    (or too many) after seeing a real gate issue changes a pipeline and re-sets
+    it, rather than waiting on an image release and a dependency bump.
+    """
+
+    def test_absent_from_source_by_default(self):
+        """Don't pin a value the resource already defaults to."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+        )
+        assert "max_carried_changes" not in _pulumi_resource(fragment).source
+
+    def test_value_lands_in_resource_source(self):
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI", "QA"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+            max_carried_changes=500,
+        )
+        assert _pulumi_resource(fragment).source["max_carried_changes"] == 500
+
+    def test_zero_is_emitted_not_dropped_as_falsy(self):
+        """0 means "no cap" and must survive to the YAML."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+            max_carried_changes=0,
+        )
+        assert _pulumi_resource(fragment).source["max_carried_changes"] == 0
+
+    def test_accepts_a_concourse_var_reference(self):
+        """Deferring to a var is what makes this tunable with no code at all."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+            max_carried_changes="((pulumi.max_carried_changes))",
+        )
+        source = _pulumi_resource(fragment).source
+        assert source["max_carried_changes"] == "((pulumi.max_carried_changes))"
