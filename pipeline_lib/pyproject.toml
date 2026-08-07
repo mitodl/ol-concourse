@@ -12,6 +12,11 @@ dependencies = ["pydantic>=2,<3"]
 Homepage = "https://github.com/mitodl/ol-concourse"
 Repository = "https://github.com/mitodl/ol-concourse"
 
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3,<10",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
