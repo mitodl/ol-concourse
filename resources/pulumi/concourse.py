@@ -394,5 +394,91 @@ def _render_summary(version: PulumiVersion, build_metadata: BuildMetadata) -> st
             ]
         )
 
+    lines.extend(
+        _render_changes(
+            json.loads(summary.get("changes", "[]")),
+            int(summary.get("changes_total", 0)),
+        )
+    )
     lines.extend(["", f"Deployed by {build_link}.", ""])
     return "\n".join(lines)
+
+
+def _resource_name(urn: str) -> str:
+    """Pull the resource name off a URN.
+
+    ``urn:pulumi:<stack>::<project>::<type-chain>::<name>`` -- the name is the
+    last ``::`` segment. Parent types are packed into the type chain with ``$``,
+    so the resource's own type is the last ``$`` segment of the second-to-last.
+    """
+    return urn.rsplit("::", 1)[-1] if urn else "?"
+
+
+def _resource_type(event: dict[str, Any]) -> str:
+    """Return the resource's own Pulumi type, e.g. ``keycloak:openid/client:Client``."""
+    declared = event.get("type")
+    if declared:
+        return str(declared)
+    parts = str(event.get("urn", "")).split("::")
+    return parts[-2].split("$")[-1] if len(parts) > 2 else "?"  # noqa: PLR2004
+
+
+def _render_changes(events: list[dict[str, Any]], total: int = 0) -> list[str]:
+    """Render the per-resource diff -- *what* changed, not just how many.
+
+    The counts above answer "did anything change"; a human deciding whether to
+    promote needs "what changed, and does it look like what I intended". A
+    Keycloak client losing a redirect URI and a Keycloak client gaining a
+    description are both `update: 1`, and only one of them should be promoted
+    without a second look.
+
+    Property paths come from ``detailed_diff`` where the provider supplies one,
+    falling back to the coarser ``diffs`` list. Both can be empty (a create or
+    delete has no property-level diff), in which case just the resource is
+    named.
+    """
+    if not events:
+        return []
+
+    by_op: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        by_op.setdefault(str(event.get("operation", "?")), []).append(event)
+
+    lines = ["", "### What changed", ""]
+    # Ordered so the destructive ops a reviewer most needs to see come first,
+    # then anything Pulumi reports that this list does not anticipate.
+    ordered = [op for op in ("delete", "replace", "create", "update") if op in by_op]
+    ordered += sorted(set(by_op) - set(ordered))
+
+    for op in ordered:
+        entries = by_op[op]
+        lines.append(f"<details open><summary><b>{op}</b> ({len(entries)})</summary>")
+        lines.append("")
+        for event in sorted(entries, key=lambda e: str(e.get("urn", ""))):
+            name = _resource_name(str(event.get("urn", "")))
+            lines.append(f"- `{name}` — `{_resource_type(event)}`")
+            for prop in _changed_properties(event):
+                lines.append(f"  - {prop}")
+        lines.extend(["", "</details>", ""])
+
+    if total > len(events):
+        # Never truncate silently -- a shortened list that reads as complete is
+        # exactly the kind of thing this whole feature exists to prevent. The
+        # cap is applied upstream, when the changes are put on the version; this
+        # only reports it.
+        lines.append(
+            f"> :warning: Showing {len(events)} of {total} changed resources. "
+            "See the build log for the full diff."
+        )
+    return lines
+
+
+def _changed_properties(event: dict[str, Any]) -> list[str]:
+    """Return the changed property paths, preferring the provider's detailed diff."""
+    detailed = event.get("detailed_diff") or {}
+    if detailed:
+        return [
+            f"`{path}` ({info.get('diff_kind', 'changed')})"
+            for path, info in sorted(detailed.items())
+        ]
+    return [f"`{prop}`" for prop in sorted(event.get("diffs") or [])]

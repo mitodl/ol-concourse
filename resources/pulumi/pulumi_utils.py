@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from typing import TYPE_CHECKING, Any
 
@@ -27,6 +27,13 @@ _LOCK_HOLDER_RE = re.compile(
     r"created by (?P<user>[^@]+)@(?P<host>\S+) \(pid (?P<pid>\d+)\) at (?P<at>\S+)"
 )
 
+# The per-resource change list rides on the Concourse *version*, which Concourse
+# persists per-resource in its database and carries through every later step. A
+# thousand-resource refactor would otherwise put a megabyte there. Cap what is
+# carried; ``changes_total`` keeps the honest count so the rendered body can say
+# how much it is not showing.
+MAX_CARRIED_CHANGES = 200
+
 
 @dataclass
 class StackUpdate:
@@ -41,6 +48,8 @@ class StackUpdate:
     result: str
     resource_changes: dict[str, int]
     duration_seconds: int | None = None
+    changes: list[dict[str, Any]] = field(default_factory=list)
+    changes_total: int = 0
 
     def to_flat_dict(self) -> dict[str, str]:
         """Flatten to strings, for a Concourse version or metadata payload."""
@@ -51,15 +60,26 @@ class StackUpdate:
         }
         if self.duration_seconds is not None:
             flat["duration_seconds"] = str(self.duration_seconds)
+        if self.changes:
+            flat["changes"] = json.dumps(self.changes)
+            flat["changes_total"] = str(self.changes_total)
         return flat
 
 
-def summarize_up_result(result: auto.UpResult) -> StackUpdate:
+def summarize_up_result(
+    result: auto.UpResult, changes: list[ResourcePreEvent] | None = None
+) -> StackUpdate:
     """Extract the resource summary from an UpResult.
 
     ``resource_changes`` is keyed by Pulumi's own op names (``create``, ``update``,
     ``delete``, ``replace``, ``same``).  Pulumi omits keys with a zero count rather
     than reporting them as 0, so absence means none of that op happened.
+
+    *changes* is the ResourcePreEvent stream collected during the update.  The
+    counts alone say a deploy touched five resources; only these say *which*
+    five and *what* about them changed -- which is what a human deciding whether
+    to promote actually needs.  ``UpResult`` does not carry them, so they have
+    to be captured via ``on_event`` while ``up`` runs.
     """
     summary = result.summary
     duration: int | None = None
@@ -68,6 +88,11 @@ def summarize_up_result(result: auto.UpResult) -> StackUpdate:
     # end_time is Optional; an update still in progress has none.
     if summary.start_time and summary.end_time:
         duration = int((summary.end_time - summary.start_time).total_seconds())
+    changed = [
+        serialize_resource_event(evt)
+        for evt in (changes or [])
+        if evt.metadata and evt.metadata.op != OpType.SAME
+    ]
     return StackUpdate(
         version=summary.version,
         result=summary.result,
@@ -75,7 +100,24 @@ def summarize_up_result(result: auto.UpResult) -> StackUpdate:
             k: int(v) for k, v in (summary.resource_changes or {}).items()
         },
         duration_seconds=duration,
+        changes=changed[:MAX_CARRIED_CHANGES],
+        changes_total=len(changed),
     )
+
+
+def _collect_resource_events() -> tuple[list[ResourcePreEvent], Callable[..., None]]:
+    """Return an event accumulator and the ``on_event`` callback that fills it.
+
+    Mirrors what ``_run_preview_on_stack`` does for previews, so an update
+    reports its per-resource detail the same way a preview already does.
+    """
+    events: list[ResourcePreEvent] = []
+
+    def on_event(event: EngineEvent) -> None:
+        if event.resource_pre_event and event.resource_pre_event.metadata:
+            events.append(event.resource_pre_event)
+
+    return events, on_event
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +210,11 @@ def create_stack(  # noqa: PLR0913
         _run_preview_on_stack(stack, preview_file)
         return _preview_stack_update()
 
-    result = _with_lock_recovery(lambda: stack.up(on_output=print), stack, stack_name)
-    return summarize_up_result(result)
+    events, on_event = _collect_resource_events()
+    result = _with_lock_recovery(
+        lambda: stack.up(on_output=print, on_event=on_event), stack, stack_name
+    )
+    return summarize_up_result(result, events)
 
 
 def _preview_stack_update() -> StackUpdate:
@@ -216,8 +261,11 @@ def update_stack(  # noqa: PLR0913
         _run_preview_on_stack(stack, preview_file)
         return _preview_stack_update()
 
-    result = _with_lock_recovery(lambda: stack.up(on_output=print), stack, stack_name)
-    return summarize_up_result(result)
+    events, on_event = _collect_resource_events()
+    result = _with_lock_recovery(
+        lambda: stack.up(on_output=print, on_event=on_event), stack, stack_name
+    )
+    return summarize_up_result(result, events)
 
 
 def destroy_stack(

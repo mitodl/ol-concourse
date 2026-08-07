@@ -40,6 +40,8 @@ def _stack_update(
     result: str = "succeeded",
     resource_changes: dict[str, int] | None = None,
     duration_seconds: int | None = 12,
+    changes: list[dict[str, Any]] | None = None,
+    changes_total: int | None = None,
 ) -> pulumi_utils.StackUpdate:
     return pulumi_utils.StackUpdate(
         version=version,
@@ -48,6 +50,8 @@ def _stack_update(
             {"same": 40, "update": 2} if resource_changes is None else resource_changes
         ),
         duration_seconds=duration_seconds,
+        changes=changes or [],
+        changes_total=len(changes or []) if changes_total is None else changes_total,
     )
 
 
@@ -969,3 +973,198 @@ class TestSummarizeUpResult:
         summary = pulumi_utils.summarize_up_result(result)
         assert summary.duration_seconds is None
         assert "duration_seconds" not in summary.to_flat_dict()
+
+
+def _event(
+    operation: str = "update",
+    name: str = "witan-vmcp",
+    resource_type: str = "keycloak:openid/client:Client",
+    diffs: list[str] | None = None,
+    detailed_diff: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "operation": operation,
+        "urn": f"urn:pulumi:CI::ol-substructure-keycloak::{resource_type}::{name}",
+        "type": resource_type,
+        "diffs": diffs if diffs is not None else [],
+        "detailed_diff": detailed_diff if detailed_diff is not None else {},
+    }
+
+
+class TestRenderedDiff:
+    """The gate issue must say *what* changed, not only how many things did.
+
+    `update: 1` is the same number whether a Keycloak client gained a
+    description or lost a redirect URI, and only one of those should be
+    promoted without a second look.
+    """
+
+    def _body(self, tmp_path: Path, **kw: Any) -> str:
+        update = _stack_update(**kw)
+        version = PulumiVersion(id="42", summary=json.dumps(update.to_flat_dict()))
+        _make_resource().download_version(
+            version,
+            tmp_path,
+            MagicMock(),
+            summary_file="deploy_summary.md",
+            read_outputs=False,
+        )
+        return (tmp_path / "deploy_summary.md").read_text()
+
+    def test_names_each_changed_resource_and_its_type(self, tmp_path: Path) -> None:
+        body = self._body(
+            tmp_path,
+            changes=[_event(operation="create", name="lakekeeper-api")],
+        )
+        assert "### What changed" in body
+        assert "`lakekeeper-api`" in body
+        assert "`keycloak:openid/client:Client`" in body
+
+    def test_detailed_diff_property_paths_are_shown(self, tmp_path: Path) -> None:
+        """The specific properties are the actual review material."""
+        body = self._body(
+            tmp_path,
+            changes=[
+                _event(
+                    detailed_diff={
+                        "validRedirectUris[1]": {
+                            "diff_kind": "delete",
+                            "input_diff": True,
+                        }
+                    }
+                )
+            ],
+        )
+        assert "`validRedirectUris[1]` (delete)" in body
+
+    def test_falls_back_to_coarse_diffs_when_no_detailed_diff(
+        self, tmp_path: Path
+    ) -> None:
+        """Not every provider supplies a detailed_diff; don't lose the field name."""
+        body = self._body(tmp_path, changes=[_event(diffs=["tags"], detailed_diff={})])
+        assert "`tags`" in body
+
+    def test_destructive_operations_are_listed_first(self, tmp_path: Path) -> None:
+        """A reviewer scanning the body should hit deletes before creates."""
+        body = self._body(
+            tmp_path,
+            changes=[
+                _event(operation="create", name="new-client"),
+                _event(operation="delete", name="legacy-admin"),
+                _event(operation="update", name="edited"),
+            ],
+        )
+        assert body.index("<b>delete</b>") < body.index("<b>create</b>")
+        assert body.index("<b>create</b>") < body.index("<b>update</b>")
+
+    def test_operations_are_grouped_with_counts(self, tmp_path: Path) -> None:
+        body = self._body(
+            tmp_path,
+            changes=[
+                _event(operation="update", name="a"),
+                _event(operation="update", name="b"),
+            ],
+        )
+        assert "<b>update</b> (2)" in body
+
+    def test_unanticipated_operation_is_still_rendered(self, tmp_path: Path) -> None:
+        """A new Pulumi op must not be silently dropped from the body."""
+        body = self._body(
+            tmp_path, changes=[_event(operation="import", name="adopted")]
+        )
+        assert "<b>import</b>" in body
+        assert "`adopted`" in body
+
+    def test_no_changes_section_when_there_are_no_changes(self, tmp_path: Path) -> None:
+        body = self._body(tmp_path, changes=[])
+        assert "### What changed" not in body
+        assert "Pulumi resource summary" in body
+
+    def test_long_change_list_is_capped_and_says_so(self, tmp_path: Path) -> None:
+        """Truncation must be visible.
+
+        A shortened list that reads as complete is exactly the failure this
+        feature exists to prevent, and a 65536-char issue body would fail the
+        put outright.
+        """
+        body = self._body(
+            tmp_path,
+            changes=[_event(name=f"client-{i}") for i in range(200)],
+            changes_total=250,
+        )
+        assert "Showing 200 of 250 changed resources" in body
+
+
+class TestChangeCaptureFromUp:
+    def test_same_resources_are_filtered_out(self) -> None:
+        """`same` is the bulk of any update and is noise in a review."""
+        result = MagicMock()
+        result.summary.version = 4
+        result.summary.result = "succeeded"
+        result.summary.resource_changes = {"update": 1, "same": 118}
+        result.summary.start_time = None
+        result.summary.end_time = None
+
+        changed = MagicMock()
+        changed.metadata.op = OpType.UPDATE
+        changed.metadata.urn = "urn:pulumi:CI::proj::aws:s3/bucket:Bucket::keep"
+        changed.metadata.type = "aws:s3/bucket:Bucket"
+        changed.metadata.diffs = ["tags"]
+        changed.metadata.detailed_diff = None
+
+        unchanged = MagicMock()
+        unchanged.metadata.op = OpType.SAME
+
+        stack_update = pulumi_utils.summarize_up_result(result, [changed, unchanged])
+
+        assert len(stack_update.changes) == 1
+        assert stack_update.changes[0]["operation"] == "update"
+        assert stack_update.changes[0]["urn"].endswith("::keep")
+
+    def test_collector_callback_accumulates_resource_events(self) -> None:
+        events, on_event = pulumi_utils._collect_resource_events()
+
+        with_resource = MagicMock()
+        with_resource.resource_pre_event.metadata = MagicMock()
+        without_resource = MagicMock()
+        without_resource.resource_pre_event = None
+
+        on_event(with_resource)
+        on_event(without_resource)
+
+        assert events == [with_resource.resource_pre_event]
+
+    def test_changes_absent_from_flat_dict_when_empty(self) -> None:
+        """Don't put an empty `changes` key on the version for nothing."""
+        assert "changes" not in _stack_update(changes=[]).to_flat_dict()
+
+    def test_carried_changes_are_capped_but_total_is_honest(self) -> None:
+        """The change list rides on the Concourse *version*, which is persisted.
+
+        Concourse stores versions per-resource in its database and carries them
+        through every later step, so an unbounded list would put megabytes there
+        on a large refactor. Cap what is carried, but keep the true count so the
+        rendered body can say how much it is not showing.
+        """
+        result = MagicMock()
+        result.summary.version = 4
+        result.summary.result = "succeeded"
+        result.summary.resource_changes = {"update": 500}
+        result.summary.start_time = None
+        result.summary.end_time = None
+
+        events = []
+        for i in range(500):
+            evt = MagicMock()
+            evt.metadata.op = OpType.UPDATE
+            evt.metadata.urn = f"urn:pulumi:CI::proj::aws:s3/bucket:Bucket::b{i}"
+            evt.metadata.type = "aws:s3/bucket:Bucket"
+            evt.metadata.diffs = []
+            evt.metadata.detailed_diff = None
+            events.append(evt)
+
+        stack_update = pulumi_utils.summarize_up_result(result, events)
+
+        assert len(stack_update.changes) == pulumi_utils.MAX_CARRIED_CHANGES
+        assert stack_update.changes_total == 500
+        assert json.loads(stack_update.to_flat_dict()["changes_total"]) == 500
