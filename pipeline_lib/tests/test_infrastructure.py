@@ -173,9 +173,15 @@ class TestRefreshStack:
 
 
 class TestPulumiJobAttempts:
-    """The Pulumi PutStep must set attempts=2 for automatic Concourse-level retry."""
+    """The Pulumi PutStep must NOT retry by default.
 
-    def test_pulumi_put_step_has_attempts_2(self):
+    A retried Pulumi put can report a green deploy for an update that failed --
+    ol-infrastructure's deploy-ol-substructure-keycloak build 158 -- and that
+    green fires the job's on_success, which posts the promotion-gate issue. One
+    Pulumi run, one verdict. See pulumi_job's pulumi_put_attempts docstring.
+    """
+
+    def test_pulumi_put_step_has_no_attempts_by_default(self):
         fragment = pulumi_jobs_chain(
             _make_pulumi_code(),
             stack_names=["CI"],
@@ -184,11 +190,28 @@ class TestPulumiJobAttempts:
             github_issue_repository="org/repo",
         )
         put = _get_pulumi_put_step(fragment)
-        assert put.attempts == 2, (
-            "Pulumi PutStep must set attempts=2 to allow one retry after worker loss"
+        assert put.attempts is None, (
+            "Pulumi PutStep must not retry by default -- a retry can turn a failed "
+            "update into a green promotion-gate signal"
         )
 
-    def test_all_stacks_in_chain_have_attempts_2(self):
+    def test_no_retry_wrapper_in_serialized_plan(self):
+        """attempts=None must drop the `retry` wrapper from the emitted plan.
+
+        attempts=1 would still serialize an `attempts: 1` key; None omits the
+        field entirely, which is what keeps `retry` out of the build plan.
+        """
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+        )
+        put = _get_pulumi_put_step(fragment)
+        assert "attempts" not in put.model_dump(exclude_none=True, by_alias=True)
+
+    def test_all_stacks_in_chain_have_no_attempts(self):
         fragment = pulumi_jobs_chain(
             _make_pulumi_code(),
             stack_names=["CI", "QA", "Production"],
@@ -198,4 +221,37 @@ class TestPulumiJobAttempts:
         )
         for i in range(len(fragment.jobs)):
             put = _get_pulumi_put_step(fragment, i)
-            assert put.attempts == 2, f"Job {i} Pulumi PutStep must set attempts=2"
+            assert put.attempts is None, f"Job {i} Pulumi PutStep must not retry"
+
+    def test_attempts_are_opt_in(self):
+        """A caller that knowingly wants the old behaviour can still ask for it."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI", "QA"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+            pulumi_put_attempts=2,
+        )
+        for i in range(len(fragment.jobs)):
+            assert _get_pulumi_put_step(fragment, i).attempts == 2
+
+    def test_gate_issue_stays_on_success_not_ensure(self):
+        """The promotion-gate issue must only post when the job actually passed.
+
+        Dropping the retry is only half the guarantee: if the gate put were ever
+        moved to `ensure`, it would post on failure too and the deploy signal
+        would be worthless again.
+        """
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI", "QA"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+        )
+        for job in fragment.jobs:
+            assert job.ensure is None, (
+                f"Job {job.name} must not post the gate on ensure"
+            )
+            assert job.on_success is not None, f"Job {job.name} lost its gate put"
