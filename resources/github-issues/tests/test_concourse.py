@@ -861,3 +861,85 @@ def test_merge_checklist_preserving_checked_preserves_trailing_newline():
 
     assert merged.endswith("\n")
     assert not merged.endswith("\n\n")
+
+
+class TestBodyFilesComposition:
+    """A promotion-gate body is assembled from more than one artifact.
+
+    A Concourse put emits no artifact of its own, so "what this deploy did" and
+    "what promoting it will do next" arrive via two separate implicit gets. The
+    issue body has to stitch them back together.
+    """
+
+    @staticmethod
+    def _resource() -> ConcourseGithubIssuesResource:
+        with patch("concourse.Github"):
+            return ConcourseGithubIssuesResource(
+                repository="test/repo",
+                access_token="dummy_token",
+                issue_prefix="[bot] ",
+            )
+
+    def test_files_are_joined_in_order(self, tmp_path):
+        """Order is meaningful: what happened, then what will happen."""
+        (tmp_path / "applied.md").write_text("## What this deploy did")
+        (tmp_path / "preview.md").write_text("## What promoting will do")
+
+        body = self._resource().get_issue_body_from_build(
+            mock_build_metadata(),
+            sources_dir=tmp_path,
+            body_files=["applied.md", "preview.md"],
+        )
+
+        assert body.index("What this deploy did") < body.index("What promoting will do")
+
+    def test_missing_file_is_reported_not_silently_skipped(self, tmp_path):
+        """The step that writes the preview may fail without failing the deploy.
+
+        Dropping the section silently would leave a body that reads as complete
+        while omitting the half a reviewer might be relying on.
+        """
+        (tmp_path / "applied.md").write_text("## What this deploy did")
+
+        body = self._resource().get_issue_body_from_build(
+            mock_build_metadata(),
+            sources_dir=tmp_path,
+            body_files=["applied.md", "preview.md"],
+        )
+
+        assert "What this deploy did" in body
+        assert "was not" in body
+        assert "preview.md" in body
+
+    def test_single_body_file_still_works(self, tmp_path):
+        (tmp_path / "only.md").write_text("just this")
+        body = self._resource().get_issue_body_from_build(
+            mock_build_metadata(), body_file="only.md", sources_dir=tmp_path
+        )
+        assert body == "just this"
+
+    def test_traversal_is_refused_for_every_file(self, tmp_path):
+        """The path check must apply to each entry, not just the first."""
+        (tmp_path / "ok.md").write_text("fine")
+        with pytest.raises(ValueError, match="within the workspace"):
+            self._resource().get_issue_body_from_build(
+                mock_build_metadata(),
+                sources_dir=tmp_path,
+                body_files=["ok.md", "../escape.md"],
+            )
+
+    def test_template_still_used_when_no_files_given(self, tmp_path):
+        body = self._resource().get_issue_body_from_build(mock_build_metadata())
+        assert "has completed build number" in body
+
+    def test_single_body_file_still_raises_when_missing(self, tmp_path):
+        """`body_file` is the whole body, not an optional fragment.
+
+        Tolerating a missing one would turn a typo'd path into a published gate
+        issue containing nothing but a warning. Only `body_files` entries are
+        allowed to be absent.
+        """
+        with pytest.raises(FileNotFoundError):
+            self._resource().get_issue_body_from_build(
+                mock_build_metadata(), body_file="typo.md", sources_dir=tmp_path
+            )

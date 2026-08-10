@@ -477,7 +477,9 @@ class TestPublishNewVersion:
                         {"change_summary": {"update": 1}, "changes": [], "stdout": ""}
                     )
                 )
-            return 0
+            return pulumi_utils._preview_stack_update(
+                {"change_summary": {"update": 1}, "changes": []}
+            )
 
         with patch("pulumi_utils.update_stack", side_effect=fake_update) as mock_update:
             _, metadata = resource.publish_new_version(
@@ -487,7 +489,8 @@ class TestPublishNewVersion:
         assert mock_update.call_args.kwargs["preview"] is True
         assert metadata["action"] == "update"
         assert "preview_file" in metadata
-        assert "changes" in metadata
+        assert metadata["result"] == "preview"
+        assert json.loads(metadata["resource_changes"]) == {"update": 1}
 
     def test_stack_config_forwarded_to_update_stack(self, tmp_path: Path) -> None:
         resource = _make_resource(stack_name="org.proj.dev", source_dir="infra")
@@ -1285,3 +1288,166 @@ class TestMaxCarriedChangesIsConfigurable:
             max_carried_changes="7",
         )
         assert resource.max_carried_changes == 7
+
+
+class TestNextEnvironmentPreview:
+    """The gate body's second half: what promoting will do to the next stack.
+
+    Additive to the applied diff, never a replacement — a preview of QA says
+    nothing about whether the CI deploy actually happened, which is the failure
+    (build 158) this whole feature exists to catch.
+    """
+
+    def _render(self, update: Any, tmp_path: Path, stack: str = "QA") -> str:
+        version = PulumiVersion(id="0", summary=json.dumps(update.to_flat_dict()))
+        _make_resource().download_version(
+            version,
+            tmp_path,
+            MagicMock(),
+            summary_file="preview.md",
+            read_outputs=False,
+            preview_stack=stack,
+        )
+        return (tmp_path / "preview.md").read_text()
+
+    def _preview(self, changes: list[dict[str, Any]], summary: dict[str, int]) -> Any:
+        return pulumi_utils._preview_stack_update(
+            {"change_summary": summary, "changes": changes}
+        )
+
+    def test_reads_as_a_prediction_not_a_record(self, tmp_path: Path) -> None:
+        """A gate can sit open for days; false confidence is worse than silence."""
+        body = self._render(self._preview([], {}), tmp_path=tmp_path)
+        assert "prediction, not a guarantee" in body
+
+    def test_names_the_target_stack(self, tmp_path: Path) -> None:
+        body = self._render(self._preview([], {}), tmp_path=tmp_path)
+        assert "`QA`" in body
+
+    def test_shows_drift_the_applied_diff_cannot(self, tmp_path: Path) -> None:
+        """The whole point: a QA-only resource the CI deploy never touched."""
+        drift = {
+            "operation": "delete",
+            "urn": "urn:pulumi:QA::proj::keycloak:index/role:Role::stale-qa-only-role",
+            "type": "keycloak:index/role:Role",
+            "diffs": [],
+            "detailed_diff": {},
+        }
+        body = self._render(self._preview([drift], {"delete": 1}), tmp_path=tmp_path)
+        assert "stale-qa-only-role" in body
+        assert "<b>delete</b>" in body
+
+    def test_no_changes_says_so_explicitly(self, tmp_path: Path) -> None:
+        body = self._render(self._preview([], {}), tmp_path=tmp_path)
+        assert "No changes" in body
+
+    def test_failed_preview_does_not_impugn_the_deploy(self, tmp_path: Path) -> None:
+        """The deploy already applied. The body must not imply it is suspect."""
+        failed = pulumi_utils.preview_failed("connection to sso-qa timed out")
+        body = self._render(failed, tmp_path=tmp_path)
+        assert "Could not preview" in body
+        assert "does not mean anything is wrong with what was just deployed" in body
+        assert "connection to sso-qa timed out" in body
+
+    def test_preview_carries_its_changes_on_the_version(self) -> None:
+        """Same transport as the applied diff -- the version, not metadata."""
+        update = self._preview(
+            [{"operation": "update", "urn": "urn:a::b::t::n", "type": "t"}],
+            {"update": 1},
+        )
+        flat = update.to_flat_dict()
+        assert flat["result"] == "preview"
+        assert json.loads(flat["changes"])[0]["urn"] == "urn:a::b::t::n"
+        assert update.version == 0, "a preview creates no stack version"
+
+    def test_preview_respects_the_carried_change_cap(self) -> None:
+        many = [
+            {"operation": "update", "urn": f"urn:a::b::t::n{i}", "type": "t"}
+            for i in range(50)
+        ]
+        update = pulumi_utils._preview_stack_update(
+            {"change_summary": {"update": 50}, "changes": many}, max_carried_changes=10
+        )
+        assert len(update.changes) == 10
+        assert update.changes_total == 50
+
+    def test_no_op_preview_reporting_only_same_says_no_changes(
+        self, tmp_path: Path
+    ) -> None:
+        """Pulumi reports a genuine no-op as {"same": N}, not an empty summary.
+
+        Counting `same` as material would leave the reader a table of zeros to
+        interpret instead of being told plainly there is nothing to do.
+        """
+        body = self._render(self._preview([], {"same": 118}), tmp_path=tmp_path)
+        assert "No changes" in body
+
+    def test_zero_valued_ops_do_not_count_as_material(self, tmp_path: Path) -> None:
+        body = self._render(
+            self._preview([], {"same": 118, "update": 0}), tmp_path=tmp_path
+        )
+        assert "No changes" in body
+
+    def test_real_changes_still_suppress_the_no_changes_message(
+        self, tmp_path: Path
+    ) -> None:
+        body = self._render(
+            self._preview([], {"same": 118, "update": 2}), tmp_path=tmp_path
+        )
+        assert "No changes" not in body
+
+
+class TestPreviewFailureTolerance:
+    """A gate preview runs AFTER the deploy applied. It must never report red.
+
+    This is the same hazard `read_outputs: false` exists to avoid: a failure on
+    the success path would say the deploy is broken when the infrastructure is
+    live and correct.
+    """
+
+    def test_fail_on_error_false_degrades_instead_of_raising(
+        self, tmp_path: Path
+    ) -> None:
+        resource = _make_resource(stack_name="org.proj.dev", source_dir="infra")
+        (tmp_path / "infra").mkdir()
+
+        with patch("pulumi_utils.update_stack", side_effect=RuntimeError("boom")):
+            version, metadata = resource.publish_new_version(
+                tmp_path,
+                MagicMock(),
+                action="update",
+                preview=True,
+                fail_on_error=False,
+            )
+
+        assert json.loads(version.summary)["result"] == "preview-failed"
+        assert "boom" in json.loads(version.summary)["error"]
+        assert metadata["result"] == "preview-failed"
+
+    def test_fail_on_error_true_still_raises(self, tmp_path: Path) -> None:
+        """A preview a pipeline genuinely gates on must still be able to fail."""
+        resource = _make_resource(stack_name="org.proj.dev", source_dir="infra")
+        (tmp_path / "infra").mkdir()
+
+        with (
+            patch("pulumi_utils.update_stack", side_effect=RuntimeError("boom")),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            resource.publish_new_version(
+                tmp_path, MagicMock(), action="update", preview=True
+            )
+
+    def test_a_real_update_is_unaffected_by_the_flag(self, tmp_path: Path) -> None:
+        """fail_on_error must not accidentally swallow a failed deploy."""
+        resource = _make_resource(stack_name="org.proj.dev", source_dir="infra")
+        (tmp_path / "infra").mkdir()
+
+        with (
+            patch(
+                "pulumi_utils.update_stack", side_effect=RuntimeError("real failure")
+            ),
+            pytest.raises(RuntimeError, match="real failure"),
+        ):
+            resource.publish_new_version(
+                tmp_path, MagicMock(), action="update", fail_on_error=False
+            )

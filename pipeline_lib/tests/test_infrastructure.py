@@ -4,7 +4,12 @@ from pathlib import Path
 
 
 from ol_concourse.lib.jobs.infrastructure import pulumi_jobs_chain
-from ol_concourse.lib.models.pipeline import Identifier, PutStep, Resource
+from ol_concourse.lib.models.pipeline import (
+    Identifier,
+    PutStep,
+    Resource,
+    TryStep,
+)
 
 
 def _make_pulumi_code(name: str = "my-repo") -> Resource:
@@ -275,9 +280,9 @@ class TestDeploySummaryInGateIssue:
         )
         for job in fragment.jobs:
             params = job.on_success.params or {}
-            assert (
-                params["body_file"] == "pulumi-ol-application-airbyte/deploy_summary.md"
-            )
+            assert params["body_files"] == [
+                "pulumi-ol-application-airbyte/deploy_summary.md"
+            ]
 
     def test_put_enables_implicit_get_to_produce_the_artifact(self):
         """A put produces no artifacts; only its implicit get does.
@@ -323,8 +328,8 @@ class TestDeploySummaryInGateIssue:
             github_issue_repository="org/repo",
         )
         put = _get_pulumi_put_step(fragment)
-        body_file = (fragment.jobs[0].on_success.params or {})["body_file"]
-        assert body_file.split("/")[0] == str(put.put)
+        body_files = (fragment.jobs[0].on_success.params or {})["body_files"]
+        assert body_files[0].split("/")[0] == str(put.put)
 
     def test_no_summary_wiring_when_issues_are_disabled(self):
         """Nothing to feed, so don't pay for the extra implicit get."""
@@ -403,3 +408,124 @@ class TestMaxCarriedChangesReachesThePipeline:
         )
         source = _pulumi_resource(fragment).source
         assert source["max_carried_changes"] == "((pulumi.max_carried_changes))"
+
+
+def _preview_try(fragment, job_index: int = 0):
+    """Return the TryStep wrapping the next-stack preview, or None if absent."""
+    for step in fragment.jobs[job_index].plan:
+        if isinstance(step, TryStep) and str(getattr(step.try_, "put", "")).endswith(
+            "-next-preview"
+        ):
+            return step
+    return None
+
+
+def _preview_put(fragment, job_index: int = 0):
+    """Return the next-stack preview PutStep, or None if absent."""
+    wrapper = _preview_try(fragment, job_index)
+    return wrapper.try_ if wrapper else None
+
+
+class TestPreviewNextStack:
+    """Opt-in preview of what promoting will apply to the next environment."""
+
+    def _chain(self, **kw):
+        return pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI", "QA", "Production"],
+            project_name="ol-substructure-keycloak",
+            project_source_path=Path("src/ol_infrastructure/substructure/keycloak"),
+            github_issue_repository="org/repo",
+            **kw,
+        )
+
+    def test_off_by_default(self):
+        """It runs real Pulumi against another environment -- never implicitly."""
+        fragment = self._chain()
+        for i in range(len(fragment.jobs)):
+            assert _preview_put(fragment, i) is None
+
+    def test_each_job_previews_the_following_stack(self):
+        fragment = self._chain(preview_next_stack=True)
+        assert _preview_put(fragment, 0).params["stack_name"] == "QA"
+        assert _preview_put(fragment, 1).params["stack_name"] == "Production"
+
+    def test_last_stack_has_no_preview(self):
+        """Production has no next environment; there is nothing to preview."""
+        fragment = self._chain(preview_next_stack=True)
+        assert _preview_put(fragment, 2) is None
+        body_files = (fragment.jobs[2].on_success.params or {})["body_files"]
+        assert len(body_files) == 1, (
+            "production gate should carry only the applied diff"
+        )
+
+    def test_preview_cannot_fail_the_deploy(self):
+        """The deploy has already applied by the time this runs."""
+        fragment = self._chain(preview_next_stack=True)
+        assert _preview_put(fragment, 0).params["fail_on_error"] is False
+
+    def test_preview_is_relabelled_onto_the_same_resource(self):
+        """Two puts to one resource name would collide on the implicit-get artifact.
+
+        `put` names the artifact, `resource` names what to run -- so the preview
+        gets its own artifact without needing a second resource definition.
+        """
+        fragment = self._chain(preview_next_stack=True)
+        main, preview = _get_pulumi_put_step(fragment), _preview_put(fragment)
+        assert preview.resource == str(main.put)
+        assert str(preview.put) != str(main.put)
+        provisioner_names = {
+            str(r.name) for r in fragment.resources if r.type == "pulumi-provisioner"
+        }
+        assert provisioner_names == {str(main.put)}, (
+            "the preview must not introduce a second provisioner resource"
+        )
+
+    def test_gate_body_composes_applied_diff_then_preview(self):
+        """Order matters: what happened, then what will happen."""
+        fragment = self._chain(preview_next_stack=True)
+        body_files = (fragment.jobs[0].on_success.params or {})["body_files"]
+        assert body_files == [
+            "pulumi-ol-substructure-keycloak/deploy_summary.md",
+            "pulumi-ol-substructure-keycloak-next-preview/deploy_summary.md",
+        ]
+
+    def test_preview_get_is_told_which_stack_it_previewed(self):
+        """The rendered body names the target, so the reviewer knows the scope."""
+        fragment = self._chain(preview_next_stack=True)
+        assert _preview_put(fragment, 0).get_params["preview_stack"] == "QA"
+
+    def test_preview_get_does_not_re_read_the_stack(self):
+        fragment = self._chain(preview_next_stack=True)
+        assert _preview_put(fragment, 0).get_params["read_outputs"] is False
+
+    def test_applied_diff_is_still_present_when_preview_is_on(self):
+        """Additive, not a replacement -- the fabricated-green evidence stays."""
+        fragment = self._chain(preview_next_stack=True)
+        main = _get_pulumi_put_step(fragment)
+        assert main.params.get("preview") is not True
+        assert (fragment.jobs[0].on_success.params or {})["body_files"][0].startswith(
+            str(main.put)
+        )
+
+    def test_preview_is_wrapped_in_try(self):
+        """`fail_on_error` alone is not enough to keep the deploy green.
+
+        It only catches exceptions raised INSIDE the resource script. A
+        Concourse-level failure -- container creation, image pull, worker loss,
+        or the implicit get -- happens outside it and would fail the job,
+        suppress the on_success gate, and report red on a deploy that already
+        applied. `try` is what makes the guarantee actually hold.
+        """
+        fragment = self._chain(preview_next_stack=True)
+        wrapper = _preview_try(fragment, 0)
+        assert wrapper is not None, "preview put must be wrapped in a try step"
+        assert str(wrapper.try_.put).endswith("-next-preview")
+
+    def test_main_deploy_put_is_not_wrapped_in_try(self):
+        """The deploy itself must still be able to fail the job."""
+        fragment = self._chain(preview_next_stack=True)
+        main = _get_pulumi_put_step(fragment)
+        assert any(
+            isinstance(step, PutStep) and step is main for step in fragment.jobs[0].plan
+        ), "the real deploy put must remain a bare plan step"

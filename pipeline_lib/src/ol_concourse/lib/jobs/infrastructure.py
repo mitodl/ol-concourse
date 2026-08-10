@@ -13,6 +13,7 @@ from ol_concourse.lib.models.pipeline import (
     PutStep,
     Resource,
     TaskStep,
+    TryStep,
 )
 from ol_concourse.lib.notifications import notification
 from ol_concourse.lib.resource_types import (
@@ -41,6 +42,39 @@ def _pulumi_put_step(fragment: PipelineFragment) -> PutStep:
             return step
     msg = "pulumi_job produced no pulumi-provisioner PutStep"
     raise ValueError(msg)
+
+
+def _next_stack_preview_step(pulumi_put: PutStep, next_stack: str) -> PutStep:
+    """Build the advisory `pulumi preview` of the next environment.
+
+    Re-labelled rather than given its own resource: ``put`` names the *artifact*
+    and ``resource`` names what to actually run, so this reuses the same
+    pulumi-provisioner while landing its implicit get under a distinct name.
+    Two puts to one resource name in a single job would otherwise collide on
+    that artifact.
+
+    ``fail_on_error: false`` is the load-bearing part. This runs after the
+    deploy has already applied, so a preview that cannot reach the next
+    environment must degrade to a note in the issue body -- never report red on
+    infrastructure that is live and correct.
+    """
+    return PutStep(
+        put=Identifier(f"{pulumi_put.put}-next-preview"),
+        resource=str(pulumi_put.put),
+        inputs="all",
+        no_get=False,
+        get_params={
+            "summary_file": DEPLOY_SUMMARY_FILENAME,
+            "read_outputs": False,
+            "preview_stack": next_stack,
+        },
+        params={
+            **(pulumi_put.params or {}),
+            "stack_name": next_stack,
+            "preview": True,
+            "fail_on_error": False,
+        },
+    )
 
 
 def _summary_artifact_path(pulumi_put: PutStep) -> str:
@@ -161,7 +195,7 @@ def packer_jobs(  # noqa: PLR0913
     )
 
 
-def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
+def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
     pulumi_code: Resource,
     stack_names: list[str],
     project_name: str,
@@ -179,6 +213,7 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
     refresh_stack: bool = True,
     pulumi_put_attempts: int | None = None,
     max_carried_changes: int | str | None = None,
+    preview_next_stack: bool = False,
 ) -> PipelineFragment:
     """Create a chained sequence of jobs for running Pulumi tasks.
 
@@ -211,6 +246,21 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
     :param max_carried_changes: How many per-resource changes the promotion-gate
         issue body lists.  ``0`` means no cap.  Omit for the resource's default
         (200).  See :func:`pulumi_job`.
+    :param preview_next_stack: When ``True``, each gate issue also carries a
+        ``pulumi preview`` of the NEXT stack in the chain -- what closing the
+        issue will actually apply.  Defaults to ``False``.
+
+        This is additive, not a replacement for the applied diff.  The applied
+        diff is evidence the deploy *happened*; a preview of the next
+        environment says nothing about that, and the last stack in a chain has
+        no next environment to preview.  What it adds is the one thing the
+        applied diff structurally cannot show: drift in the target environment,
+        which is precisely the surprise a promotion gate exists to catch.
+
+        Off by default because it is not free -- it runs a real ``pulumi
+        preview`` against the next environment on the success path of every
+        deploy, with the API load on that environment's control plane that
+        implies.  The preview is failure-tolerant and cannot fail the deploy.
     :type custom_dependencies: Dict[int, list[GetStep]]
 
     :returns: A `PipelineFragment` object that can be composed with other fragments to
@@ -339,12 +389,37 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912
                 # deploy -- where a failure would redden a deploy that worked.
                 "read_outputs": False,
             }
+            body_files = [_summary_artifact_path(pulumi_put)]
+
+            next_stack = (
+                stack_names[index + 1] if index + 1 < len(stack_names) else None
+            )
+            if preview_next_stack and next_stack:
+                preview_put = _next_stack_preview_step(pulumi_put, next_stack)
+                # Appended to the job's own plan rather than to on_success: the
+                # gate issue must read its artifact, and on_success is a single
+                # step.
+                #
+                # Wrapped in `try` because `fail_on_error` only covers exceptions
+                # raised INSIDE the resource script. A Concourse-level failure --
+                # container creation, image pull, worker loss, the implicit get --
+                # happens outside it, and would fail the job, suppress the
+                # on_success gate entirely, and report red on a deploy that has
+                # already applied. `try` is what makes "cannot fail the deploy"
+                # actually true. When it swallows a failure no artifact is
+                # produced, and the issue body's missing-fragment warning says so.
+                step_fragment.jobs[0].plan.append(TryStep(try_=preview_put))
+                body_files.append(_summary_artifact_path(preview_put))
+
             create_gh_issue = PutStep(
                 put=gh_issues_post.name,
                 params={
                     "labels": github_issue_labels or default_github_issue_labels,
                     "assignees": github_issue_assignees or [],
-                    "body_file": _summary_artifact_path(pulumi_put),
+                    # A single body_file would only ever be the applied diff.
+                    # body_files composes the applied diff and, when enabled, the
+                    # preview of what promoting will do to the next environment.
+                    "body_files": body_files,
                 },
             )
             chain_fragment.resources.append(gh_issues_post)
