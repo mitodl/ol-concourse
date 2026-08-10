@@ -691,9 +691,16 @@ class TestPreviewGatedRejectsUnsupportedInputs:
         with pytest.raises(ValueError, match="enable_github_issue_resource"):
             _gated_chain(enable_github_issue_resource=False)
 
-    def test_additional_post_steps_rejected_not_dropped(self):
-        with pytest.raises(ValueError, match="not yet supported"):
-            _gated_chain(additional_post_steps={0: [GetStep(get=Identifier("x"))]})
+    def test_every_index_keyed_parameter_is_now_honoured(self):
+        """Nothing left to reject — both index-keyed params are supported."""
+        fragment = _gated_chain(
+            custom_dependencies={1: [GetStep(get=Identifier("an-input"))]},
+            additional_post_steps={1: [PutStep(put=Identifier("a-post-step"))]},
+        )
+        deploy = _job(fragment, "deploy-ol-substructure-keycloak-qa")
+        assert any(
+            isinstance(s, PutStep) and str(s.put) == "a-post-step" for s in deploy.plan
+        )
 
 
 class TestPreviewGatedStageInputs:
@@ -781,3 +788,94 @@ class TestPreviewGatedStageInputs:
         dep = self._dep()
         _gated_chain(dependencies=[dep])
         assert dep.trigger is True
+
+
+class TestPreviewGatedSideEffects:
+    """Nothing that writes to the outside world may fire from a preview.
+
+    `k8s_apps` brackets its Pulumi run with a GitHub Deployment — `action:
+    start` in custom_dependencies, `action: finish` in additional_post_steps.
+    Running `start` from a preview would open a Deployment for a promotion
+    nobody has approved, leaving it `pending` until someone closes the gate, or
+    forever if they never do.
+    """
+
+    @staticmethod
+    def _chain():
+        return _gated_chain(
+            custom_dependencies={
+                1: [
+                    GetStep(get=Identifier("release-gate"), trigger=True),
+                    PutStep(
+                        put=Identifier("deployment-rc"), params={"action": "start"}
+                    ),
+                ]
+            },
+            additional_post_steps={
+                1: [
+                    PutStep(put=Identifier("fastly-purge"), no_get=True),
+                    PutStep(
+                        put=Identifier("deployment-rc"), params={"action": "finish"}
+                    ),
+                ]
+            },
+        )
+
+    @staticmethod
+    def _puts(job):
+        return [str(s.put) for s in job.plan if isinstance(s, PutStep)]
+
+    def test_preview_runs_no_side_effects(self):
+        preview = _job(self._chain(), "preview-ol-substructure-keycloak-qa")
+        assert self._puts(preview) == ["pulumi-ol-substructure-keycloak"]
+
+    def test_preview_still_gets_read_only_inputs(self):
+        preview = _job(self._chain(), "preview-ol-substructure-keycloak-qa")
+        gets = [str(s.get) for s in preview.plan if isinstance(s, GetStep)]
+        assert "release-gate" in gets
+
+    def test_deploy_brackets_the_apply_with_its_side_effects(self):
+        """Start → up → purge → finish, in that order."""
+        deploy = _job(self._chain(), "deploy-ol-substructure-keycloak-qa")
+        puts = self._puts(deploy)
+        assert puts == [
+            "deployment-rc",
+            "pulumi-ol-substructure-keycloak",
+            "fastly-purge",
+            "deployment-rc",
+        ]
+
+    def test_start_precedes_the_apply_and_finish_follows_it(self):
+        deploy = _job(self._chain(), "deploy-ol-substructure-keycloak-qa")
+        actions = [
+            (str(s.put), (s.params or {}).get("action"))
+            for s in deploy.plan
+            if isinstance(s, PutStep)
+        ]
+        apply_at = next(
+            i for i, (name, _) in enumerate(actions) if name.startswith("pulumi-")
+        )
+        start_at = next(i for i, (_, a) in enumerate(actions) if a == "start")
+        finish_at = next(i for i, (_, a) in enumerate(actions) if a == "finish")
+        assert start_at < apply_at < finish_at
+
+    def test_post_steps_never_reach_the_preview(self):
+        preview = _job(self._chain(), "preview-ol-substructure-keycloak-qa")
+        assert "fastly-purge" not in self._puts(preview)
+
+    def test_post_steps_are_scoped_to_their_own_stage(self):
+        fragment = self._chain()
+        prod = _job(fragment, "deploy-ol-substructure-keycloak-production")
+        assert "fastly-purge" not in self._puts(prod)
+
+    def test_exempt_stage_gets_its_side_effects_and_post_steps(self):
+        fragment = _gated_chain(
+            custom_dependencies={0: [PutStep(put=Identifier("ci-effect"))]},
+            additional_post_steps={0: [PutStep(put=Identifier("ci-post"))]},
+        )
+        puts = self._puts(_job(fragment, "deploy-ol-substructure-keycloak-ci"))
+        assert puts == [
+            "ci-effect",
+            "pulumi-ol-substructure-keycloak",
+            "ci-post",
+        ]

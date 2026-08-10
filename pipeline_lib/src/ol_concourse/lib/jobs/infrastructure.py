@@ -647,6 +647,32 @@ def _stage_inputs(deps: list[GetStep] | None, *, allow_trigger: bool) -> list[Ge
     return inputs
 
 
+def _split_stage_steps(
+    steps: list[Any],
+) -> tuple[list[GetStep], list[Any]]:
+    """Split a stage's steps into read-only inputs and side effects.
+
+    ★ A `GetStep` is an INPUT: it fetches an artifact, changes nothing outside
+    the build, and both the preview and the deploy need it because both run
+    Pulumi over the same tree.
+
+    ★ ANYTHING ELSE IS A SIDE EFFECT and belongs to the deploy alone. Despite
+    the `dict[int, list[GetStep]]` annotation, callers put `PutStep`s in
+    `custom_dependencies` -- k8s_apps opens a GitHub Deployment with
+    `action: start` there, pairing it with the `action: finish` in
+    `additional_post_steps`. Running that from a preview would open a
+    Deployment for a promotion nobody has approved yet, leaving it `pending`
+    until someone closes the gate, or forever if they never do.
+
+    A non-Get step that a preview genuinely needed would fail the preview and
+    so block the gate -- fail-closed and visible, rather than a silent unwanted
+    write. No current caller does that.
+    """
+    inputs = [step for step in steps if isinstance(step, GetStep)]
+    effects = [step for step in steps if not isinstance(step, GetStep)]
+    return inputs, effects
+
+
 def _stack_serial_group(project_name: str, stack_name: str) -> str:
     """Return the serial group shared by a stack's preview and deploy jobs.
 
@@ -663,16 +689,14 @@ def _dispatch_preview_gated(
     *,
     enable_github_issue_resource: bool,
     preview_next_stack: bool,
-    additional_post_steps: dict[int, list[GetStep | PutStep | TaskStep]] | None,
     github_issue_repository: str | None,
     **kwargs: Any,
 ) -> PipelineFragment:
     """Validate preview-gated inputs, then build.
 
-    Rejects the parameters this topology does not yet honour rather than
-    accepting and silently ignoring them -- a dropped `slack_url_path` or
-    `additional_post_steps` would be invisible until the thing it configured
-    failed to happen.
+    Rejects inputs this topology cannot honour rather than accepting and
+    silently ignoring them -- a dropped setting is invisible until the thing it
+    configured fails to happen.
     """
     if not enable_github_issue_resource:
         msg = (
@@ -687,18 +711,6 @@ def _dispatch_preview_gated(
         msg = (
             "preview_next_stack is redundant with topology='preview-gated' -- "
             "each stack already previews itself. Drop preview_next_stack."
-        )
-        raise ValueError(msg)
-    unsupported = [
-        name
-        for name, value in (("additional_post_steps", additional_post_steps),)
-        if value
-    ]
-    if unsupported:
-        msg = (
-            f"{', '.join(unsupported)} not yet supported by "
-            "topology='preview-gated' (they are keyed by chain index, which no "
-            "longer maps 1:1 to a job)"
         )
         raise ValueError(msg)
     return _preview_gated_chain(
@@ -717,6 +729,7 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
     github_issue_labels: list[str] | None = None,
     dependencies: list[GetStep] | None = None,
     custom_dependencies: dict[int, list[GetStep]] | None = None,
+    additional_post_steps: dict[int, list[GetStep | PutStep | TaskStep]] | None = None,
     additional_env_vars: dict[str, str] | None = None,
     env_vars_from_files: dict[str, str] | None = None,
     refresh_stack: bool = True,
@@ -838,10 +851,13 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
     previous_deploy: Job | None = None
     for index, stack_name in enumerate(stack_names):
         # Chain-wide dependencies plus this stage's index-keyed custom ones.
-        stage_inputs = [
-            *(dependencies or []),
-            *((custom_dependencies or {}).get(index) or []),
-        ]
+        stage_inputs, stage_effects = _split_stage_steps(
+            [
+                *(dependencies or []),
+                *((custom_dependencies or {}).get(index) or []),
+            ]
+        )
+        post_steps = list((additional_post_steps or {}).get(index) or [])
         slug = stack_name.lower().replace(".", "-")
         serial_group = _stack_serial_group(project_name, stack_name)
         passed_from = [previous_deploy.name] if previous_deploy else None
@@ -863,6 +879,7 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
                 plan=[
                     # Entry point for an exempt stage: triggers are wanted here.
                     *_stage_inputs(stage_inputs, allow_trigger=True),
+                    *stage_effects,
                     GetStep(get=pulumi_code.name, trigger=True, passed=passed_from),
                     PutStep(
                         inputs="all",
@@ -875,6 +892,7 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
                         },
                         params={**common_params, "stack_name": stack_name},
                     ),
+                    *post_steps,
                 ],
                 on_success=PutStep(
                     put=record_issue.name,
@@ -967,6 +985,10 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
                 # `passed` is the guarantee: only code that went through this
                 # stack's own preview is eligible to deploy to it.
                 GetStep(get=pulumi_code.name, trigger=False, passed=[preview.name]),
+                # Side effects run here, after the gate and before the apply --
+                # e.g. opening a GitHub Deployment with `action: start`, which
+                # must bracket the Pulumi run and must never fire off a preview.
+                *stage_effects,
                 PutStep(
                     inputs="all",
                     put=pulumi_resource.name,
@@ -977,6 +999,7 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
                     },
                     params={**common_params, "stack_name": stack_name},
                 ),
+                *post_steps,
             ],
             on_success=PutStep(
                 put=record_issue.name,
