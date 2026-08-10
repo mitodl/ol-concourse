@@ -13,6 +13,7 @@ from ol_concourse.lib.models.pipeline import (
     PutStep,
     Resource,
     TaskStep,
+    TryStep,
 )
 from ol_concourse.lib.notifications import notification
 from ol_concourse.lib.resource_types import (
@@ -396,9 +397,18 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
             if preview_next_stack and next_stack:
                 preview_put = _next_stack_preview_step(pulumi_put, next_stack)
                 # Appended to the job's own plan rather than to on_success: the
-                # gate issue is what must read its artifact, and on_success is a
-                # single step. The put cannot fail the job -- see fail_on_error.
-                step_fragment.jobs[0].plan.append(preview_put)
+                # gate issue must read its artifact, and on_success is a single
+                # step.
+                #
+                # Wrapped in `try` because `fail_on_error` only covers exceptions
+                # raised INSIDE the resource script. A Concourse-level failure --
+                # container creation, image pull, worker loss, the implicit get --
+                # happens outside it, and would fail the job, suppress the
+                # on_success gate entirely, and report red on a deploy that has
+                # already applied. `try` is what makes "cannot fail the deploy"
+                # actually true. When it swallows a failure no artifact is
+                # produced, and the issue body's missing-fragment warning says so.
+                step_fragment.jobs[0].plan.append(TryStep(try_=preview_put))
                 body_files.append(_summary_artifact_path(preview_put))
 
             create_gh_issue = PutStep(

@@ -1371,6 +1371,31 @@ class TestNextEnvironmentPreview:
         assert len(update.changes) == 10
         assert update.changes_total == 50
 
+    def test_no_op_preview_reporting_only_same_says_no_changes(
+        self, tmp_path: Path
+    ) -> None:
+        """Pulumi reports a genuine no-op as {"same": N}, not an empty summary.
+
+        Counting `same` as material would leave the reader a table of zeros to
+        interpret instead of being told plainly there is nothing to do.
+        """
+        body = self._render(self._preview([], {"same": 118}), tmp_path=tmp_path)
+        assert "No changes" in body
+
+    def test_zero_valued_ops_do_not_count_as_material(self, tmp_path: Path) -> None:
+        body = self._render(
+            self._preview([], {"same": 118, "update": 0}), tmp_path=tmp_path
+        )
+        assert "No changes" in body
+
+    def test_real_changes_still_suppress_the_no_changes_message(
+        self, tmp_path: Path
+    ) -> None:
+        body = self._render(
+            self._preview([], {"same": 118, "update": 2}), tmp_path=tmp_path
+        )
+        assert "No changes" not in body
+
 
 class TestPreviewFailureTolerance:
     """A gate preview runs AFTER the deploy applied. It must never report red.

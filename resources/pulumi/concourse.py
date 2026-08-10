@@ -371,6 +371,11 @@ def _apply_os_env(env_vars: dict[str, str]) -> None:
 # to the catch-all loop below so a new op type is never silently dropped.
 _NOTABLE_OPS = ("create", "update", "replace", "delete")
 
+# Ops that mean "nothing is being done to this resource". Pulumi reports a
+# genuine no-op preview as {"same": N}, not as an empty summary, so these have
+# to be discounted before asking whether a preview found anything worth reading.
+_NON_MATERIAL_OPS = frozenset({"same"})
+
 
 def _render_summary(
     version: PulumiVersion,
@@ -499,7 +504,11 @@ def _render_preview(
         "",
     ]
 
-    if not events and not changes:
+    # A no-op preview still reports {"same": N}, so `changes` alone is always
+    # truthy and would skip this branch -- leaving the reader a table of zeros to
+    # interpret instead of being told plainly that there is nothing to do.
+    material = {op: n for op, n in changes.items() if op not in _NON_MATERIAL_OPS and n}
+    if not events and not material:
         lines.extend(
             [
                 ":white_check_mark: No changes -- the next environment is already "

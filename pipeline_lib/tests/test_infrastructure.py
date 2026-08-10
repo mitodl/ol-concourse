@@ -4,7 +4,12 @@ from pathlib import Path
 
 
 from ol_concourse.lib.jobs.infrastructure import pulumi_jobs_chain
-from ol_concourse.lib.models.pipeline import Identifier, PutStep, Resource
+from ol_concourse.lib.models.pipeline import (
+    Identifier,
+    PutStep,
+    Resource,
+    TryStep,
+)
 
 
 def _make_pulumi_code(name: str = "my-repo") -> Resource:
@@ -405,12 +410,20 @@ class TestMaxCarriedChangesReachesThePipeline:
         assert source["max_carried_changes"] == "((pulumi.max_carried_changes))"
 
 
-def _preview_put(fragment, job_index: int = 0):
-    """Return the next-stack preview PutStep, or None if absent."""
+def _preview_try(fragment, job_index: int = 0):
+    """Return the TryStep wrapping the next-stack preview, or None if absent."""
     for step in fragment.jobs[job_index].plan:
-        if isinstance(step, PutStep) and str(step.put).endswith("-next-preview"):
+        if isinstance(step, TryStep) and str(getattr(step.try_, "put", "")).endswith(
+            "-next-preview"
+        ):
             return step
     return None
+
+
+def _preview_put(fragment, job_index: int = 0):
+    """Return the next-stack preview PutStep, or None if absent."""
+    wrapper = _preview_try(fragment, job_index)
+    return wrapper.try_ if wrapper else None
 
 
 class TestPreviewNextStack:
@@ -494,3 +507,25 @@ class TestPreviewNextStack:
         assert (fragment.jobs[0].on_success.params or {})["body_files"][0].startswith(
             str(main.put)
         )
+
+    def test_preview_is_wrapped_in_try(self):
+        """`fail_on_error` alone is not enough to keep the deploy green.
+
+        It only catches exceptions raised INSIDE the resource script. A
+        Concourse-level failure -- container creation, image pull, worker loss,
+        or the implicit get -- happens outside it and would fail the job,
+        suppress the on_success gate, and report red on a deploy that already
+        applied. `try` is what makes the guarantee actually hold.
+        """
+        fragment = self._chain(preview_next_stack=True)
+        wrapper = _preview_try(fragment, 0)
+        assert wrapper is not None, "preview put must be wrapped in a try step"
+        assert str(wrapper.try_.put).endswith("-next-preview")
+
+    def test_main_deploy_put_is_not_wrapped_in_try(self):
+        """The deploy itself must still be able to fail the job."""
+        fragment = self._chain(preview_next_stack=True)
+        main = _get_pulumi_put_step(fragment)
+        assert any(
+            isinstance(step, PutStep) and step is main for step in fragment.jobs[0].plan
+        ), "the real deploy put must remain a bare plan step"
