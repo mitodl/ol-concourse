@@ -3,7 +3,7 @@
 from collections.abc import Iterable
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ol_concourse.lib.models.fragment import PipelineFragment
 from ol_concourse.lib.models.pipeline import (
@@ -215,6 +215,8 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
     pulumi_put_attempts: int | None = None,
     max_carried_changes: int | str | None = None,
     preview_next_stack: bool = False,
+    topology: Literal["deploy-chained", "preview-gated"] = "deploy-chained",
+    auto_deploy_stages: list[str] | None = None,
 ) -> PipelineFragment:
     """Create a chained sequence of jobs for running Pulumi tasks.
 
@@ -271,6 +273,32 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
         msg = (
             "github_issue_repository is required when enable_github_issue_resource=True"
         )
+        raise ValueError(msg)
+
+    if topology == "preview-gated":
+        return _dispatch_preview_gated(
+            pulumi_code=pulumi_code,
+            stack_names=stack_names,
+            project_name=project_name,
+            project_source_path=project_source_path,
+            github_issue_repository=github_issue_repository,
+            auto_deploy_stages=auto_deploy_stages,
+            github_issue_assignees=github_issue_assignees,
+            github_issue_labels=github_issue_labels,
+            dependencies=dependencies,
+            additional_env_vars=additional_env_vars,
+            env_vars_from_files=env_vars_from_files,
+            refresh_stack=refresh_stack,
+            pulumi_put_attempts=pulumi_put_attempts,
+            max_carried_changes=max_carried_changes,
+            slack_url_path=slack_url_path,
+            enable_github_issue_resource=enable_github_issue_resource,
+            preview_next_stack=preview_next_stack,
+            custom_dependencies=custom_dependencies,
+            additional_post_steps=additional_post_steps,
+        )
+    if auto_deploy_stages is not None:
+        msg = "auto_deploy_stages only applies to topology='preview-gated'"
         raise ValueError(msg)
 
     chain_fragment = PipelineFragment(resource_types=[github_issues_resource()])
@@ -607,7 +635,58 @@ def _stack_serial_group(project_name: str, stack_name: str) -> str:
     return f"{project_name}-{stack_name}".lower().replace(".", "-")
 
 
-def pulumi_preview_gate_chain(  # noqa: PLR0913
+def _dispatch_preview_gated(
+    *,
+    enable_github_issue_resource: bool,
+    preview_next_stack: bool,
+    custom_dependencies: dict[int, list[GetStep]] | None,
+    additional_post_steps: dict[int, list[GetStep | PutStep | TaskStep]] | None,
+    github_issue_repository: str | None,
+    **kwargs: Any,
+) -> PipelineFragment:
+    """Validate preview-gated inputs, then build.
+
+    Rejects the parameters this topology does not yet honour rather than
+    accepting and silently ignoring them -- a dropped `slack_url_path` or
+    `additional_post_steps` would be invisible until the thing it configured
+    failed to happen.
+    """
+    if not enable_github_issue_resource:
+        msg = (
+            "topology='preview-gated' requires enable_github_issue_resource=True: "
+            "the gate issue is what triggers each deploy"
+        )
+        raise ValueError(msg)
+    if github_issue_repository is None:
+        msg = "github_issue_repository is required for topology='preview-gated'"
+        raise ValueError(msg)
+    if preview_next_stack:
+        msg = (
+            "preview_next_stack is redundant with topology='preview-gated' -- "
+            "each stack already previews itself. Drop preview_next_stack."
+        )
+        raise ValueError(msg)
+    unsupported = [
+        name
+        for name, value in (
+            ("custom_dependencies", custom_dependencies),
+            ("additional_post_steps", additional_post_steps),
+        )
+        if value
+    ]
+    if unsupported:
+        msg = (
+            f"{', '.join(unsupported)} not yet supported by "
+            "topology='preview-gated' (they are keyed by chain index, which no "
+            "longer maps 1:1 to a job)"
+        )
+        raise ValueError(msg)
+    return _preview_gated_chain(
+        github_issue_repository=github_issue_repository, **kwargs
+    )
+
+
+def _preview_gated_chain(  # noqa: PLR0913
     pulumi_code: Resource,
     stack_names: list[str],
     project_name: str,
@@ -615,11 +694,16 @@ def pulumi_preview_gate_chain(  # noqa: PLR0913
     github_issue_repository: str,
     auto_deploy_stages: list[str] | None = None,
     github_issue_assignees: list[str] | None = None,
+    github_issue_labels: list[str] | None = None,
+    dependencies: list[GetStep] | None = None,
     additional_env_vars: dict[str, str] | None = None,
     env_vars_from_files: dict[str, str] | None = None,
     refresh_stack: bool = True,
+    pulumi_put_attempts: int | None = None,
+    max_carried_changes: int | str | None = None,
+    slack_url_path: str | None = None,
 ) -> PipelineFragment:
-    """PROTOTYPE: gate each stack on a preview OF ITSELF, not of the next stack.
+    """Build the ``preview-gated`` topology: gate each stack on a preview OF ITSELF.
 
     Every gated stack becomes two jobs:
 
@@ -672,8 +756,19 @@ def pulumi_preview_gate_chain(  # noqa: PLR0913
         name=Identifier(f"pulumi-{project_name}"),
         project_name=project_name,
         project_path=f"{pulumi_code.name}/{project_source_path}",
+        max_carried_changes=max_carried_changes,
     )
     chain.resources.append(pulumi_resource)
+
+    if slack_url_path:
+        slack_resource = slack_notification(
+            name=Identifier(f"slack-alert-{project_name}"),
+            url=f"(({slack_url_path}))",
+        )
+        chain.resources.append(slack_resource)
+        chain.resource_types.append(slack_notification_resource())
+    else:
+        slack_resource = None
 
     common_params: dict[str, Any] = {
         "env_os": {
@@ -684,6 +779,40 @@ def pulumi_preview_gate_chain(  # noqa: PLR0913
         "env_vars_from_files": env_vars_from_files or {},
         **({"refresh_stack": False} if not refresh_stack else {}),
     }
+
+    def _labels(stack: str) -> list[str]:
+        if github_issue_labels is not None:
+            return github_issue_labels
+        base = ["product:infrastructure", "DevOps", "pipeline-workflow"]
+        lowered = stack.lower()
+        if lowered.endswith("ci"):
+            base.append("promotion-to-qa")
+        elif lowered.endswith("qa"):
+            base.append("promotion-to-production")
+        elif lowered.endswith("production"):
+            base.append("finalized-deployment")
+        return base
+
+    def _alerts(job: Job, stack: str, kind: str) -> None:
+        """Attach Slack failure/error/abort hooks, matching pulumi_job."""
+        if not slack_resource:
+            return
+        body = (
+            f"Pulumi {kind} {project_name} {stack} encountered a problem."
+            " Check the pipeline for details."
+        )
+        job.on_failure = notification(
+            resource=slack_resource,
+            title=f"Pulumi {kind} {project_name} {stack} failed",
+            body=body,
+            alert_type="failed",
+        )
+        job.on_error = notification(
+            resource=slack_resource,
+            title=f"Pulumi {kind} {project_name} {stack} errored",
+            body=body,
+            alert_type="errored",
+        )
 
     previous_deploy: Job | None = None
     for stack_name in stack_names:
@@ -722,12 +851,14 @@ def pulumi_preview_gate_chain(  # noqa: PLR0913
                     put=record_issue.name,
                     params={
                         "assignees": github_issue_assignees or [],
+                        "labels": _labels(stack_name),
                         "body_files": [
                             f"{pulumi_resource.name}/{DEPLOY_SUMMARY_FILENAME}"
                         ],
                     },
                 ),
             )
+            _alerts(deploy, stack_name, "deploy")
             chain.jobs.append(deploy)
             previous_deploy = deploy
             continue
@@ -763,10 +894,12 @@ def pulumi_preview_gate_chain(  # noqa: PLR0913
             name=Identifier(f"preview-{project_name}-{slug}"),
             serial_groups=[Identifier(serial_group)],
             plan=[
+                *[d.model_copy() for d in (dependencies or [])],
                 GetStep(get=pulumi_code.name, trigger=True, passed=passed_from),
                 PutStep(
                     inputs="all",
                     put=pulumi_resource.name,
+                    attempts=pulumi_put_attempts,
                     no_get=False,
                     get_params={
                         "summary_file": PREVIEW_SUMMARY_FILENAME,
@@ -784,17 +917,20 @@ def pulumi_preview_gate_chain(  # noqa: PLR0913
                 put=gate_post.name,
                 params={
                     "assignees": github_issue_assignees or [],
+                    "labels": _labels(stack_name),
                     "body_files": [
                         f"{pulumi_resource.name}/{PREVIEW_SUMMARY_FILENAME}"
                     ],
                 },
             ),
         )
+        _alerts(preview, stack_name, "preview")
 
         deploy = Job(
             name=Identifier(f"deploy-{project_name}-{slug}"),
             serial_groups=[Identifier(serial_group)],
             plan=[
+                *[d.model_copy() for d in (dependencies or [])],
                 GetStep(get=gate_trigger.name, trigger=True),
                 # `passed` is the guarantee: only code that went through this
                 # stack's own preview is eligible to deploy to it.
@@ -818,6 +954,8 @@ def pulumi_preview_gate_chain(  # noqa: PLR0913
                 },
             ),
         )
+
+        _alerts(deploy, stack_name, "deploy")
 
         chain.jobs.extend([preview, deploy])
         previous_deploy = deploy
