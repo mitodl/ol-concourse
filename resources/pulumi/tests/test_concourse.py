@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pulumi import automation as auto
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -31,6 +33,35 @@ from pulumi_concourse import (
 # ---------------------------------------------------------------------------
 # Helpers / factories
 # ---------------------------------------------------------------------------
+
+
+def _stack_update(
+    version: int = 5,
+    result: str = "succeeded",
+    resource_changes: dict[str, int] | None = None,
+    duration_seconds: int | None = 12,
+    changes: list[dict[str, Any]] | None = None,
+    changes_total: int | None = None,
+) -> pulumi_utils.StackUpdate:
+    return pulumi_utils.StackUpdate(
+        version=version,
+        result=result,
+        resource_changes=(
+            {"same": 40, "update": 2} if resource_changes is None else resource_changes
+        ),
+        duration_seconds=duration_seconds,
+        changes=changes or [],
+        changes_total=len(changes or []) if changes_total is None else changes_total,
+    )
+
+
+def _make_resource_with_cap(cap: int) -> PulumiResource:
+    return PulumiResource(
+        stack_name="org.proj.dev",
+        project_name="my-project",
+        source_dir="infra",
+        max_carried_changes=cap,
+    )
 
 
 def _make_resource(
@@ -354,7 +385,9 @@ class TestPublishNewVersion:
         build_metadata = MagicMock()
 
         with (
-            patch("pulumi_utils.create_stack", return_value=1) as mock_create,
+            patch(
+                "pulumi_utils.create_stack", return_value=_stack_update(1)
+            ) as mock_create,
             patch("pulumi_utils.update_stack") as mock_update,
         ):
             resource.publish_new_version(tmp_path, build_metadata, action="create")
@@ -370,7 +403,9 @@ class TestPublishNewVersion:
         build_metadata = MagicMock()
 
         with (
-            patch("pulumi_utils.update_stack", return_value=5) as mock_update,
+            patch(
+                "pulumi_utils.update_stack", return_value=_stack_update(5)
+            ) as mock_update,
             patch("pulumi_utils.create_stack") as mock_create,
         ):
             resource.publish_new_version(tmp_path, build_metadata, action="update")
@@ -384,7 +419,9 @@ class TestPublishNewVersion:
         (tmp_path / "infra").mkdir()
         build_metadata = MagicMock()
 
-        with patch("pulumi_utils.update_stack", return_value=5) as mock_update:
+        with patch(
+            "pulumi_utils.update_stack", return_value=_stack_update(5)
+        ) as mock_update:
             resource.publish_new_version(
                 tmp_path, build_metadata, action="update", refresh_stack=False
             )
@@ -457,7 +494,9 @@ class TestPublishNewVersion:
         (tmp_path / "infra").mkdir()
         build_metadata = MagicMock()
 
-        with patch("pulumi_utils.update_stack", return_value=5) as mock_update:
+        with patch(
+            "pulumi_utils.update_stack", return_value=_stack_update(5)
+        ) as mock_update:
             resource.publish_new_version(
                 tmp_path,
                 build_metadata,
@@ -482,7 +521,7 @@ class TestPublishNewVersion:
         passphrase_file.write_text("super-secret\n")
         build_metadata = MagicMock()
 
-        with patch("pulumi_utils.update_stack", return_value=5):
+        with patch("pulumi_utils.update_stack", return_value=_stack_update(5)):
             resource.publish_new_version(
                 tmp_path,
                 build_metadata,
@@ -497,19 +536,20 @@ class TestPublishNewVersion:
         (tmp_path / "infra").mkdir()
         build_metadata = MagicMock()
 
-        with patch("pulumi_utils.update_stack", return_value=5):
+        with patch("pulumi_utils.update_stack", return_value=_stack_update(5)):
             version, _ = resource.publish_new_version(
                 tmp_path, build_metadata, action="update"
             )
 
-        assert version == PulumiVersion(id="5")
+        assert version.id == "5"
+        assert json.loads(version.summary)["version"] == "5"
 
     def test_metadata_includes_action_and_stack(self, tmp_path: Path) -> None:
         resource = _make_resource(stack_name="org.proj.dev", source_dir="infra")
         (tmp_path / "infra").mkdir()
         build_metadata = MagicMock()
 
-        with patch("pulumi_utils.update_stack", return_value=5):
+        with patch("pulumi_utils.update_stack", return_value=_stack_update(5)):
             _, metadata = resource.publish_new_version(
                 tmp_path, build_metadata, action="update"
             )
@@ -722,3 +762,526 @@ class TestRunPreviewOnStack:
         assert "changes" in payload
         assert "stdout" in payload
         assert not list(tmp_path.iterdir())
+
+
+class TestDeploySummary:
+    """The deploy summary is what makes a promotion gate judgeable on evidence.
+
+    Closing the `[bot] Pulumi <project> <stack> deployed.` issue promotes the
+    change to the next environment, and until now that issue carried only a
+    title -- so the human closing it was trusting the job's colour. These pin
+    the summary's trip from the Pulumi run to the issue body.
+    """
+
+    def test_publish_carries_summary_on_the_version(self, tmp_path: Path) -> None:
+        """The put's version carries the summary; metadata alone cannot.
+
+        Concourse metadata is only ever displayed in its own UI. Riding on the
+        version is what lets the implicit get hand the summary to a later step.
+        """
+        resource = _make_resource(stack_name="org.proj.dev", source_dir="infra")
+        (tmp_path / "infra").mkdir()
+
+        with patch(
+            "pulumi_utils.update_stack",
+            return_value=_stack_update(9, resource_changes={"update": 2, "same": 40}),
+        ):
+            version, metadata = resource.publish_new_version(
+                tmp_path, MagicMock(), action="update"
+            )
+
+        summary = json.loads(version.summary)
+        assert summary["version"] == "9"
+        assert summary["result"] == "succeeded"
+        assert json.loads(summary["resource_changes"]) == {"update": 2, "same": 40}
+        # ...and in metadata too, so it is visible in the Concourse UI as well.
+        assert metadata["result"] == "succeeded"
+        assert json.loads(metadata["resource_changes"]) == {"update": 2, "same": 40}
+
+    def test_get_writes_summary_file_without_reading_the_stack(
+        self, tmp_path: Path
+    ) -> None:
+        """read_outputs=False must not invoke Pulumi.
+
+        This get runs on the success path of every deploy. A stack read here
+        would be a second Pulumi invocation whose failure would redden a deploy
+        that actually worked.
+        """
+        resource = _make_resource()
+        version = PulumiVersion(
+            id="9", summary=json.dumps(_stack_update(9).to_flat_dict())
+        )
+
+        with patch("pulumi_utils.read_stack") as mock_read:
+            _, metadata = resource.download_version(
+                version,
+                tmp_path,
+                MagicMock(),
+                summary_file="deploy_summary.md",
+                read_outputs=False,
+            )
+
+        mock_read.assert_not_called()
+        body = (tmp_path / "deploy_summary.md").read_text()
+        assert "Pulumi resource summary" in body
+        assert "| update | 2 |" in body
+        assert "| same | 40 |" in body
+        assert metadata["summary_file"].endswith("deploy_summary.md")
+
+    def test_zero_count_ops_are_reported_as_zero(self, tmp_path: Path) -> None:
+        """Pulumi omits zero-count ops, so absence must render as 0, not vanish."""
+        resource = _make_resource()
+        version = PulumiVersion(
+            id="9",
+            summary=json.dumps(
+                _stack_update(9, resource_changes={"same": 40}).to_flat_dict()
+            ),
+        )
+
+        resource.download_version(
+            version,
+            tmp_path,
+            MagicMock(),
+            summary_file="deploy_summary.md",
+            read_outputs=False,
+        )
+
+        body = (tmp_path / "deploy_summary.md").read_text()
+        for op in ("create", "update", "replace", "delete"):
+            assert f"| {op} | 0 |" in body
+
+    def test_missing_summary_renders_a_do_not_promote_warning(
+        self, tmp_path: Path
+    ) -> None:
+        """A green job with no summary is build 158's shape -- it must scream.
+
+        deploy-ol-substructure-keycloak build 158 reported success having run no
+        Pulumi at all. A body that merely omitted the counts would read as
+        "nothing to report"; it has to read as "do not trust this".
+        """
+        resource = _make_resource()
+
+        resource.download_version(
+            PulumiVersion(id="0"),
+            tmp_path,
+            MagicMock(),
+            summary_file="deploy_summary.md",
+            read_outputs=False,
+        )
+
+        body = (tmp_path / "deploy_summary.md").read_text()
+        assert "No Pulumi resource summary was recorded" in body
+        assert "Do not close this issue" in body
+
+    def test_errored_update_says_do_not_promote(self, tmp_path: Path) -> None:
+        """The exact case build 158 hid: `2 errored` must be visible in the body."""
+        resource = _make_resource()
+        version = PulumiVersion(
+            id="0",
+            summary=json.dumps(
+                _stack_update(
+                    0, result="failed", resource_changes={"errored": 2}
+                ).to_flat_dict()
+            ),
+        )
+
+        resource.download_version(
+            version,
+            tmp_path,
+            MagicMock(),
+            summary_file="deploy_summary.md",
+            read_outputs=False,
+        )
+
+        body = (tmp_path / "deploy_summary.md").read_text()
+        assert "| errored | 2 |" in body
+        assert "Do not promote it." in body
+
+    def test_normal_get_still_reads_outputs(self, tmp_path: Path) -> None:
+        """The default get is unchanged -- it exists to fetch stack outputs."""
+        resource = _make_resource(stack_name="org.proj.dev", source_dir="infra")
+
+        with patch("pulumi_utils.read_stack", return_value={"key": "value"}) as mock:
+            _, metadata = resource.download_version(
+                PulumiVersion(id="9"), tmp_path, MagicMock()
+            )
+
+        mock.assert_called_once()
+        assert metadata["outputs_file"].endswith("org.proj.dev_outputs.json")
+
+
+class TestSummarizeUpResult:
+    """`UpdateSummary.start_time`/`end_time` are datetimes, NOT strings.
+
+    The automation API parses the wire format's RFC 3339 timestamps before we
+    see them (`start_time: datetime`, `end_time: Optional[datetime]` in
+    pulumi 3.253's `UpdateSummary.__init__`). Feeding these tests strings would
+    let a string-parsing implementation pass here and then raise TypeError in
+    production on the success path of every deploy -- after `pulumi up` has
+    already applied. Keep them as real datetimes.
+    """
+
+    def test_duration_computed_from_start_and_end(self) -> None:
+        result = MagicMock()
+        result.summary.version = 4
+        result.summary.result = "succeeded"
+        result.summary.resource_changes = {"create": 1}
+        result.summary.start_time = datetime(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+        result.summary.end_time = datetime(2020, 1, 1, 0, 2, 30, tzinfo=UTC)
+
+        assert pulumi_utils.summarize_up_result(result).duration_seconds == 150
+
+    def test_real_pulumi_update_summary_type_is_accepted(self) -> None:
+        """Pin against the actual SDK class, not a MagicMock of it.
+
+        A MagicMock accepts any attribute type, so it cannot catch the
+        wrong-type assumption on its own -- constructing the genuine
+        UpdateSummary is what makes this test load-bearing.
+        """
+        summary = auto.UpdateSummary(
+            kind="update",
+            start_time=datetime(2026, 8, 6, 22, 0, 0, tzinfo=UTC),
+            message="",
+            environment={},
+            config={},
+            result="succeeded",
+            end_time=datetime(2026, 8, 6, 22, 1, 34, tzinfo=UTC),
+            version=42,
+            resource_changes={"update": 3, "same": 118},
+        )
+        result = MagicMock()
+        result.summary = summary
+
+        stack_update = pulumi_utils.summarize_up_result(result)
+        assert stack_update.duration_seconds == 94
+        assert stack_update.version == 42
+        assert stack_update.result == "succeeded"
+        assert stack_update.resource_changes == {"update": 3, "same": 118}
+
+    def test_missing_end_time_leaves_duration_unset(self) -> None:
+        """end_time is Optional -- an update still in progress has none."""
+        result = MagicMock()
+        result.summary.version = 4
+        result.summary.result = "succeeded"
+        result.summary.resource_changes = {"create": 1}
+        result.summary.start_time = datetime(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+        result.summary.end_time = None
+
+        summary = pulumi_utils.summarize_up_result(result)
+        assert summary.duration_seconds is None
+        assert "duration_seconds" not in summary.to_flat_dict()
+
+    def test_missing_timestamps_leave_duration_unset(self) -> None:
+        result = MagicMock()
+        result.summary.version = 4
+        result.summary.result = "succeeded"
+        result.summary.resource_changes = {"create": 1}
+        result.summary.start_time = None
+        result.summary.end_time = None
+
+        summary = pulumi_utils.summarize_up_result(result)
+        assert summary.duration_seconds is None
+        assert "duration_seconds" not in summary.to_flat_dict()
+
+
+def _event(
+    operation: str = "update",
+    name: str = "witan-vmcp",
+    resource_type: str = "keycloak:openid/client:Client",
+    diffs: list[str] | None = None,
+    detailed_diff: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "operation": operation,
+        "urn": f"urn:pulumi:CI::ol-substructure-keycloak::{resource_type}::{name}",
+        "type": resource_type,
+        "diffs": diffs if diffs is not None else [],
+        "detailed_diff": detailed_diff if detailed_diff is not None else {},
+    }
+
+
+class TestRenderedDiff:
+    """The gate issue must say *what* changed, not only how many things did.
+
+    `update: 1` is the same number whether a Keycloak client gained a
+    description or lost a redirect URI, and only one of those should be
+    promoted without a second look.
+    """
+
+    def _body(self, tmp_path: Path, **kw: Any) -> str:
+        update = _stack_update(**kw)
+        version = PulumiVersion(id="42", summary=json.dumps(update.to_flat_dict()))
+        _make_resource().download_version(
+            version,
+            tmp_path,
+            MagicMock(),
+            summary_file="deploy_summary.md",
+            read_outputs=False,
+        )
+        return (tmp_path / "deploy_summary.md").read_text()
+
+    def test_names_each_changed_resource_and_its_type(self, tmp_path: Path) -> None:
+        body = self._body(
+            tmp_path,
+            changes=[_event(operation="create", name="lakekeeper-api")],
+        )
+        assert "### What changed" in body
+        assert "`lakekeeper-api`" in body
+        assert "`keycloak:openid/client:Client`" in body
+
+    def test_detailed_diff_property_paths_are_shown(self, tmp_path: Path) -> None:
+        """The specific properties are the actual review material."""
+        body = self._body(
+            tmp_path,
+            changes=[
+                _event(
+                    detailed_diff={
+                        "validRedirectUris[1]": {
+                            "diff_kind": "delete",
+                            "input_diff": True,
+                        }
+                    }
+                )
+            ],
+        )
+        assert "`validRedirectUris[1]` (delete)" in body
+
+    def test_falls_back_to_coarse_diffs_when_no_detailed_diff(
+        self, tmp_path: Path
+    ) -> None:
+        """Not every provider supplies a detailed_diff; don't lose the field name."""
+        body = self._body(tmp_path, changes=[_event(diffs=["tags"], detailed_diff={})])
+        assert "`tags`" in body
+
+    def test_destructive_operations_are_listed_first(self, tmp_path: Path) -> None:
+        """A reviewer scanning the body should hit deletes before creates."""
+        body = self._body(
+            tmp_path,
+            changes=[
+                _event(operation="create", name="new-client"),
+                _event(operation="delete", name="legacy-admin"),
+                _event(operation="update", name="edited"),
+            ],
+        )
+        assert body.index("<b>delete</b>") < body.index("<b>create</b>")
+        assert body.index("<b>create</b>") < body.index("<b>update</b>")
+
+    def test_operations_are_grouped_with_counts(self, tmp_path: Path) -> None:
+        body = self._body(
+            tmp_path,
+            changes=[
+                _event(operation="update", name="a"),
+                _event(operation="update", name="b"),
+            ],
+        )
+        assert "<b>update</b> (2)" in body
+
+    def test_unanticipated_operation_is_still_rendered(self, tmp_path: Path) -> None:
+        """A new Pulumi op must not be silently dropped from the body."""
+        body = self._body(
+            tmp_path, changes=[_event(operation="import", name="adopted")]
+        )
+        assert "<b>import</b>" in body
+        assert "`adopted`" in body
+
+    def test_no_changes_section_when_there_are_no_changes(self, tmp_path: Path) -> None:
+        body = self._body(tmp_path, changes=[])
+        assert "### What changed" not in body
+        assert "Pulumi resource summary" in body
+
+    def test_long_change_list_is_capped_and_says_so(self, tmp_path: Path) -> None:
+        """Truncation must be visible.
+
+        A shortened list that reads as complete is exactly the failure this
+        feature exists to prevent, and a 65536-char issue body would fail the
+        put outright.
+        """
+        body = self._body(
+            tmp_path,
+            changes=[_event(name=f"client-{i}") for i in range(200)],
+            changes_total=250,
+        )
+        assert "Showing 200 of 250 changed resources" in body
+
+
+class TestChangeCaptureFromUp:
+    def test_same_resources_are_filtered_out(self) -> None:
+        """`same` is the bulk of any update and is noise in a review."""
+        result = MagicMock()
+        result.summary.version = 4
+        result.summary.result = "succeeded"
+        result.summary.resource_changes = {"update": 1, "same": 118}
+        result.summary.start_time = None
+        result.summary.end_time = None
+
+        changed = MagicMock()
+        changed.metadata.op = OpType.UPDATE
+        changed.metadata.urn = "urn:pulumi:CI::proj::aws:s3/bucket:Bucket::keep"
+        changed.metadata.type = "aws:s3/bucket:Bucket"
+        changed.metadata.diffs = ["tags"]
+        changed.metadata.detailed_diff = None
+
+        unchanged = MagicMock()
+        unchanged.metadata.op = OpType.SAME
+
+        stack_update = pulumi_utils.summarize_up_result(result, [changed, unchanged])
+
+        assert len(stack_update.changes) == 1
+        assert stack_update.changes[0]["operation"] == "update"
+        assert stack_update.changes[0]["urn"].endswith("::keep")
+
+    def test_collector_callback_accumulates_resource_events(self) -> None:
+        events, on_event = pulumi_utils._collect_resource_events()
+
+        with_resource = MagicMock()
+        with_resource.resource_pre_event.metadata = MagicMock()
+        without_resource = MagicMock()
+        without_resource.resource_pre_event = None
+
+        on_event(with_resource)
+        on_event(without_resource)
+
+        assert events == [with_resource.resource_pre_event]
+
+    def test_changes_absent_from_flat_dict_when_empty(self) -> None:
+        """Don't put an empty `changes` key on the version for nothing."""
+        assert "changes" not in _stack_update(changes=[]).to_flat_dict()
+
+    def test_carried_changes_are_capped_but_total_is_honest(self) -> None:
+        """The change list rides on the Concourse *version*, which is persisted.
+
+        Concourse stores versions per-resource in its database and carries them
+        through every later step, so an unbounded list would put megabytes there
+        on a large refactor. Cap what is carried, but keep the true count so the
+        rendered body can say how much it is not showing.
+        """
+        result = MagicMock()
+        result.summary.version = 4
+        result.summary.result = "succeeded"
+        result.summary.resource_changes = {"update": 500}
+        result.summary.start_time = None
+        result.summary.end_time = None
+
+        events = []
+        for i in range(500):
+            evt = MagicMock()
+            evt.metadata.op = OpType.UPDATE
+            evt.metadata.urn = f"urn:pulumi:CI::proj::aws:s3/bucket:Bucket::b{i}"
+            evt.metadata.type = "aws:s3/bucket:Bucket"
+            evt.metadata.diffs = []
+            evt.metadata.detailed_diff = None
+            events.append(evt)
+
+        stack_update = pulumi_utils.summarize_up_result(result, events)
+
+        assert len(stack_update.changes) == pulumi_utils.DEFAULT_MAX_CARRIED_CHANGES
+        assert stack_update.changes_total == 500
+        assert json.loads(stack_update.to_flat_dict()["changes_total"]) == 500
+
+
+class TestMaxCarriedChangesIsConfigurable:
+    """The cap must be tunable from the pipeline, not only from this code.
+
+    Baked into a constant, changing it would mean editing this image, cutting a
+    release, and bumping the dependency in every consumer. As a `source` field
+    (or per-put param) it is a pipeline re-set instead, which is the difference
+    between "we can try a bigger number tomorrow" and "we can try it next
+    release".
+    """
+
+    def _events(self, count: int) -> list[MagicMock]:
+        events = []
+        for i in range(count):
+            evt = MagicMock()
+            evt.metadata.op = OpType.UPDATE
+            evt.metadata.urn = f"urn:pulumi:CI::proj::aws:s3/bucket:Bucket::b{i}"
+            evt.metadata.type = "aws:s3/bucket:Bucket"
+            evt.metadata.diffs = []
+            evt.metadata.detailed_diff = None
+            events.append(evt)
+        return events
+
+    def _up_result(self) -> MagicMock:
+        result = MagicMock()
+        result.summary.version = 4
+        result.summary.result = "succeeded"
+        result.summary.resource_changes = {"update": 10}
+        result.summary.start_time = None
+        result.summary.end_time = None
+        return result
+
+    def test_source_level_value_is_used(self, tmp_path: Path) -> None:
+        resource = _make_resource_with_cap(3)
+        (tmp_path / "infra").mkdir(exist_ok=True)
+
+        captured: dict[str, Any] = {}
+
+        def fake_update(**kwargs: Any) -> pulumi_utils.StackUpdate:
+            captured.update(kwargs)
+            return _stack_update()
+
+        with patch("pulumi_utils.update_stack", side_effect=fake_update):
+            resource.publish_new_version(tmp_path, MagicMock(), action="update")
+
+        assert captured["max_carried_changes"] == 3
+
+    def test_put_param_overrides_source(self, tmp_path: Path) -> None:
+        resource = _make_resource_with_cap(3)
+        (tmp_path / "infra").mkdir(exist_ok=True)
+
+        captured: dict[str, Any] = {}
+
+        def fake_update(**kwargs: Any) -> pulumi_utils.StackUpdate:
+            captured.update(kwargs)
+            return _stack_update()
+
+        with patch("pulumi_utils.update_stack", side_effect=fake_update):
+            resource.publish_new_version(
+                tmp_path, MagicMock(), action="update", max_carried_changes=50
+            )
+
+        assert captured["max_carried_changes"] == 50
+
+    def test_zero_means_no_cap_and_is_not_swallowed_as_falsy(
+        self, tmp_path: Path
+    ) -> None:
+        """`or`-style defaulting would turn an explicit 0 back into 200."""
+        resource = _make_resource_with_cap(200)
+        (tmp_path / "infra").mkdir(exist_ok=True)
+
+        captured: dict[str, Any] = {}
+
+        def fake_update(**kwargs: Any) -> pulumi_utils.StackUpdate:
+            captured.update(kwargs)
+            return _stack_update()
+
+        with patch("pulumi_utils.update_stack", side_effect=fake_update):
+            resource.publish_new_version(
+                tmp_path, MagicMock(), action="update", max_carried_changes=0
+            )
+
+        assert captured["max_carried_changes"] == 0
+
+    def test_zero_carries_every_change(self) -> None:
+        stack_update = pulumi_utils.summarize_up_result(
+            self._up_result(), self._events(10), max_carried_changes=0
+        )
+        assert len(stack_update.changes) == 10
+        assert stack_update.changes_total == 10
+
+    def test_custom_cap_truncates_but_keeps_total(self) -> None:
+        stack_update = pulumi_utils.summarize_up_result(
+            self._up_result(), self._events(10), max_carried_changes=4
+        )
+        assert len(stack_update.changes) == 4
+        assert stack_update.changes_total == 10
+
+    def test_string_from_pipeline_yaml_is_coerced(self) -> None:
+        """Concourse source/params values can arrive as strings."""
+        resource = PulumiResource(
+            stack_name="org.proj.dev",
+            project_name="p",
+            source_dir="infra",
+            max_carried_changes="7",
+        )
+        assert resource.max_carried_changes == 7

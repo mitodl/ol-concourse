@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -259,6 +260,12 @@ class TestUpdateStackLockRecovery:
         mock_stack = MagicMock()
         up_result = MagicMock()
         up_result.summary.version = 7
+        up_result.summary.result = "succeeded"
+        up_result.summary.resource_changes = {"same": 3}
+        # datetimes, matching UpdateSummary's real type -- not the RFC 3339
+        # strings of the wire format
+        up_result.summary.start_time = datetime(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+        up_result.summary.end_time = datetime(2020, 1, 1, 0, 0, 9, tzinfo=UTC)
         call_count = [0]
 
         def flaky_up(**_kwargs):
@@ -276,7 +283,7 @@ class TestUpdateStackLockRecovery:
             mock_auto.ConfigValue = auto.ConfigValue
             mock_auto.LocalWorkspaceOptions = auto.LocalWorkspaceOptions
 
-            version = pulumi_utils.update_stack(
+            stack_update = pulumi_utils.update_stack(
                 stack_name="my-stack",
                 project_name="my-project",
                 source_dir="/nonexistent/src",
@@ -285,7 +292,10 @@ class TestUpdateStackLockRecovery:
                 refresh_stack=False,
             )
 
-        assert version == 7
+        assert stack_update.version == 7
+        assert stack_update.result == "succeeded"
+        assert stack_update.resource_changes == {"same": 3}
+        assert stack_update.duration_seconds == 9
         mock_stack.cancel.assert_called_once()
 
     def test_update_stack_does_not_cancel_developer_lock(self) -> None:

@@ -255,3 +255,151 @@ class TestPulumiJobAttempts:
                 f"Job {job.name} must not post the gate on ensure"
             )
             assert job.on_success is not None, f"Job {job.name} lost its gate put"
+
+
+class TestDeploySummaryInGateIssue:
+    """The promotion-gate issue body must carry the Pulumi resource summary.
+
+    Closing the `[bot] Pulumi <project> <stack> deployed.` issue is what promotes
+    a change to the next environment, and the issue used to carry only a title --
+    so the human closing it was trusting the job's colour rather than evidence.
+    """
+
+    def test_gate_issue_body_reads_the_summary_artifact(self):
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI", "QA"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+        )
+        for job in fragment.jobs:
+            params = job.on_success.params or {}
+            assert (
+                params["body_file"] == "pulumi-ol-application-airbyte/deploy_summary.md"
+            )
+
+    def test_put_enables_implicit_get_to_produce_the_artifact(self):
+        """A put produces no artifacts; only its implicit get does.
+
+        If no_get stayed True the summary would never reach the issue put, and
+        the body_file above would point at a path that does not exist.
+        """
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI", "QA"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+        )
+        for i in range(len(fragment.jobs)):
+            put = _get_pulumi_put_step(fragment, i)
+            assert put.no_get is False
+            assert put.get_params["summary_file"] == "deploy_summary.md"
+
+    def test_implicit_get_does_not_re_read_the_stack(self):
+        """read_outputs must be False on the implicit get.
+
+        This get runs on the success path of every deploy. Leaving the stack read
+        on would add a second Pulumi invocation there, and a failure in it would
+        redden a deploy that actually applied.
+        """
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+        )
+        assert _get_pulumi_put_step(fragment).get_params["read_outputs"] is False
+
+    def test_body_file_path_matches_the_put_resource_name(self):
+        """The artifact is named after the resource, so the two must not drift."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-substructure-keycloak",
+            project_source_path=Path("src/ol_infrastructure/substructure/keycloak"),
+            github_issue_repository="org/repo",
+        )
+        put = _get_pulumi_put_step(fragment)
+        body_file = (fragment.jobs[0].on_success.params or {})["body_file"]
+        assert body_file.split("/")[0] == str(put.put)
+
+    def test_no_summary_wiring_when_issues_are_disabled(self):
+        """Nothing to feed, so don't pay for the extra implicit get."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            enable_github_issue_resource=False,
+        )
+        put = _get_pulumi_put_step(fragment)
+        assert put.no_get is True
+        assert put.get_params is None
+
+
+def _pulumi_resource(fragment):
+    """Return the pulumi-provisioner Resource from a fragment."""
+    for resource in fragment.resources:
+        if resource.type == "pulumi-provisioner":
+            return resource
+    msg = "no pulumi-provisioner resource in fragment"
+    raise AssertionError(msg)
+
+
+class TestMaxCarriedChangesReachesThePipeline:
+    """The cap must be settable without editing and releasing the resource image.
+
+    It lands in the resource's `source`, so an operator who finds 200 too few
+    (or too many) after seeing a real gate issue changes a pipeline and re-sets
+    it, rather than waiting on an image release and a dependency bump.
+    """
+
+    def test_absent_from_source_by_default(self):
+        """Don't pin a value the resource already defaults to."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+        )
+        assert "max_carried_changes" not in _pulumi_resource(fragment).source
+
+    def test_value_lands_in_resource_source(self):
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI", "QA"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+            max_carried_changes=500,
+        )
+        assert _pulumi_resource(fragment).source["max_carried_changes"] == 500
+
+    def test_zero_is_emitted_not_dropped_as_falsy(self):
+        """0 means "no cap" and must survive to the YAML."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+            max_carried_changes=0,
+        )
+        assert _pulumi_resource(fragment).source["max_carried_changes"] == 0
+
+    def test_accepts_a_concourse_var_reference(self):
+        """Deferring to a var is what makes this tunable with no code at all."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+            max_carried_changes="((pulumi.max_carried_changes))",
+        )
+        source = _pulumi_resource(fragment).source
+        assert source["max_carried_changes"] == "((pulumi.max_carried_changes))"

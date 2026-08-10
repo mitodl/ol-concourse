@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +26,110 @@ _UUID_RE = re.compile(
 _LOCK_HOLDER_RE = re.compile(
     r"created by (?P<user>[^@]+)@(?P<host>\S+) \(pid (?P<pid>\d+)\) at (?P<at>\S+)"
 )
+
+# The per-resource change list rides on the Concourse *version*, which Concourse
+# persists per-resource in its database and carries through every later step. A
+# thousand-resource refactor would otherwise put a megabyte there. Cap what is
+# carried; ``changes_total`` keeps the honest count so the rendered body can say
+# how much it is not showing.
+#
+# This is only the default. The cap is a pipeline-level setting -- the resource's
+# ``max_carried_changes`` source field or put param -- so raising or disabling it
+# is a pipeline re-set, not a code change plus a package release plus a
+# dependency bump.
+DEFAULT_MAX_CARRIED_CHANGES = 200
+
+
+@dataclass
+class StackUpdate:
+    """The outcome of a ``pulumi up``, as much of it as is worth carrying forward.
+
+    ``pulumi up`` already prints all of this to the build log, but the log is not
+    something a later step can read.  A promotion-gate issue is decided by a human
+    who is not reading the log, so the counts have to travel out of here as data.
+    """
+
+    version: int
+    result: str
+    resource_changes: dict[str, int]
+    duration_seconds: int | None = None
+    changes: list[dict[str, Any]] = field(default_factory=list)
+    changes_total: int = 0
+
+    def to_flat_dict(self) -> dict[str, str]:
+        """Flatten to strings, for a Concourse version or metadata payload."""
+        flat = {
+            "version": str(self.version),
+            "result": self.result,
+            "resource_changes": json.dumps(self.resource_changes, sort_keys=True),
+        }
+        if self.duration_seconds is not None:
+            flat["duration_seconds"] = str(self.duration_seconds)
+        if self.changes:
+            flat["changes"] = json.dumps(self.changes)
+            flat["changes_total"] = str(self.changes_total)
+        return flat
+
+
+def summarize_up_result(
+    result: auto.UpResult,
+    changes: list[ResourcePreEvent] | None = None,
+    max_carried_changes: int = DEFAULT_MAX_CARRIED_CHANGES,
+) -> StackUpdate:
+    """Extract the resource summary from an UpResult.
+
+    ``resource_changes`` is keyed by Pulumi's own op names (``create``, ``update``,
+    ``delete``, ``replace``, ``same``).  Pulumi omits keys with a zero count rather
+    than reporting them as 0, so absence means none of that op happened.
+
+    *changes* is the ResourcePreEvent stream collected during the update.  The
+    counts alone say a deploy touched five resources; only these say *which*
+    five and *what* about them changed -- which is what a human deciding whether
+    to promote actually needs.  ``UpResult`` does not carry them, so they have
+    to be captured via ``on_event`` while ``up`` runs.
+
+    *max_carried_changes* bounds how many of those events ride on the version.
+    ``0`` disables the cap entirely.  ``changes_total`` always records the true
+    count, so a capped list can say how much it is not showing rather than
+    reading as complete.
+    """
+    summary = result.summary
+    duration: int | None = None
+    # UpdateSummary.start_time/end_time are datetimes, not the RFC 3339 strings
+    # the wire format uses -- the automation API parses them before we see them.
+    # end_time is Optional; an update still in progress has none.
+    if summary.start_time and summary.end_time:
+        duration = int((summary.end_time - summary.start_time).total_seconds())
+    changed = [
+        serialize_resource_event(evt)
+        for evt in (changes or [])
+        if evt.metadata and evt.metadata.op != OpType.SAME
+    ]
+    return StackUpdate(
+        version=summary.version,
+        result=summary.result,
+        resource_changes={
+            k: int(v) for k, v in (summary.resource_changes or {}).items()
+        },
+        duration_seconds=duration,
+        changes=changed if max_carried_changes == 0 else changed[:max_carried_changes],
+        changes_total=len(changed),
+    )
+
+
+def _collect_resource_events() -> tuple[list[ResourcePreEvent], Callable[..., None]]:
+    """Return an event accumulator and the ``on_event`` callback that fills it.
+
+    Mirrors what ``_run_preview_on_stack`` does for previews, so an update
+    reports its per-resource detail the same way a preview already does.
+    """
+    events: list[ResourcePreEvent] = []
+
+    def on_event(event: EngineEvent) -> None:
+        if event.resource_pre_event and event.resource_pre_event.metadata:
+            events.append(event.resource_pre_event)
+
+    return events, on_event
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +198,11 @@ def create_stack(  # noqa: PLR0913
     *,
     preview: bool = False,
     preview_file: Path | None = None,
-) -> int:
+    max_carried_changes: int = DEFAULT_MAX_CARRIED_CHANGES,
+) -> StackUpdate:
     """Create a new stack and run pulumi up (or preview).
 
-    Returns the Pulumi stack version number, or 0 for a preview run.
+    Returns the update's StackUpdate summary, or an empty one for a preview run.
     Raises StackAlreadyExistsError if the stack already exists.
     """
     try:
@@ -115,10 +221,18 @@ def create_stack(  # noqa: PLR0913
 
     if preview:
         _run_preview_on_stack(stack, preview_file)
-        return 0
+        return _preview_stack_update()
 
-    result = _with_lock_recovery(lambda: stack.up(on_output=print), stack, stack_name)
-    return result.summary.version
+    events, on_event = _collect_resource_events()
+    result = _with_lock_recovery(
+        lambda: stack.up(on_output=print, on_event=on_event), stack, stack_name
+    )
+    return summarize_up_result(result, events, max_carried_changes)
+
+
+def _preview_stack_update() -> StackUpdate:
+    """Return the StackUpdate for a preview run, which applies nothing."""
+    return StackUpdate(version=0, result="preview", resource_changes={})
 
 
 def update_stack(  # noqa: PLR0913
@@ -131,10 +245,11 @@ def update_stack(  # noqa: PLR0913
     refresh_stack: bool = True,
     preview: bool = False,
     preview_file: Path | None = None,
-) -> int:
+    max_carried_changes: int = DEFAULT_MAX_CARRIED_CHANGES,
+) -> StackUpdate:
     """Select an existing stack, optionally refresh, then run pulumi up (or preview).
 
-    Returns the Pulumi stack version number, or 0 for a preview run.
+    Returns the update's StackUpdate summary, or an empty one for a preview run.
     Raises StackNotFoundError or ConcurrentUpdateError as appropriate.
     """
     try:
@@ -158,10 +273,13 @@ def update_stack(  # noqa: PLR0913
 
     if preview:
         _run_preview_on_stack(stack, preview_file)
-        return 0
+        return _preview_stack_update()
 
-    result = _with_lock_recovery(lambda: stack.up(on_output=print), stack, stack_name)
-    return result.summary.version
+    events, on_event = _collect_resource_events()
+    result = _with_lock_recovery(
+        lambda: stack.up(on_output=print, on_event=on_event), stack, stack_name
+    )
+    return summarize_up_result(result, events, max_carried_changes)
 
 
 def destroy_stack(

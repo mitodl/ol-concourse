@@ -307,24 +307,41 @@ def amazon_ami(
 
 
 def pulumi_provisioner(
-    name: Identifier, project_name: str, project_path: str
+    name: Identifier,
+    project_name: str,
+    project_path: str,
+    max_carried_changes: int | str | None = None,
 ) -> Resource:
     """Generate a Pulumi provisioner resource for the given project.
 
     :param name: Resource name used across pipeline steps.
     :param project_name: Pulumi project name.
     :param project_path: Path to the Pulumi project directory within the workspace.
+    :param max_carried_changes: How many per-resource changes the deploy summary
+        carries on the emitted version, which is what the promotion-gate issue
+        body is rendered from.  ``0`` means no cap.  Omit to use the resource's
+        own default (200).
+
+        This lives in the resource's ``source`` deliberately: it is a knob an
+        operator may want to turn after seeing a real deploy's issue body, and
+        putting it here makes that a pipeline re-set rather than a change to the
+        resource image, a release, and a dependency bump.  It can equally be
+        driven by a Concourse var, e.g. ``((pulumi.max_carried_changes))``.
     :returns: A configured Concourse pulumi-provisioner resource.
     """
+    source: dict[str, Any] = {
+        "action": "update",
+        "project_name": project_name,
+        "source_dir": project_path,
+    }
+    # `is not None` rather than truthiness -- 0 is a meaningful value here.
+    if max_carried_changes is not None:
+        source["max_carried_changes"] = max_carried_changes
     return Resource(
         name=name,
         type="pulumi-provisioner",
         icon="cloud-braces",
-        source={
-            "action": "update",
-            "project_name": project_name,
-            "source_dir": project_path,
-        },
+        source=source,
     )
 
 
