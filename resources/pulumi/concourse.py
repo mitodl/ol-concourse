@@ -599,11 +599,42 @@ def _render_changes(events: list[dict[str, Any]], total: int = 0) -> list[str]:
 
 
 def _changed_properties(event: dict[str, Any]) -> list[str]:
-    """Return the changed property paths, preferring the provider's detailed diff."""
+    """Return the changed properties, with their values where Pulumi gave us any.
+
+    A property name alone is thin review material: `version (update)` does not
+    say whether a patch bump or a major downgrade is about to be promoted.
+    Where old and new are both known this renders `old` -> `new`; where only one
+    side exists (an add or a delete) it renders just that side, labelled.
+    """
     detailed = event.get("detailed_diff") or {}
-    if detailed:
-        return [
-            f"`{path}` ({info.get('diff_kind', 'changed')})"
-            for path, info in sorted(detailed.items())
-        ]
-    return [f"`{prop}`" for prop in sorted(event.get("diffs") or [])]
+    if not detailed:
+        return [f"`{prop}`" for prop in sorted(event.get("diffs") or [])]
+
+    lines: list[str] = []
+    for path, info in sorted(detailed.items()):
+        kind = info.get("diff_kind", "changed")
+        old, new = info.get("old"), info.get("new")
+        if old is not None and new is not None:
+            detail = f"{_code(old)} → {_code(new)}"
+        elif new is not None:
+            detail = f"→ {_code(new)}"
+        elif old is not None:
+            detail = f"was {_code(old)}"
+        else:
+            detail = ""
+        # The path is as untrusted as the value: a Pulumi property key is
+        # quoted precisely because it holds characters like dots and slashes,
+        # and nothing stops one holding a backtick or newline. Sanitise both.
+        lines.append(f"{_code(path)} ({kind})" + (f": {detail}" if detail else ""))
+    return lines
+
+
+def _code(value: str) -> str:
+    """Inline-code a value, keeping it from breaking the surrounding Markdown.
+
+    Backticks in the value would otherwise terminate the span early and let
+    arbitrary config text render as Markdown in the issue body; newlines would
+    break the list item. Both are neutralised rather than trusted.
+    """
+    flattened = " ".join(str(value).splitlines())
+    return "`" + flattened.replace("`", "'") + "`"

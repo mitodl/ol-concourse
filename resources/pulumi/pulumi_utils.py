@@ -111,9 +111,8 @@ def summarize_up_result(
     return StackUpdate(
         version=summary.version,
         result=summary.result,
-        resource_changes={
-            k: int(v) for k, v in (summary.resource_changes or {}).items()
-        },
+        # Same OpMap-annotated-but-actually-strings field as the preview path.
+        resource_changes=_op_counts(summary.resource_changes),
         duration_seconds=duration,
         changes=changed if max_carried_changes == 0 else changed[:max_carried_changes],
         changes_total=len(changed),
@@ -376,18 +375,169 @@ def cancel_stack_lock(
     stack.cancel()
 
 
+def _op_name(op: Any) -> str:
+    """Return an op's wire name whether the SDK handed us an enum or a string.
+
+    ``SummaryEvent.resource_changes`` is annotated ``OpMap``
+    (``Mapping[OpType, int]``) but its keys arrive as PLAIN STRINGS -- the
+    automation API does not coerce them when deserializing the event log, unlike
+    ``StepEventMetadata.op`` and ``PropertyDiff.diff_kind``, which really are
+    parsed into enums. Assuming the annotation crashed a live gate preview with
+    ``'str' object has no attribute 'value'``.
+    """
+    return op.value if hasattr(op, "value") else str(op)
+
+
+def _op_counts(change_summary: Any) -> dict[str, int]:
+    """Normalise a change summary to plain ``{op_name: count}``."""
+    return {_op_name(k): int(v) for k, v in (change_summary or {}).items()}
+
+
+# Longest value rendered for a single changed property. A Pulumi input can be a
+# whole IAM policy document or a rendered config file; the point of showing
+# values is to make a change scannable, which a 40KB blob is not -- and each
+# property prints TWO of them, old and new. Sized to comfortably fit the cases
+# that actually reward reading (versions, counts, ARNs, URLs, booleans) without
+# letting one policy document swamp the list.
+MAX_DIFF_VALUE_CHARS = 120
+
+# What Pulumi substitutes for a value it has filtered. Matched so it renders as
+# an explicit redaction rather than a confusing literal.
+_SECRET_MARKERS = frozenset({"[secret]", "[unknown]"})
+
+_MISSING = object()
+
+
+def _parse_property_path(path: str) -> list[str | int]:
+    """Split a Pulumi property path into segments.
+
+    Pulumi's syntax is `root.nested["quoted key"][0]`, and a key is quoted
+    precisely when it contains characters that would otherwise be structural --
+    dots and slashes above all. Kubernetes labels are the everyday case:
+    `labels["app.kubernetes.io/name"]`. Naively stripping brackets and splitting
+    on dots shreds that into four meaningless fragments, so the value silently
+    disappears from the diff -- which is worse than an error, because the gate
+    still renders and just quietly says less than it should.
+
+    Numeric bracket segments stay list indexes; quoted ones are single mapping
+    keys, with `\"` and `\\` unescaped.
+    """
+    segments: list[str | int] = []
+    buffer: list[str] = []
+    index = 0
+    length = len(path)
+
+    def flush() -> None:
+        if buffer:
+            segments.append("".join(buffer))
+            buffer.clear()
+
+    while index < length:
+        char = path[index]
+        if char == ".":
+            flush()
+            index += 1
+        elif char == "[":
+            flush()
+            index += 1
+            if index < length and path[index] == '"':
+                index += 1
+                key: list[str] = []
+                while index < length and path[index] != '"':
+                    if path[index] == "\\" and index + 1 < length:
+                        index += 1
+                    key.append(path[index])
+                    index += 1
+                index += 1  # closing quote
+                segments.append("".join(key))
+            else:
+                digits: list[str] = []
+                while index < length and path[index] != "]":
+                    digits.append(path[index])
+                    index += 1
+                raw = "".join(digits)
+                segments.append(int(raw) if raw.isdigit() else raw)
+            while index < length and path[index] != "]":
+                index += 1
+            index += 1  # closing bracket
+        else:
+            buffer.append(char)
+            index += 1
+    flush()
+    return segments
+
+
+def _resolve_property_path(root: Any, path: str) -> Any:
+    """Resolve a Pulumi detailed-diff path against an input tree.
+
+    Returns ``_MISSING`` rather than raising when the path does not exist, which
+    is normal: an ``add`` has no old value and a ``delete`` has no new one.
+    """
+    current = root
+    for segment in _parse_property_path(path):
+        if isinstance(segment, int):
+            if not isinstance(current, (list, tuple)) or segment >= len(current):
+                return _MISSING
+            current = current[segment]
+        elif isinstance(current, dict):
+            if segment not in current:
+                return _MISSING
+            current = current[segment]
+        else:
+            return _MISSING
+    return current
+
+
+def _render_value(value: Any) -> str | None:
+    """Render one property value for display, redacted and truncated.
+
+    ``None`` means "nothing to show" and is distinct from the JSON value null,
+    which renders as ``"null"``.
+    """
+    if value is _MISSING:
+        return None
+    if isinstance(value, str) and value in _SECRET_MARKERS:
+        return "«redacted by Pulumi»"
+    try:
+        rendered = value if isinstance(value, str) else json.dumps(value, default=str)
+    except (TypeError, ValueError):
+        rendered = str(value)
+    if len(rendered) > MAX_DIFF_VALUE_CHARS:
+        rendered = rendered[:MAX_DIFF_VALUE_CHARS] + "…(truncated)"
+    return rendered
+
+
 def serialize_resource_event(event: ResourcePreEvent) -> dict[str, Any]:
-    """Convert a ResourcePreEvent into a JSON-serialisable dict."""
+    """Convert a ResourcePreEvent into a JSON-serialisable dict.
+
+    Carries the OLD AND NEW VALUE of each changed property, not just its name.
+    Knowing that `version` changed says almost nothing; knowing it went
+    `1.2.3 -> 1.2.4` is the actual review.
+
+    ★ VALUES COME FROM `inputs`, NEVER `outputs`. The automation API documents
+    inputs as having secrets filtered out and large assets replaced by hashes;
+    it makes no such promise about outputs. This body is published to a GitHub
+    issue, so the difference matters. Anything still carrying Pulumi's filter
+    marker is rendered as an explicit redaction.
+    """
     meta = event.metadata
+    old_inputs = getattr(meta.old, "inputs", None) or {}
+    new_inputs = getattr(meta.new, "inputs", None) or {}
+
     detailed: dict[str, Any] = {}
-    if meta.detailed_diff:
-        detailed = {
-            path: {
-                "diff_kind": diff.diff_kind.value,
-                "input_diff": diff.input_diff,
-            }
-            for path, diff in meta.detailed_diff.items()
+    for path, diff in (meta.detailed_diff or {}).items():
+        entry: dict[str, Any] = {
+            "diff_kind": diff.diff_kind.value,
+            "input_diff": diff.input_diff,
         }
+        old = _render_value(_resolve_property_path(old_inputs, path))
+        new = _render_value(_resolve_property_path(new_inputs, path))
+        if old is not None:
+            entry["old"] = old
+        if new is not None:
+            entry["new"] = new
+        detailed[path] = entry
+
     return {
         "operation": meta.op.value,
         "urn": meta.urn,
@@ -508,9 +658,7 @@ def _run_preview_on_stack(
     ]
 
     payload = {
-        "change_summary": {
-            k.value: v for k, v in (result.change_summary or {}).items()
-        },
+        "change_summary": _op_counts(result.change_summary),
         "changes": changes,
         "stdout": result.stdout,
     }

@@ -27,6 +27,7 @@ from pulumi_concourse import (
     PulumiResource,
     PulumiVersion,
     _apply_os_env,
+    _changed_properties as _render_changed_properties,
 )
 
 
@@ -1451,3 +1452,244 @@ class TestPreviewFailureTolerance:
             resource.publish_new_version(
                 tmp_path, MagicMock(), action="update", fail_on_error=False
             )
+
+
+class TestOpMapKeysAreStrings:
+    """`SummaryEvent.resource_changes` is annotated OpMap but yields plain strings.
+
+    Assuming the annotation crashed a live EKS gate preview with
+    `'str' object has no attribute 'value'`. The automation API does NOT coerce
+    these keys, unlike StepEventMetadata.op and PropertyDiff.diff_kind, which
+    genuinely are parsed into enums.
+    """
+
+    def test_string_keys_do_not_crash(self) -> None:
+        assert pulumi_utils._op_counts({"same": 10, "update": 2}) == {
+            "same": 10,
+            "update": 2,
+        }
+
+    def test_enum_keys_still_work(self) -> None:
+        assert pulumi_utils._op_counts({OpType.CREATE: 1, OpType.SAME: 5}) == {
+            "create": 1,
+            "same": 5,
+        }
+
+    def test_none_summary_is_empty(self) -> None:
+        assert pulumi_utils._op_counts(None) == {}
+
+    def test_preview_payload_with_string_keys_renders(self, tmp_path: Path) -> None:
+        """The end-to-end shape that failed: preview -> version -> rendered body."""
+        update = pulumi_utils._preview_stack_update(
+            {"change_summary": {"same": 10, "update": 2}, "changes": []}
+        )
+        version = PulumiVersion(id="0", summary=json.dumps(update.to_flat_dict()))
+        _make_resource().download_version(
+            version,
+            tmp_path,
+            MagicMock(),
+            summary_file="p.md",
+            read_outputs=False,
+            preview_stack="residential.Production",
+        )
+        body = (tmp_path / "p.md").read_text()
+        assert "residential.Production" in body
+        assert "| update | 2 |" in body
+
+
+class TestDiffValues:
+    """A property name alone is thin review material.
+
+    `version (update)` does not say whether a patch bump or a major downgrade is
+    about to be promoted. The old -> new values are the actual review.
+    """
+
+    @staticmethod
+    def _event(detailed, old_inputs, new_inputs):
+        meta = MagicMock()
+        meta.op = OpType.UPDATE
+        meta.urn = "urn:pulumi:QA::proj::eks:index/nodeGroup:NodeGroup::ng"
+        meta.type = "eks:index/nodeGroup:NodeGroup"
+        meta.diffs = list(detailed)
+        meta.detailed_diff = {
+            k: MagicMock(diff_kind=v, input_diff=True) for k, v in detailed.items()
+        }
+        meta.old.inputs = old_inputs
+        meta.new.inputs = new_inputs
+        evt = MagicMock()
+        evt.metadata = meta
+        return evt
+
+    def test_scalar_change_shows_both_sides(self) -> None:
+        ser = pulumi_utils.serialize_resource_event(
+            self._event(
+                {"version": DiffKind.UPDATE}, {"version": "1.31"}, {"version": "1.32"}
+            )
+        )
+        assert ser["detailed_diff"]["version"]["old"] == "1.31"
+        assert ser["detailed_diff"]["version"]["new"] == "1.32"
+
+    def test_rendered_as_an_arrow(self, tmp_path: Path) -> None:
+        ser = pulumi_utils.serialize_resource_event(
+            self._event(
+                {"version": DiffKind.UPDATE}, {"version": "1.31"}, {"version": "1.32"}
+            )
+        )
+        line = _render_changed_properties(ser)[0]
+        assert "`1.31` → `1.32`" in line
+
+    def test_nested_and_indexed_paths_resolve(self) -> None:
+        ser = pulumi_utils.serialize_resource_event(
+            self._event(
+                {"labels.tier": DiffKind.ADD, "uris[1]": DiffKind.UPDATE},
+                {"labels": {}, "uris": ["a", "b"]},
+                {"labels": {"tier": "spot"}, "uris": ["a", "c"]},
+            )
+        )
+        assert ser["detailed_diff"]["labels.tier"]["new"] == "spot"
+        assert ser["detailed_diff"]["uris[1]"]["old"] == "b"
+        assert ser["detailed_diff"]["uris[1]"]["new"] == "c"
+
+    def test_add_has_no_old_side(self) -> None:
+        ser = pulumi_utils.serialize_resource_event(
+            self._event({"newProp": DiffKind.ADD}, {}, {"newProp": "x"})
+        )
+        assert "old" not in ser["detailed_diff"]["newProp"]
+        assert ser["detailed_diff"]["newProp"]["new"] == "x"
+
+    def test_pulumi_filtered_secret_is_shown_as_redacted(self) -> None:
+        """Values reach a GitHub issue, so a leaked secret would be published."""
+        ser = pulumi_utils.serialize_resource_event(
+            self._event(
+                {"apiToken": DiffKind.UPDATE},
+                {"apiToken": "[secret]"},
+                {"apiToken": "[secret]"},
+            )
+        )
+        assert ser["detailed_diff"]["apiToken"]["new"] == "«redacted by Pulumi»"
+
+    def test_long_values_are_truncated(self) -> None:
+        ser = pulumi_utils.serialize_resource_event(
+            self._event(
+                {"policy": DiffKind.UPDATE},
+                {"policy": "X" * 900},
+                {"policy": "Y" * 900},
+            )
+        )
+        new = ser["detailed_diff"]["policy"]["new"]
+        assert new.endswith("…(truncated)")
+        assert len(new) < 200
+
+    def test_backticks_and_newlines_cannot_break_the_markdown(
+        self, tmp_path: Path
+    ) -> None:
+        """A value is untrusted text inside an inline-code span in an issue body."""
+        ser = pulumi_utils.serialize_resource_event(
+            self._event(
+                {"script": DiffKind.UPDATE},
+                {"script": "a`b"},
+                {"script": "line1\nline2"},
+            )
+        )
+        line = _render_changed_properties(ser)[0]
+        assert "`" in line
+        assert "\n" not in line
+        assert "a'b" in line
+
+
+class TestPropertyPathParsing:
+    """Pulumi quotes a property key precisely when it contains dots or slashes.
+
+    `labels["app.kubernetes.io/name"]` is the everyday Kubernetes case, and it
+    is exactly what the EKS gates will see. Splitting on dots shredded it into
+    meaningless fragments and the value vanished from the diff — worse than an
+    error, because the gate still rendered and just quietly said less.
+    """
+
+    def test_dotted_kubernetes_label_key_resolves(self) -> None:
+        inputs = {"labels": {"app.kubernetes.io/name": "omnigraph"}}
+        got = pulumi_utils._resolve_property_path(
+            inputs, 'labels["app.kubernetes.io/name"]'
+        )
+        assert got == "omnigraph"
+
+    def test_plain_dotted_path_still_resolves(self) -> None:
+        assert (
+            pulumi_utils._resolve_property_path(
+                {"labels": {"tier": "spot"}}, "labels.tier"
+            )
+            == "spot"
+        )
+
+    def test_numeric_index_stays_a_list_index(self) -> None:
+        assert (
+            pulumi_utils._resolve_property_path({"uris": ["a", "b"]}, "uris[1]") == "b"
+        )
+
+    def test_escaped_quote_inside_a_key(self) -> None:
+        inputs = {"q": {'we"ird': 1}}
+        assert pulumi_utils._resolve_property_path(inputs, 'q["we\\"ird"]') == 1
+
+    def test_quoted_key_followed_by_index(self) -> None:
+        inputs = {"m": {"a.b": ["x", "y"]}}
+        assert pulumi_utils._resolve_property_path(inputs, 'm["a.b"][1]') == "y"
+
+    def test_missing_path_is_missing_not_an_error(self) -> None:
+        assert (
+            pulumi_utils._resolve_property_path({}, "nope.missing")
+            is pulumi_utils._MISSING
+        )
+
+    def test_index_past_the_end_is_missing(self) -> None:
+        assert (
+            pulumi_utils._resolve_property_path({"uris": ["a"]}, "uris[9]")
+            is pulumi_utils._MISSING
+        )
+
+    def test_dotted_label_value_reaches_the_rendered_diff(self) -> None:
+        """End-to-end: the regression case Copilot asked to pin."""
+        meta = MagicMock()
+        meta.op = OpType.UPDATE
+        meta.urn = "urn:pulumi:QA::p::k8s::deploy"
+        meta.type = "kubernetes:apps/v1:Deployment"
+        meta.diffs = ['labels["app.kubernetes.io/version"]']
+        meta.detailed_diff = {
+            'labels["app.kubernetes.io/version"]': MagicMock(
+                diff_kind=DiffKind.UPDATE, input_diff=True
+            )
+        }
+        meta.old.inputs = {"labels": {"app.kubernetes.io/version": "1.2.3"}}
+        meta.new.inputs = {"labels": {"app.kubernetes.io/version": "1.2.4"}}
+        evt = MagicMock()
+        evt.metadata = meta
+
+        line = _render_changed_properties(pulumi_utils.serialize_resource_event(evt))[0]
+        assert "`1.2.3` → `1.2.4`" in line
+
+
+class TestPropertyPathIsSanitized:
+    """The path is as untrusted as the value.
+
+    A key is quoted because it holds structural characters; nothing stops one
+    holding a backtick or newline, which would terminate the inline-code span
+    and inject Markdown into the published issue body.
+    """
+
+    @staticmethod
+    def _line(path: str) -> str:
+        event = {
+            "operation": "update",
+            "urn": "urn:pulumi:QA::p::t::n",
+            "type": "t",
+            "diffs": [path],
+            "detailed_diff": {path: {"diff_kind": "update", "new": "x"}},
+        }
+        return _render_changed_properties(event)[0]
+
+    def test_backtick_in_path_cannot_break_the_span(self) -> None:
+        line = self._line('labels["a`b"]')
+        assert "a'b" in line
+        assert "`a`b`" not in line
+
+    def test_newline_in_path_cannot_break_the_list_item(self) -> None:
+        assert "\n" not in self._line('labels["a\nb"]')
