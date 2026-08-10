@@ -3,6 +3,7 @@
 from collections.abc import Iterable
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 from ol_concourse.lib.models.fragment import PipelineFragment
 from ol_concourse.lib.models.pipeline import (
@@ -588,3 +589,237 @@ def pulumi_job(  # noqa: PLR0913
         resource_types=extra_resource_types,
         jobs=[pulumi_job_object],
     )
+
+
+# Filename the preview job's implicit get writes its diff to.
+PREVIEW_SUMMARY_FILENAME = "preview_summary.md"
+
+
+def _stack_serial_group(project_name: str, stack_name: str) -> str:
+    """Return the serial group shared by a stack's preview and deploy jobs.
+
+    ★ A `pulumi preview` TAKES THE STACK LOCK, so the preview and the deploy of
+    one stack must never run concurrently. Splitting them into two jobs loses
+    the `max_in_flight=1` that protected the single combined job, and lock
+    recovery will NOT save us: `_is_recoverable_lock` only cancels locks older
+    than 15 minutes, so a live preview's lock blocks a real deploy outright.
+    """
+    return f"{project_name}-{stack_name}".lower().replace(".", "-")
+
+
+def pulumi_preview_gate_chain(  # noqa: PLR0913
+    pulumi_code: Resource,
+    stack_names: list[str],
+    project_name: str,
+    project_source_path: Path,
+    github_issue_repository: str,
+    auto_deploy_stages: list[str] | None = None,
+    github_issue_assignees: list[str] | None = None,
+    additional_env_vars: dict[str, str] | None = None,
+    env_vars_from_files: dict[str, str] | None = None,
+    refresh_stack: bool = True,
+) -> PipelineFragment:
+    """PROTOTYPE: gate each stack on a preview OF ITSELF, not of the next stack.
+
+    Every gated stack becomes two jobs:
+
+        preview-<project>-<stack>   runs `pulumi preview` and OPENS the gate
+                                    issue with that stack's own diff
+        deploy-<project>-<stack>    runs `pulumi up`, triggered by the gate
+                                    issue being closed
+
+    Why this beats previewing the *next* stack from the current stack's deploy
+    job (`preview_next_stack`):
+
+    - IT WORKS FOR SINGLETONS. A one-stack chain -- a production-only stack, or
+      a `default` stack -- has no "next" to preview, so it gets no gate at all
+      today. Here every gated stack previews itself.
+    - IT WORKS ACROSS CHAINS. edxapp splits one deployment across Open edX
+      releases, so mitx CI and mitx QA live in different `pulumi_jobs_chain`
+      calls and the next-stack preview cannot span them. Self-preview does not
+      care.
+    - THE DIFF IS OF THE THING BEING APPROVED, and taken immediately before the
+      deploy it authorises, rather than one stage and possibly days earlier.
+
+    ★ `passed=[preview_job]` ON THE DEPLOY'S CODE GET is what stops a change
+    reaching an environment without having been previewed. Note it is set
+    MEMBERSHIP, not equality: if two commits both pass the preview, closing the
+    gate deploys the newer one. The gate issue is therefore updated in place, so
+    its body always shows the diff that will actually apply rather than the
+    first one posted.
+
+    ★ THIS INVERTS THE FAIL-OPEN PROPERTY of `preview_next_stack`. There the
+    preview was advisory and could never fail a deploy. Here it generates the
+    gate, so a preview that fails means no gate opens and nothing deploys.
+    That is fail-closed and correct for a promotion gate, but it puts preview
+    reliability on the deploy path.
+
+    *auto_deploy_stages* names the stages that keep today's behaviour: no gate,
+    auto-deploy on code change. Typically ``["CI"]`` -- gating CI would destroy
+    the fast feedback loop it exists to provide. Matched case-insensitively
+    against both the full stack name and its trailing dotted segment, so both
+    ``CI`` and ``mitx.CI`` work.
+    """
+    exempt = {s.lower() for s in (auto_deploy_stages or [])}
+
+    def is_exempt(stack: str) -> bool:
+        return stack.lower() in exempt or stack.rsplit(".", 1)[-1].lower() in exempt
+
+    chain = PipelineFragment(
+        resource_types=[github_issues_resource(), pulumi_provisioner_resource()]
+    )
+    pulumi_resource = pulumi_provisioner(
+        name=Identifier(f"pulumi-{project_name}"),
+        project_name=project_name,
+        project_path=f"{pulumi_code.name}/{project_source_path}",
+    )
+    chain.resources.append(pulumi_resource)
+
+    common_params: dict[str, Any] = {
+        "env_os": {
+            "AWS_DEFAULT_REGION": "us-east-1",
+            "PYTHONPATH": f"/usr/lib/:/tmp/build/put/{pulumi_code.name}/src/",
+            **(additional_env_vars or {}),
+        },
+        "env_vars_from_files": env_vars_from_files or {},
+        **({"refresh_stack": False} if not refresh_stack else {}),
+    }
+
+    previous_deploy: Job | None = None
+    for stack_name in stack_names:
+        slug = stack_name.lower().replace(".", "-")
+        serial_group = _stack_serial_group(project_name, stack_name)
+        passed_from = [previous_deploy.name] if previous_deploy else None
+
+        record_issue = github_issues(
+            auth_method="token",
+            name=Identifier(f"gh-{project_name.lower()}-{slug}-deployed"),
+            repository=github_issue_repository,
+            issue_title_template=f"[bot] Pulumi {project_name} {stack_name} deployed.",
+            issue_prefix=f"[bot] Pulumi {project_name} {stack_name} deployed.",
+            issue_state="open",
+        )
+        chain.resources.append(record_issue)
+
+        if is_exempt(stack_name):
+            deploy = Job(
+                name=Identifier(f"deploy-{project_name}-{slug}"),
+                serial_groups=[Identifier(serial_group)],
+                plan=[
+                    GetStep(get=pulumi_code.name, trigger=True, passed=passed_from),
+                    PutStep(
+                        inputs="all",
+                        put=pulumi_resource.name,
+                        no_get=False,
+                        get_params={
+                            "summary_file": DEPLOY_SUMMARY_FILENAME,
+                            "read_outputs": False,
+                        },
+                        params={**common_params, "stack_name": stack_name},
+                    ),
+                ],
+                on_success=PutStep(
+                    put=record_issue.name,
+                    params={
+                        "assignees": github_issue_assignees or [],
+                        "body_files": [
+                            f"{pulumi_resource.name}/{DEPLOY_SUMMARY_FILENAME}"
+                        ],
+                    },
+                ),
+            )
+            chain.jobs.append(deploy)
+            previous_deploy = deploy
+            continue
+
+        gate_post = github_issues(
+            auth_method="token",
+            name=Identifier(f"gh-{project_name.lower()}-{slug}-gate-post"),
+            repository=github_issue_repository,
+            issue_title_template=(
+                f"[bot] Pulumi {project_name} {stack_name} ready to deploy."
+            ),
+            issue_prefix=f"[bot] Pulumi {project_name} {stack_name} ready to deploy.",
+            issue_state="open",
+            # The body must show the diff that will ACTUALLY apply. A newer
+            # commit re-previews; appending a comment would leave the stale
+            # first diff at the top of what a reviewer reads.
+            update_in_place=True,
+        )
+        gate_trigger = github_issues(
+            auth_method="token",
+            name=Identifier(f"gh-{project_name.lower()}-{slug}-gate-trigger"),
+            repository=github_issue_repository,
+            issue_title_template=(
+                f"[bot] Pulumi {project_name} {stack_name} ready to deploy."
+            ),
+            issue_prefix=f"[bot] Pulumi {project_name} {stack_name} ready to deploy.",
+            issue_state="closed",
+            poll_frequency="15m",
+        )
+        chain.resources.extend([gate_post, gate_trigger])
+
+        preview = Job(
+            name=Identifier(f"preview-{project_name}-{slug}"),
+            serial_groups=[Identifier(serial_group)],
+            plan=[
+                GetStep(get=pulumi_code.name, trigger=True, passed=passed_from),
+                PutStep(
+                    inputs="all",
+                    put=pulumi_resource.name,
+                    no_get=False,
+                    get_params={
+                        "summary_file": PREVIEW_SUMMARY_FILENAME,
+                        "read_outputs": False,
+                        "preview_stack": stack_name,
+                    },
+                    params={
+                        **common_params,
+                        "stack_name": stack_name,
+                        "preview": True,
+                    },
+                ),
+            ],
+            on_success=PutStep(
+                put=gate_post.name,
+                params={
+                    "assignees": github_issue_assignees or [],
+                    "body_files": [
+                        f"{pulumi_resource.name}/{PREVIEW_SUMMARY_FILENAME}"
+                    ],
+                },
+            ),
+        )
+
+        deploy = Job(
+            name=Identifier(f"deploy-{project_name}-{slug}"),
+            serial_groups=[Identifier(serial_group)],
+            plan=[
+                GetStep(get=gate_trigger.name, trigger=True),
+                # `passed` is the guarantee: only code that went through this
+                # stack's own preview is eligible to deploy to it.
+                GetStep(get=pulumi_code.name, trigger=False, passed=[preview.name]),
+                PutStep(
+                    inputs="all",
+                    put=pulumi_resource.name,
+                    no_get=False,
+                    get_params={
+                        "summary_file": DEPLOY_SUMMARY_FILENAME,
+                        "read_outputs": False,
+                    },
+                    params={**common_params, "stack_name": stack_name},
+                ),
+            ],
+            on_success=PutStep(
+                put=record_issue.name,
+                params={
+                    "assignees": github_issue_assignees or [],
+                    "body_files": [f"{pulumi_resource.name}/{DEPLOY_SUMMARY_FILENAME}"],
+                },
+            ),
+        )
+
+        chain.jobs.extend([preview, deploy])
+        previous_deploy = deploy
+
+    return chain
