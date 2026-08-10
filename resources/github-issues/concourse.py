@@ -317,22 +317,47 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         build_metadata: BuildMetadata,
         body_file: str | None = None,
         sources_dir: Path | None = None,
+        body_files: list[str] | None = None,
     ) -> str:
-        """Return the issue body from a workspace file or by rendering the template."""
+        """Return the issue body from workspace file(s) or the rendered template.
+
+        *body_files* composes one body from several artifacts, in the order
+        given. A promotion gate wants "what this deploy did" and "what promoting
+        it will do to the next environment" in one issue, and those are produced
+        by two different put steps in two different artifacts -- a put step emits
+        no artifact of its own, so each arrives via its own implicit get.
+
+        A file that is missing is reported in the body rather than skipped. The
+        upstream step that should have written it is allowed to fail without
+        failing the deploy, so absence is expected -- but silently dropping a
+        section would leave a body that reads as complete while omitting the
+        half a reviewer may be relying on.
+        """
+        if body_files:
+            return "\n".join(self._read_body_file(f, sources_dir) for f in body_files)
         if body_file is not None:
-            if sources_dir is None:
-                msg = "sources_dir is required when body_file is provided"
-                raise ValueError(msg)
-            body_path = Path(body_file)
-            if body_path.is_absolute():
-                msg = "body_file must be a relative path"
-                raise ValueError(msg)
-            resolved = (sources_dir / body_path).resolve()
-            if not resolved.is_relative_to(sources_dir.resolve()):
-                msg = "body_file must be within the workspace sources directory"
-                raise ValueError(msg)
-            return resolved.read_text()
+            return self._read_body_file(body_file, sources_dir)
         return self.issue_body_template.format(**build_metadata_dict(build_metadata))
+
+    def _read_body_file(self, body_file: str, sources_dir: Path | None) -> str:
+        """Read one body fragment, refusing to escape the workspace."""
+        if sources_dir is None:
+            msg = "sources_dir is required when body_file is provided"
+            raise ValueError(msg)
+        body_path = Path(body_file)
+        if body_path.is_absolute():
+            msg = "body_file must be a relative path"
+            raise ValueError(msg)
+        resolved = (sources_dir / body_path).resolve()
+        if not resolved.is_relative_to(sources_dir.resolve()):
+            msg = "body_file must be within the workspace sources directory"
+            raise ValueError(msg)
+        if not resolved.exists():
+            return (
+                f"\n> :warning: Expected content from `{body_file}` was not "
+                "produced by this build.\n"
+            )
+        return resolved.read_text()
 
     def get_title_from_build(
         self, build_metadata: BuildMetadata, title_template: str | None = None
@@ -359,13 +384,17 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         labels: list[str] | None = None,
         body_file: str | None = None,
         title_template: str | None = None,
+        body_files: list[str] | None = None,
     ) -> tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
         """Create or comment on a GitHub Issue and return its version."""
         # Assume that: title is enough uniqueness to discern whether the issue
         # already exists
 
         issue_body = self.get_issue_body_from_build(
-            build_metadata, body_file=body_file, sources_dir=sources_dir
+            build_metadata,
+            body_file=body_file,
+            sources_dir=sources_dir,
+            body_files=body_files,
         )
 
         # Use GitHub Search API for efficiency instead of listing all issues
