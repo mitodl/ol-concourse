@@ -2,9 +2,12 @@
 
 from pathlib import Path
 
+import pytest
+
 
 from ol_concourse.lib.jobs.infrastructure import pulumi_jobs_chain
 from ol_concourse.lib.models.pipeline import (
+    GetStep,
     Identifier,
     PutStep,
     Resource,
@@ -529,3 +532,350 @@ class TestPreviewNextStack:
         assert any(
             isinstance(step, PutStep) and step is main for step in fragment.jobs[0].plan
         ), "the real deploy put must remain a bare plan step"
+
+
+def _job(fragment, name_fragment: str):
+    for job in fragment.jobs:
+        if name_fragment in str(job.name):
+            return job
+    return None
+
+
+def _gated_chain(**kw):
+    return pulumi_jobs_chain(
+        _make_pulumi_code(),
+        stack_names=kw.pop("stack_names", ["CI", "QA", "Production"]),
+        project_name="ol-substructure-keycloak",
+        project_source_path=Path("src/ol_infrastructure/substructure/keycloak"),
+        github_issue_repository="org/repo",
+        topology="preview-gated",
+        auto_deploy_stages=kw.pop("auto_deploy_stages", ["CI"]),
+        **kw,
+    )
+
+
+class TestPreviewGatedTopologyIsOptIn:
+    """The default topology must be byte-for-byte what it was."""
+
+    def test_default_topology_produces_no_preview_jobs(self):
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["CI", "QA"],
+            project_name="ol-application-airbyte",
+            project_source_path=Path("src/ol_infrastructure/applications/airbyte"),
+            github_issue_repository="org/repo",
+        )
+        assert all(not str(j.name).startswith("preview-") for j in fragment.jobs)
+
+    def test_auto_deploy_stages_rejected_on_default_topology(self):
+        with pytest.raises(ValueError, match="only applies to"):
+            pulumi_jobs_chain(
+                _make_pulumi_code(),
+                stack_names=["CI"],
+                project_name="p",
+                project_source_path=Path("x"),
+                github_issue_repository="org/repo",
+                auto_deploy_stages=["CI"],
+            )
+
+
+class TestPreviewGatedTopology:
+    """Each stack previews ITSELF and its own preview opens the gate."""
+
+    def test_exempt_stage_keeps_auto_deploy_and_has_no_preview(self):
+        fragment = _gated_chain()
+        assert _job(fragment, "preview-ol-substructure-keycloak-ci") is None
+        deploy_ci = _job(fragment, "deploy-ol-substructure-keycloak-ci")
+        code_get = next(
+            s for s in deploy_ci.plan if getattr(s, "get", None) == "my-repo"
+        )
+        assert code_get.trigger is True
+
+    def test_gated_stage_has_preview_and_deploy(self):
+        fragment = _gated_chain()
+        assert _job(fragment, "preview-ol-substructure-keycloak-qa") is not None
+        assert _job(fragment, "deploy-ol-substructure-keycloak-qa") is not None
+
+    def test_deploy_is_passed_constrained_to_its_own_preview(self):
+        """The guarantee: nothing reaches an environment unpreviewed."""
+        fragment = _gated_chain()
+        deploy = _job(fragment, "deploy-ol-substructure-keycloak-qa")
+        code_get = next(s for s in deploy.plan if getattr(s, "get", None) == "my-repo")
+        assert code_get.passed == ["preview-ol-substructure-keycloak-qa"]
+        assert code_get.trigger is not True, "deploy must wait for the gate, not code"
+
+    def test_deploy_is_triggered_by_the_gate_issue(self):
+        fragment = _gated_chain()
+        deploy = _job(fragment, "deploy-ol-substructure-keycloak-qa")
+        gate_gets = [
+            s
+            for s in deploy.plan
+            if "gate-trigger" in str(getattr(s, "get", "")) and s.trigger
+        ]
+        assert len(gate_gets) == 1
+
+    def test_preview_follows_the_previous_stages_deploy(self):
+        fragment = _gated_chain()
+        preview = _job(fragment, "preview-ol-substructure-keycloak-qa")
+        code_get = next(s for s in preview.plan if getattr(s, "get", None) == "my-repo")
+        assert code_get.passed == ["deploy-ol-substructure-keycloak-ci"]
+        assert code_get.trigger is True
+
+    def test_preview_and_deploy_share_a_serial_group(self):
+        """A `pulumi preview` takes the stack lock.
+
+        Splitting one job into two loses the `max_in_flight=1` that kept them
+        apart, and lock recovery will not help — it refuses to cancel anything
+        under 15 minutes old, so a live preview lock blocks a real deploy.
+        """
+        fragment = _gated_chain()
+        preview = _job(fragment, "preview-ol-substructure-keycloak-qa")
+        deploy = _job(fragment, "deploy-ol-substructure-keycloak-qa")
+        assert preview.serial_groups == deploy.serial_groups
+        assert preview.serial_groups
+
+    def test_each_stack_has_its_own_serial_group(self):
+        """QA's preview must not serialise against Production's deploy."""
+        fragment = _gated_chain()
+        qa = _job(fragment, "preview-ol-substructure-keycloak-qa").serial_groups
+        prod = _job(fragment, "preview-ol-substructure-keycloak-production")
+        assert qa != prod.serial_groups
+
+    def test_gate_issue_is_updated_in_place(self):
+        """The body must show the diff that will apply, not the first one posted.
+
+        `passed` is set membership, not equality: if a newer commit also passes
+        the preview, it is what deploys. Appending a comment would leave the
+        stale diff at the top of what a reviewer reads.
+        """
+        fragment = _gated_chain()
+        gate = next(r for r in fragment.resources if "qa-gate-post" in str(r.name))
+        assert gate.source["update_in_place"] is True
+
+    def test_deploy_still_posts_the_applied_diff_record(self):
+        """The gate does not replace the build-158 detector."""
+        fragment = _gated_chain()
+        deploy = _job(fragment, "deploy-ol-substructure-keycloak-qa")
+        params = deploy.on_success.params or {}
+        assert "deployed" in str(deploy.on_success.put)
+        assert params["body_files"] == [
+            "pulumi-ol-substructure-keycloak/deploy_summary.md"
+        ]
+
+    def test_singleton_production_stack_gets_a_gate(self):
+        """Today a one-stack chain gets no gate at all — this is the fix."""
+        fragment = _gated_chain(stack_names=["Production"])
+        assert _job(fragment, "preview-ol-substructure-keycloak-production")
+        deploy = _job(fragment, "deploy-ol-substructure-keycloak-production")
+        code_get = next(s for s in deploy.plan if getattr(s, "get", None) == "my-repo")
+        assert code_get.passed == ["preview-ol-substructure-keycloak-production"]
+
+    def test_exemption_matches_the_trailing_dotted_segment(self):
+        """Edxapp stacks are `mitx.CI`, not `CI`."""
+        fragment = _gated_chain(stack_names=["mitx.CI"], auto_deploy_stages=["CI"])
+        assert _job(fragment, "preview-") is None
+
+    def test_every_job_gets_slack_alerts_when_configured(self):
+        fragment = _gated_chain(slack_url_path="slack.url")
+        assert all(j.on_failure is not None for j in fragment.jobs)
+
+
+class TestPreviewGatedRejectsUnsupportedInputs:
+    """Silently ignoring a parameter is worse than refusing it."""
+
+    def test_preview_next_stack_is_rejected_as_redundant(self):
+        with pytest.raises(ValueError, match="redundant"):
+            _gated_chain(preview_next_stack=True)
+
+    def test_issue_resource_is_required(self):
+        with pytest.raises(ValueError, match="enable_github_issue_resource"):
+            _gated_chain(enable_github_issue_resource=False)
+
+    def test_every_index_keyed_parameter_is_now_honoured(self):
+        """Nothing left to reject — both index-keyed params are supported."""
+        fragment = _gated_chain(
+            custom_dependencies={1: [GetStep(get=Identifier("an-input"))]},
+            additional_post_steps={1: [PutStep(put=Identifier("a-post-step"))]},
+        )
+        deploy = _job(fragment, "deploy-ol-substructure-keycloak-qa")
+        assert any(
+            isinstance(s, PutStep) and str(s.put) == "a-post-step" for s in deploy.plan
+        )
+
+
+class TestPreviewGatedStageInputs:
+    """Stage inputs are artifacts the Pulumi run consumes, not just triggers.
+
+    k8s_apps hands in a `deployment.json`; kubewatch a `passed`-constrained
+    build; simple_pulumi a cross-environment gate issue. Preview and deploy both
+    run Pulumi over the same tree, so both need them — but a triggering input on
+    the gated deploy would start it without anyone closing the gate.
+    """
+
+    @staticmethod
+    def _dep(name="some-image", **kw):
+        return GetStep(get=Identifier(name), trigger=True, **kw)
+
+    def _gets(self, job, name):
+        return [s for s in job.plan if str(getattr(s, "get", "")) == name]
+
+    def test_chain_dependencies_reach_every_job(self):
+        fragment = _gated_chain(dependencies=[self._dep()])
+        for job_name in (
+            "deploy-ol-substructure-keycloak-ci",
+            "preview-ol-substructure-keycloak-qa",
+            "deploy-ol-substructure-keycloak-qa",
+        ):
+            job = _job(fragment, job_name)
+            assert self._gets(job, "some-image"), f"{job_name} lost the input"
+
+    def test_triggering_input_cannot_start_a_gated_deploy(self):
+        """The regression that would silently defeat the entire topology."""
+        fragment = _gated_chain(dependencies=[self._dep()])
+        deploy = _job(fragment, "deploy-ol-substructure-keycloak-qa")
+        dep = self._gets(deploy, "some-image")[0]
+        assert dep.trigger is not True, (
+            "a triggering input on a gated deploy bypasses the gate entirely"
+        )
+
+    def test_the_same_input_still_triggers_the_preview(self):
+        fragment = _gated_chain(dependencies=[self._dep()])
+        preview = _job(fragment, "preview-ol-substructure-keycloak-qa")
+        assert self._gets(preview, "some-image")[0].trigger is True
+
+    def test_custom_dependencies_land_on_their_own_stage_only(self):
+        fragment = _gated_chain(
+            custom_dependencies={1: [self._dep("qa-only-artifact")]}
+        )
+        assert self._gets(
+            _job(fragment, "preview-ol-substructure-keycloak-qa"), "qa-only-artifact"
+        )
+        assert not self._gets(
+            _job(fragment, "deploy-ol-substructure-keycloak-ci"), "qa-only-artifact"
+        )
+        assert not self._gets(
+            _job(fragment, "preview-ol-substructure-keycloak-production"),
+            "qa-only-artifact",
+        )
+
+    def test_custom_dependencies_reach_both_jobs_of_their_stage(self):
+        """The deploy runs Pulumi too — it needs the artifact, not just the preview."""
+        fragment = _gated_chain(
+            custom_dependencies={1: [self._dep("qa-only-artifact")]}
+        )
+        deploy = _job(fragment, "deploy-ol-substructure-keycloak-qa")
+        dep = self._gets(deploy, "qa-only-artifact")[0]
+        assert dep.trigger is not True
+
+    def test_custom_dependencies_on_an_exempt_stage_keep_their_trigger(self):
+        fragment = _gated_chain(custom_dependencies={0: [self._dep("ci-artifact")]})
+        deploy_ci = _job(fragment, "deploy-ol-substructure-keycloak-ci")
+        assert self._gets(deploy_ci, "ci-artifact")[0].trigger is True
+
+    def test_passed_constraints_on_inputs_are_preserved(self):
+        fragment = _gated_chain(
+            custom_dependencies={1: [self._dep("built", passed=["some-upstream-job"])]}
+        )
+        for job_name in (
+            "preview-ol-substructure-keycloak-qa",
+            "deploy-ol-substructure-keycloak-qa",
+        ):
+            dep = self._gets(_job(fragment, job_name), "built")[0]
+            assert dep.passed == ["some-upstream-job"]
+
+    def test_callers_step_objects_are_not_mutated(self):
+        """The existing chain mutates shared dependencies in place; do not."""
+        dep = self._dep()
+        _gated_chain(dependencies=[dep])
+        assert dep.trigger is True
+
+
+class TestPreviewGatedSideEffects:
+    """Nothing that writes to the outside world may fire from a preview.
+
+    `k8s_apps` brackets its Pulumi run with a GitHub Deployment — `action:
+    start` in custom_dependencies, `action: finish` in additional_post_steps.
+    Running `start` from a preview would open a Deployment for a promotion
+    nobody has approved, leaving it `pending` until someone closes the gate, or
+    forever if they never do.
+    """
+
+    @staticmethod
+    def _chain():
+        return _gated_chain(
+            custom_dependencies={
+                1: [
+                    GetStep(get=Identifier("release-gate"), trigger=True),
+                    PutStep(
+                        put=Identifier("deployment-rc"), params={"action": "start"}
+                    ),
+                ]
+            },
+            additional_post_steps={
+                1: [
+                    PutStep(put=Identifier("fastly-purge"), no_get=True),
+                    PutStep(
+                        put=Identifier("deployment-rc"), params={"action": "finish"}
+                    ),
+                ]
+            },
+        )
+
+    @staticmethod
+    def _puts(job):
+        return [str(s.put) for s in job.plan if isinstance(s, PutStep)]
+
+    def test_preview_runs_no_side_effects(self):
+        preview = _job(self._chain(), "preview-ol-substructure-keycloak-qa")
+        assert self._puts(preview) == ["pulumi-ol-substructure-keycloak"]
+
+    def test_preview_still_gets_read_only_inputs(self):
+        preview = _job(self._chain(), "preview-ol-substructure-keycloak-qa")
+        gets = [str(s.get) for s in preview.plan if isinstance(s, GetStep)]
+        assert "release-gate" in gets
+
+    def test_deploy_brackets_the_apply_with_its_side_effects(self):
+        """Start → up → purge → finish, in that order."""
+        deploy = _job(self._chain(), "deploy-ol-substructure-keycloak-qa")
+        puts = self._puts(deploy)
+        assert puts == [
+            "deployment-rc",
+            "pulumi-ol-substructure-keycloak",
+            "fastly-purge",
+            "deployment-rc",
+        ]
+
+    def test_start_precedes_the_apply_and_finish_follows_it(self):
+        deploy = _job(self._chain(), "deploy-ol-substructure-keycloak-qa")
+        actions = [
+            (str(s.put), (s.params or {}).get("action"))
+            for s in deploy.plan
+            if isinstance(s, PutStep)
+        ]
+        apply_at = next(
+            i for i, (name, _) in enumerate(actions) if name.startswith("pulumi-")
+        )
+        start_at = next(i for i, (_, a) in enumerate(actions) if a == "start")
+        finish_at = next(i for i, (_, a) in enumerate(actions) if a == "finish")
+        assert start_at < apply_at < finish_at
+
+    def test_post_steps_never_reach_the_preview(self):
+        preview = _job(self._chain(), "preview-ol-substructure-keycloak-qa")
+        assert "fastly-purge" not in self._puts(preview)
+
+    def test_post_steps_are_scoped_to_their_own_stage(self):
+        fragment = self._chain()
+        prod = _job(fragment, "deploy-ol-substructure-keycloak-production")
+        assert "fastly-purge" not in self._puts(prod)
+
+    def test_exempt_stage_gets_its_side_effects_and_post_steps(self):
+        fragment = _gated_chain(
+            custom_dependencies={0: [PutStep(put=Identifier("ci-effect"))]},
+            additional_post_steps={0: [PutStep(put=Identifier("ci-post"))]},
+        )
+        puts = self._puts(_job(fragment, "deploy-ol-substructure-keycloak-ci"))
+        assert puts == [
+            "ci-effect",
+            "pulumi-ol-substructure-keycloak",
+            "ci-post",
+        ]
