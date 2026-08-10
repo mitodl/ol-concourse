@@ -48,6 +48,15 @@ PYPI_INDEX_URL = "https://pypi.org"
 PYPI_UPLOAD_URL = "https://upload.pypi.org/legacy/"
 _HTTP_NOT_FOUND = 404
 
+# How long to keep retrying a 404 while PyPI's JSON index catches up with an
+# upload that has already landed. Overridable per-resource in the pipeline's
+# `source`, so tuning it is a pipeline re-set rather than a release of this
+# image. 0 disables the wait entirely.
+_DEFAULT_INDEX_LAG_TIMEOUT_SECONDS = 300.0
+# Cap on any single sleep, so a long budget does not become one huge final
+# sleep that overshoots the moment the index actually catches up.
+_MAX_RETRY_DELAY_SECONDS = 30.0
+
 
 class PyPIVersion(Version, SortableVersionMixin):
     """Version type representing a PyPI package version string."""
@@ -65,7 +74,7 @@ class PyPIVersion(Version, SortableVersionMixin):
 class PyPIResource(ConcourseResource):
     """Concourse resource for check/get/put against a PyPI-compatible index."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         /,
         package_name: str,
@@ -73,6 +82,7 @@ class PyPIResource(ConcourseResource):
         username: str = "__token__",
         repository_url: str = PYPI_UPLOAD_URL,
         index_url: str = PYPI_INDEX_URL,
+        index_lag_timeout_seconds: float | str = _DEFAULT_INDEX_LAG_TIMEOUT_SECONDS,
     ) -> None:
         super().__init__(PyPIVersion)
         self.package_name = package_name
@@ -80,6 +90,9 @@ class PyPIResource(ConcourseResource):
         self.password = password
         self.repository_url = repository_url
         self.index_url = index_url.rstrip("/")
+        # Values arriving from pipeline YAML can be strings; coerce once here
+        # rather than assuming an int and failing later inside the arithmetic.
+        self.index_lag_timeout_seconds = float(index_lag_timeout_seconds)
 
     def _get_package_metadata(self) -> dict[str, Any]:
         """Query the PyPI JSON API for all package metadata."""
@@ -99,27 +112,53 @@ class PyPIResource(ConcourseResource):
         self,
         version: str,
         *,
-        max_attempts: int = 5,
+        max_attempts: int | None = None,
         base_delay_seconds: float = 1.0,
+        timeout_seconds: float | None = None,
+        max_delay_seconds: float = _MAX_RETRY_DELAY_SECONDS,
     ) -> list[dict[str, Any]]:
-        """Fetch version file metadata, retrying a 404 with exponential backoff.
+        """Fetch version file metadata, retrying a 404 while the index catches up.
 
-        PyPI's JSON index can lag a few seconds behind an upload actually
-        landing. Concourse performs an implicit `get` right after a `put`
-        succeeds so later steps can use the artifact -- that get can race
-        this index lag and fail the whole build even though the upload
-        itself genuinely succeeded (confirmed live on pypi.org, just not
-        yet reflected in the JSON API). Only retries on 404, since that's
-        the specific "not indexed yet" signal; any other error propagates
-        immediately as a real failure.
+        PyPI's JSON index lags behind an upload actually landing. Concourse runs
+        an implicit `get` right after a `put` succeeds, and that get races the
+        lag: the build goes red reporting a failed publish for a package that is
+        already live on pypi.org and installable. Confirmed on
+        `publish-ol-concourse-lib` builds 38, 39 and 40, each of which logged
+        `View at: https://pypi.org/project/ol-concourse/<version>/` and then
+        404'd on `/pypi/<pkg>/<version>/json`.
+
+        The retry is bounded by TIME, not by an attempt count. The previous
+        1+2+4+8 exponential gave up after ~15s of waiting, which real lag
+        exceeded. Delay is capped at *max_delay_seconds* so a long budget does
+        not turn into one enormous final sleep that overshoots the moment the
+        index actually catches up.
+
+        Only 404 is retried -- that is the specific "not indexed yet" signal, and
+        it is genuinely a miss rather than a cached negative (PyPI returns the
+        404 with no `cache-control` and `x-cache: MISS`). Any other status is a
+        real error and propagates immediately.
+
+        *max_attempts* is accepted for callers that want to bound iterations
+        instead of wall-clock; the two bounds compose, whichever trips first.
         """
-        if max_attempts < 1:
+        if max_attempts is not None and max_attempts < 1:
             msg = f"max_attempts must be >= 1, got {max_attempts}"
             raise ValueError(msg)
         if base_delay_seconds < 0:
             msg = f"base_delay_seconds must be >= 0, got {base_delay_seconds}"
             raise ValueError(msg)
-        for attempt in range(max_attempts):
+        budget = (
+            self.index_lag_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        if budget < 0:
+            msg = f"timeout_seconds must be >= 0, got {budget}"
+            raise ValueError(msg)
+
+        deadline = time.monotonic() + budget
+        attempt = 0
+        while True:
             try:
                 return self._get_version_files(version)
             except requests.HTTPError as exc:
@@ -127,11 +166,21 @@ class PyPIResource(ConcourseResource):
                     exc.response is not None
                     and exc.response.status_code == _HTTP_NOT_FOUND
                 )
-                if not is_not_found or attempt == max_attempts - 1:
+                if not is_not_found:
                     raise
-                time.sleep(base_delay_seconds * (2**attempt))
-        msg = "unreachable"  # loop above always returns or raises
-        raise AssertionError(msg)
+                attempt += 1
+                if max_attempts is not None and attempt >= max_attempts:
+                    raise
+                delay = min(
+                    base_delay_seconds * (2 ** (attempt - 1)), max_delay_seconds
+                )
+                if time.monotonic() + delay >= deadline:
+                    raise
+                print(  # noqa: T201
+                    f"{version} not indexed yet; retrying in {delay:.0f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
 
     def fetch_new_versions(
         self, previous_version: PyPIVersion | None = None

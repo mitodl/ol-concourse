@@ -108,6 +108,17 @@ def build_pipeline() -> Pipeline:
             PutStep(
                 put=Identifier("ol-concourse-pypi"),
                 params={"glob": "dist/ol_concourse-*"},
+                # This put is the last step and nothing consumes its artifact,
+                # so the implicit get is pure overhead -- and it is not free:
+                # it re-reads the version from PyPI's JSON index, which lags
+                # behind the upload landing, so it can fail a build whose
+                # publish genuinely succeeded. Builds 38, 39 and 40 all went
+                # red that way, each having already logged
+                # `View at: https://pypi.org/project/ol-concourse/<version>/`.
+                #
+                # The resource retries that lag now, but the get it is retrying
+                # buys this pipeline nothing, so don't run it at all.
+                no_get=True,
             ),
         ],
     )

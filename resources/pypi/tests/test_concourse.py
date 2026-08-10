@@ -505,3 +505,133 @@ def test_publish_new_version_no_match_raises(resource, tmp_path):
 )
 def test_extract_version_from_filenames(filenames, expected):
     assert _extract_version_from_filenames(filenames) == expected
+
+
+# ---------------------------------------------------------------------------
+# Index-lag retry: time budget, delay cap, and configurability
+# ---------------------------------------------------------------------------
+
+
+@resp_lib.activate
+def test_retry_survives_lag_longer_than_the_old_15_second_budget(resource):
+    """The regression that took publish-ol-concourse-lib red three times.
+
+    The previous 1+2+4+8 exponential gave up after ~15s of waiting. Real PyPI
+    lag exceeded that, so builds 38, 39 and 40 reported a failed publish for a
+    package already live on pypi.org. Nine 404s is well past the old budget.
+    """
+    for _ in range(9):
+        resp_lib.add(
+            resp_lib.GET,
+            f"https://pypi.org/pypi/{PACKAGE_NAME}/0.3.0/json",
+            status=404,
+        )
+    resp_lib.add(
+        resp_lib.GET,
+        f"https://pypi.org/pypi/{PACKAGE_NAME}/0.3.0/json",
+        json=PYPI_VERSION_METADATA,
+    )
+
+    from unittest.mock import patch
+
+    with patch("concourse.time.sleep"):
+        files = resource._get_version_files_with_retry("0.3.0")
+
+    assert files == PYPI_VERSION_METADATA["urls"]
+
+
+@resp_lib.activate
+def test_individual_sleeps_are_capped(resource):
+    """Uncapped exponential would overshoot the moment the index catches up.
+
+    Doubling without a cap means the last sleep dominates the budget: the
+    resource would sit idle for minutes after the version became available.
+    """
+    for _ in range(12):
+        resp_lib.add(
+            resp_lib.GET,
+            f"https://pypi.org/pypi/{PACKAGE_NAME}/0.3.0/json",
+            status=404,
+        )
+    resp_lib.add(
+        resp_lib.GET,
+        f"https://pypi.org/pypi/{PACKAGE_NAME}/0.3.0/json",
+        json=PYPI_VERSION_METADATA,
+    )
+
+    from unittest.mock import patch
+
+    import concourse as pypi_concourse
+
+    with patch("concourse.time.sleep") as mock_sleep:
+        resource._get_version_files_with_retry("0.3.0")
+
+    delays = [call.args[0] for call in mock_sleep.call_args_list]
+    assert delays, "expected the retry to sleep at least once"
+    assert max(delays) <= pypi_concourse._MAX_RETRY_DELAY_SECONDS
+
+
+@resp_lib.activate
+def test_time_budget_is_respected_and_stops_retrying(resource):
+    """A version that never indexes must still fail, not hang forever."""
+    for _ in range(50):
+        resp_lib.add(
+            resp_lib.GET,
+            f"https://pypi.org/pypi/{PACKAGE_NAME}/0.3.0/json",
+            status=404,
+        )
+
+    from unittest.mock import patch
+
+    with patch("concourse.time.sleep"), pytest.raises(requests.HTTPError):
+        resource._get_version_files_with_retry("0.3.0", timeout_seconds=5)
+
+
+@resp_lib.activate
+def test_non_404_still_fails_immediately(resource):
+    """Only 404 means "not indexed yet"; a 500 is a real error."""
+    resp_lib.add(
+        resp_lib.GET,
+        f"https://pypi.org/pypi/{PACKAGE_NAME}/0.3.0/json",
+        status=500,
+    )
+
+    from unittest.mock import patch
+
+    with patch("concourse.time.sleep") as mock_sleep, pytest.raises(requests.HTTPError):
+        resource._get_version_files_with_retry("0.3.0")
+
+    mock_sleep.assert_not_called()
+
+
+def test_timeout_is_configurable_from_pipeline_source():
+    """Tuning the wait must not require rebuilding and releasing this image."""
+    r = PyPIResource(
+        package_name=PACKAGE_NAME, password="x", index_lag_timeout_seconds=42
+    )
+    assert r.index_lag_timeout_seconds == 42
+
+
+def test_timeout_string_from_yaml_is_coerced():
+    """Concourse source values can arrive as strings."""
+    r = PyPIResource(
+        package_name=PACKAGE_NAME, password="x", index_lag_timeout_seconds="90"
+    )
+    assert r.index_lag_timeout_seconds == 90.0
+
+
+@resp_lib.activate
+def test_zero_timeout_disables_waiting(resource):
+    """An operator who wants the old fail-fast behaviour can still have it."""
+    resp_lib.add(
+        resp_lib.GET,
+        f"https://pypi.org/pypi/{PACKAGE_NAME}/0.3.0/json",
+        status=404,
+    )
+
+    from unittest.mock import patch
+
+    with patch("concourse.time.sleep") as mock_sleep, pytest.raises(requests.HTTPError):
+        resource._get_version_files_with_retry("0.3.0", timeout_seconds=0)
+
+    mock_sleep.assert_not_called()

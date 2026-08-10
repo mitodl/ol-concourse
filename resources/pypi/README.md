@@ -24,6 +24,7 @@ resource_types:
 | `username` | | `__token__` | Upload username |
 | `repository_url` | | `https://upload.pypi.org/legacy/` | Upload endpoint (use TestPyPI for testing) |
 | `index_url` | | `https://pypi.org` | Index for `check`/`get` operations |
+| `index_lag_timeout_seconds` | | `300` | How long `get` keeps retrying a 404 while PyPI's JSON index catches up with an upload that has already landed. The index lags behind the upload, and Concourse's implicit `get` after a `put` races it -- without this the build reports a failed publish for a package that is already live and installable. `0` restores fail-fast. |
 
 ## `check`: track new versions
 

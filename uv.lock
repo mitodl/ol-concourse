@@ -899,7 +899,7 @@ dev = [{ name = "pytest", specifier = ">=9.0.3,<10" }]
 
 [[package]]
 name = "ol-concourse-pypi"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "resources/pypi" }
 dependencies = [
     { name = "concoursetools" },
