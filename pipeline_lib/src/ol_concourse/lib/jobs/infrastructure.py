@@ -623,6 +623,30 @@ def pulumi_job(  # noqa: PLR0913
 PREVIEW_SUMMARY_FILENAME = "preview_summary.md"
 
 
+def _stage_inputs(deps: list[GetStep] | None, *, allow_trigger: bool) -> list[GetStep]:
+    """Copy a stage's extra inputs for one job, neutering triggers where unsafe.
+
+    Stage inputs are not merely triggers -- callers pass artifacts the Pulumi run
+    consumes (k8s_apps hands in a `deployment.json`, kubewatch a `passed`-gated
+    build). Both the preview and the deploy run Pulumi over the same tree, so
+    both need them.
+
+    ★ BUT `trigger: true` MUST NOT REACH A GATED DEPLOY. That job is supposed to
+    start only when a human closes the gate; a triggering input would fire it on
+    a new image or upstream build and walk straight past the approval the whole
+    topology exists to require. Copies are deep so a caller's step object is
+    never mutated -- the existing chain mutates shared dependencies in place and
+    it is a long-standing trap.
+    """
+    inputs: list[GetStep] = []
+    for dep in deps or []:
+        step = dep.model_copy(deep=True)
+        if not allow_trigger and getattr(step, "trigger", None):
+            step.trigger = False
+        inputs.append(step)
+    return inputs
+
+
 def _stack_serial_group(project_name: str, stack_name: str) -> str:
     """Return the serial group shared by a stack's preview and deploy jobs.
 
@@ -639,7 +663,6 @@ def _dispatch_preview_gated(
     *,
     enable_github_issue_resource: bool,
     preview_next_stack: bool,
-    custom_dependencies: dict[int, list[GetStep]] | None,
     additional_post_steps: dict[int, list[GetStep | PutStep | TaskStep]] | None,
     github_issue_repository: str | None,
     **kwargs: Any,
@@ -668,10 +691,7 @@ def _dispatch_preview_gated(
         raise ValueError(msg)
     unsupported = [
         name
-        for name, value in (
-            ("custom_dependencies", custom_dependencies),
-            ("additional_post_steps", additional_post_steps),
-        )
+        for name, value in (("additional_post_steps", additional_post_steps),)
         if value
     ]
     if unsupported:
@@ -686,7 +706,7 @@ def _dispatch_preview_gated(
     )
 
 
-def _preview_gated_chain(  # noqa: PLR0913
+def _preview_gated_chain(  # noqa: PLR0913, PLR0915
     pulumi_code: Resource,
     stack_names: list[str],
     project_name: str,
@@ -696,6 +716,7 @@ def _preview_gated_chain(  # noqa: PLR0913
     github_issue_assignees: list[str] | None = None,
     github_issue_labels: list[str] | None = None,
     dependencies: list[GetStep] | None = None,
+    custom_dependencies: dict[int, list[GetStep]] | None = None,
     additional_env_vars: dict[str, str] | None = None,
     env_vars_from_files: dict[str, str] | None = None,
     refresh_stack: bool = True,
@@ -815,7 +836,12 @@ def _preview_gated_chain(  # noqa: PLR0913
         )
 
     previous_deploy: Job | None = None
-    for stack_name in stack_names:
+    for index, stack_name in enumerate(stack_names):
+        # Chain-wide dependencies plus this stage's index-keyed custom ones.
+        stage_inputs = [
+            *(dependencies or []),
+            *((custom_dependencies or {}).get(index) or []),
+        ]
         slug = stack_name.lower().replace(".", "-")
         serial_group = _stack_serial_group(project_name, stack_name)
         passed_from = [previous_deploy.name] if previous_deploy else None
@@ -835,10 +861,13 @@ def _preview_gated_chain(  # noqa: PLR0913
                 name=Identifier(f"deploy-{project_name}-{slug}"),
                 serial_groups=[Identifier(serial_group)],
                 plan=[
+                    # Entry point for an exempt stage: triggers are wanted here.
+                    *_stage_inputs(stage_inputs, allow_trigger=True),
                     GetStep(get=pulumi_code.name, trigger=True, passed=passed_from),
                     PutStep(
                         inputs="all",
                         put=pulumi_resource.name,
+                        attempts=pulumi_put_attempts,
                         no_get=False,
                         get_params={
                             "summary_file": DEPLOY_SUMMARY_FILENAME,
@@ -894,7 +923,9 @@ def _preview_gated_chain(  # noqa: PLR0913
             name=Identifier(f"preview-{project_name}-{slug}"),
             serial_groups=[Identifier(serial_group)],
             plan=[
-                *[d.model_copy() for d in (dependencies or [])],
+                # The preview IS the entry point of a gated stage, so this is
+                # where upstream triggers belong.
+                *_stage_inputs(stage_inputs, allow_trigger=True),
                 GetStep(get=pulumi_code.name, trigger=True, passed=passed_from),
                 PutStep(
                     inputs="all",
@@ -930,7 +961,8 @@ def _preview_gated_chain(  # noqa: PLR0913
             name=Identifier(f"deploy-{project_name}-{slug}"),
             serial_groups=[Identifier(serial_group)],
             plan=[
-                *[d.model_copy() for d in (dependencies or [])],
+                # Same inputs, triggers stripped: only the gate starts this job.
+                *_stage_inputs(stage_inputs, allow_trigger=False),
                 GetStep(get=gate_trigger.name, trigger=True),
                 # `passed` is the guarantee: only code that went through this
                 # stack's own preview is eligible to deploy to it.

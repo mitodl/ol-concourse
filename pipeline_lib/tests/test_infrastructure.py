@@ -691,6 +691,93 @@ class TestPreviewGatedRejectsUnsupportedInputs:
         with pytest.raises(ValueError, match="enable_github_issue_resource"):
             _gated_chain(enable_github_issue_resource=False)
 
-    def test_index_keyed_params_are_rejected_not_dropped(self):
+    def test_additional_post_steps_rejected_not_dropped(self):
         with pytest.raises(ValueError, match="not yet supported"):
-            _gated_chain(custom_dependencies={0: [GetStep(get=Identifier("x"))]})
+            _gated_chain(additional_post_steps={0: [GetStep(get=Identifier("x"))]})
+
+
+class TestPreviewGatedStageInputs:
+    """Stage inputs are artifacts the Pulumi run consumes, not just triggers.
+
+    k8s_apps hands in a `deployment.json`; kubewatch a `passed`-constrained
+    build; simple_pulumi a cross-environment gate issue. Preview and deploy both
+    run Pulumi over the same tree, so both need them — but a triggering input on
+    the gated deploy would start it without anyone closing the gate.
+    """
+
+    @staticmethod
+    def _dep(name="some-image", **kw):
+        return GetStep(get=Identifier(name), trigger=True, **kw)
+
+    def _gets(self, job, name):
+        return [s for s in job.plan if str(getattr(s, "get", "")) == name]
+
+    def test_chain_dependencies_reach_every_job(self):
+        fragment = _gated_chain(dependencies=[self._dep()])
+        for job_name in (
+            "deploy-ol-substructure-keycloak-ci",
+            "preview-ol-substructure-keycloak-qa",
+            "deploy-ol-substructure-keycloak-qa",
+        ):
+            job = _job(fragment, job_name)
+            assert self._gets(job, "some-image"), f"{job_name} lost the input"
+
+    def test_triggering_input_cannot_start_a_gated_deploy(self):
+        """The regression that would silently defeat the entire topology."""
+        fragment = _gated_chain(dependencies=[self._dep()])
+        deploy = _job(fragment, "deploy-ol-substructure-keycloak-qa")
+        dep = self._gets(deploy, "some-image")[0]
+        assert dep.trigger is not True, (
+            "a triggering input on a gated deploy bypasses the gate entirely"
+        )
+
+    def test_the_same_input_still_triggers_the_preview(self):
+        fragment = _gated_chain(dependencies=[self._dep()])
+        preview = _job(fragment, "preview-ol-substructure-keycloak-qa")
+        assert self._gets(preview, "some-image")[0].trigger is True
+
+    def test_custom_dependencies_land_on_their_own_stage_only(self):
+        fragment = _gated_chain(
+            custom_dependencies={1: [self._dep("qa-only-artifact")]}
+        )
+        assert self._gets(
+            _job(fragment, "preview-ol-substructure-keycloak-qa"), "qa-only-artifact"
+        )
+        assert not self._gets(
+            _job(fragment, "deploy-ol-substructure-keycloak-ci"), "qa-only-artifact"
+        )
+        assert not self._gets(
+            _job(fragment, "preview-ol-substructure-keycloak-production"),
+            "qa-only-artifact",
+        )
+
+    def test_custom_dependencies_reach_both_jobs_of_their_stage(self):
+        """The deploy runs Pulumi too — it needs the artifact, not just the preview."""
+        fragment = _gated_chain(
+            custom_dependencies={1: [self._dep("qa-only-artifact")]}
+        )
+        deploy = _job(fragment, "deploy-ol-substructure-keycloak-qa")
+        dep = self._gets(deploy, "qa-only-artifact")[0]
+        assert dep.trigger is not True
+
+    def test_custom_dependencies_on_an_exempt_stage_keep_their_trigger(self):
+        fragment = _gated_chain(custom_dependencies={0: [self._dep("ci-artifact")]})
+        deploy_ci = _job(fragment, "deploy-ol-substructure-keycloak-ci")
+        assert self._gets(deploy_ci, "ci-artifact")[0].trigger is True
+
+    def test_passed_constraints_on_inputs_are_preserved(self):
+        fragment = _gated_chain(
+            custom_dependencies={1: [self._dep("built", passed=["some-upstream-job"])]}
+        )
+        for job_name in (
+            "preview-ol-substructure-keycloak-qa",
+            "deploy-ol-substructure-keycloak-qa",
+        ):
+            dep = self._gets(_job(fragment, job_name), "built")[0]
+            assert dep.passed == ["some-upstream-job"]
+
+    def test_callers_step_objects_are_not_mutated(self):
+        """The existing chain mutates shared dependencies in place; do not."""
+        dep = self._dep()
+        _gated_chain(dependencies=[dep])
+        assert dep.trigger is True
