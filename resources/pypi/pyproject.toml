@@ -1,6 +1,6 @@
 [project]
 name = "ol-concourse-pypi"
-version = "0.1.0"
+version = "0.2.0"
 description = "Concourse resource type for PyPI package publishing and version tracking"
 authors = [{ name = "MIT Open Learning", email = "odl-devops@mit.edu" }]
 requires-python = ">=3.13"
