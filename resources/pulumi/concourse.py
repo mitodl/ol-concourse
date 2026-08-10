@@ -622,7 +622,10 @@ def _changed_properties(event: dict[str, Any]) -> list[str]:
             detail = f"was {_code(old)}"
         else:
             detail = ""
-        lines.append(f"`{path}` ({kind})" + (f": {detail}" if detail else ""))
+        # The path is as untrusted as the value: a Pulumi property key is
+        # quoted precisely because it holds characters like dots and slashes,
+        # and nothing stops one holding a backtick or newline. Sanitise both.
+        lines.append(f"{_code(path)} ({kind})" + (f": {detail}" if detail else ""))
     return lines
 
 

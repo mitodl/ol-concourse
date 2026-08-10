@@ -408,24 +408,81 @@ _SECRET_MARKERS = frozenset({"[secret]", "[unknown]"})
 _MISSING = object()
 
 
+def _parse_property_path(path: str) -> list[str | int]:
+    """Split a Pulumi property path into segments.
+
+    Pulumi's syntax is `root.nested["quoted key"][0]`, and a key is quoted
+    precisely when it contains characters that would otherwise be structural --
+    dots and slashes above all. Kubernetes labels are the everyday case:
+    `labels["app.kubernetes.io/name"]`. Naively stripping brackets and splitting
+    on dots shreds that into four meaningless fragments, so the value silently
+    disappears from the diff -- which is worse than an error, because the gate
+    still renders and just quietly says less than it should.
+
+    Numeric bracket segments stay list indexes; quoted ones are single mapping
+    keys, with `\"` and `\\` unescaped.
+    """
+    segments: list[str | int] = []
+    buffer: list[str] = []
+    index = 0
+    length = len(path)
+
+    def flush() -> None:
+        if buffer:
+            segments.append("".join(buffer))
+            buffer.clear()
+
+    while index < length:
+        char = path[index]
+        if char == ".":
+            flush()
+            index += 1
+        elif char == "[":
+            flush()
+            index += 1
+            if index < length and path[index] == '"':
+                index += 1
+                key: list[str] = []
+                while index < length and path[index] != '"':
+                    if path[index] == "\\" and index + 1 < length:
+                        index += 1
+                    key.append(path[index])
+                    index += 1
+                index += 1  # closing quote
+                segments.append("".join(key))
+            else:
+                digits: list[str] = []
+                while index < length and path[index] != "]":
+                    digits.append(path[index])
+                    index += 1
+                raw = "".join(digits)
+                segments.append(int(raw) if raw.isdigit() else raw)
+            while index < length and path[index] != "]":
+                index += 1
+            index += 1  # closing bracket
+        else:
+            buffer.append(char)
+            index += 1
+    flush()
+    return segments
+
+
 def _resolve_property_path(root: Any, path: str) -> Any:
-    """Resolve a Pulumi detailed-diff path like ``tags.Env`` or ``uris[1]``.
+    """Resolve a Pulumi detailed-diff path against an input tree.
 
     Returns ``_MISSING`` rather than raising when the path does not exist, which
     is normal: an ``add`` has no old value and a ``delete`` has no new one.
     """
     current = root
-    for raw_segment in path.replace("[", ".").replace("]", "").split("."):
-        if raw_segment == "" or current is _MISSING:
-            continue
-        if isinstance(current, dict):
-            if raw_segment not in current:
+    for segment in _parse_property_path(path):
+        if isinstance(segment, int):
+            if not isinstance(current, (list, tuple)) or segment >= len(current):
                 return _MISSING
-            current = current[raw_segment]
-        elif isinstance(current, (list, tuple)):
-            if not raw_segment.isdigit() or int(raw_segment) >= len(current):
+            current = current[segment]
+        elif isinstance(current, dict):
+            if segment not in current:
                 return _MISSING
-            current = current[int(raw_segment)]
+            current = current[segment]
         else:
             return _MISSING
     return current

@@ -1595,3 +1595,101 @@ class TestDiffValues:
         assert "`" in line
         assert "\n" not in line
         assert "a'b" in line
+
+
+class TestPropertyPathParsing:
+    """Pulumi quotes a property key precisely when it contains dots or slashes.
+
+    `labels["app.kubernetes.io/name"]` is the everyday Kubernetes case, and it
+    is exactly what the EKS gates will see. Splitting on dots shredded it into
+    meaningless fragments and the value vanished from the diff — worse than an
+    error, because the gate still rendered and just quietly said less.
+    """
+
+    def test_dotted_kubernetes_label_key_resolves(self) -> None:
+        inputs = {"labels": {"app.kubernetes.io/name": "omnigraph"}}
+        got = pulumi_utils._resolve_property_path(
+            inputs, 'labels["app.kubernetes.io/name"]'
+        )
+        assert got == "omnigraph"
+
+    def test_plain_dotted_path_still_resolves(self) -> None:
+        assert (
+            pulumi_utils._resolve_property_path(
+                {"labels": {"tier": "spot"}}, "labels.tier"
+            )
+            == "spot"
+        )
+
+    def test_numeric_index_stays_a_list_index(self) -> None:
+        assert (
+            pulumi_utils._resolve_property_path({"uris": ["a", "b"]}, "uris[1]") == "b"
+        )
+
+    def test_escaped_quote_inside_a_key(self) -> None:
+        inputs = {"q": {'we"ird': 1}}
+        assert pulumi_utils._resolve_property_path(inputs, 'q["we\\"ird"]') == 1
+
+    def test_quoted_key_followed_by_index(self) -> None:
+        inputs = {"m": {"a.b": ["x", "y"]}}
+        assert pulumi_utils._resolve_property_path(inputs, 'm["a.b"][1]') == "y"
+
+    def test_missing_path_is_missing_not_an_error(self) -> None:
+        assert (
+            pulumi_utils._resolve_property_path({}, "nope.missing")
+            is pulumi_utils._MISSING
+        )
+
+    def test_index_past_the_end_is_missing(self) -> None:
+        assert (
+            pulumi_utils._resolve_property_path({"uris": ["a"]}, "uris[9]")
+            is pulumi_utils._MISSING
+        )
+
+    def test_dotted_label_value_reaches_the_rendered_diff(self) -> None:
+        """End-to-end: the regression case Copilot asked to pin."""
+        meta = MagicMock()
+        meta.op = OpType.UPDATE
+        meta.urn = "urn:pulumi:QA::p::k8s::deploy"
+        meta.type = "kubernetes:apps/v1:Deployment"
+        meta.diffs = ['labels["app.kubernetes.io/version"]']
+        meta.detailed_diff = {
+            'labels["app.kubernetes.io/version"]': MagicMock(
+                diff_kind=DiffKind.UPDATE, input_diff=True
+            )
+        }
+        meta.old.inputs = {"labels": {"app.kubernetes.io/version": "1.2.3"}}
+        meta.new.inputs = {"labels": {"app.kubernetes.io/version": "1.2.4"}}
+        evt = MagicMock()
+        evt.metadata = meta
+
+        line = _render_changed_properties(pulumi_utils.serialize_resource_event(evt))[0]
+        assert "`1.2.3` → `1.2.4`" in line
+
+
+class TestPropertyPathIsSanitized:
+    """The path is as untrusted as the value.
+
+    A key is quoted because it holds structural characters; nothing stops one
+    holding a backtick or newline, which would terminate the inline-code span
+    and inject Markdown into the published issue body.
+    """
+
+    @staticmethod
+    def _line(path: str) -> str:
+        event = {
+            "operation": "update",
+            "urn": "urn:pulumi:QA::p::t::n",
+            "type": "t",
+            "diffs": [path],
+            "detailed_diff": {path: {"diff_kind": "update", "new": "x"}},
+        }
+        return _render_changed_properties(event)[0]
+
+    def test_backtick_in_path_cannot_break_the_span(self) -> None:
+        line = self._line('labels["a`b"]')
+        assert "a'b" in line
+        assert "`a`b`" not in line
+
+    def test_newline_in_path_cannot_break_the_list_item(self) -> None:
+        assert "\n" not in self._line('labels["a\nb"]')
