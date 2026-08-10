@@ -91,6 +91,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         env_os: dict[str, str] | None = None,
         summary_file: str | None = None,
         read_outputs: bool = True,
+        preview_stack: str = "",
     ) -> tuple[PulumiVersion, dict[str, str]]:
         """Read stack outputs and optionally run a preview.
 
@@ -110,7 +111,7 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         """
         if summary_file:
             (destination_dir / summary_file).write_text(
-                _render_summary(version, build_metadata)
+                _render_summary(version, build_metadata, preview_stack)
             )
 
         metadata: dict[str, str] = {}
@@ -179,10 +180,17 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         env_os: dict[str, str] | None = None,
         env_vars_from_files: dict[str, str] | None = None,
         max_carried_changes: int | str | None = None,
+        fail_on_error: bool = True,
     ) -> tuple[PulumiVersion, dict[str, str]]:
         """Execute a Pulumi action against a stack.
 
         sources_dir is the job working directory containing all fetched inputs.
+
+        *fail_on_error* only applies to ``preview``.  Leave it True for a preview
+        a pipeline actually gates on.  Set it False for an advisory preview that
+        runs after a successful deploy -- a promotion gate showing what the next
+        environment would get -- where failing the step would report red on
+        infrastructure that is already live and correct.
         """
         effective_action = action or self.action
         if effective_action not in ("cancel", "create", "update", "destroy"):
@@ -254,31 +262,45 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
 
         elif preview:
             preview_file = work_dir / f"{effective['stack_name']}_preview.json"
-            if effective_action == "create":
-                pulumi_utils.create_stack(
-                    stack_name=effective["stack_name"],
-                    project_name=effective["project_name"],
-                    source_dir=work_dir,
-                    stack_config=cfg,
-                    env_pulumi=effective["env_pulumi"],
-                    preview=True,
-                    preview_file=preview_file,
-                )
-            else:
-                pulumi_utils.update_stack(
-                    stack_name=effective["stack_name"],
-                    project_name=effective["project_name"],
-                    source_dir=work_dir,
-                    stack_config=cfg,
-                    env_pulumi=effective["env_pulumi"],
-                    refresh_stack=refresh_stack,
-                    preview=True,
-                    preview_file=preview_file,
-                )
+            try:
+                if effective_action == "create":
+                    stack_update = pulumi_utils.create_stack(
+                        stack_name=effective["stack_name"],
+                        project_name=effective["project_name"],
+                        source_dir=work_dir,
+                        stack_config=cfg,
+                        env_pulumi=effective["env_pulumi"],
+                        preview=True,
+                        preview_file=preview_file,
+                        max_carried_changes=effective["max_carried_changes"],
+                    )
+                else:
+                    stack_update = pulumi_utils.update_stack(
+                        stack_name=effective["stack_name"],
+                        project_name=effective["project_name"],
+                        source_dir=work_dir,
+                        stack_config=cfg,
+                        env_pulumi=effective["env_pulumi"],
+                        refresh_stack=refresh_stack,
+                        preview=True,
+                        preview_file=preview_file,
+                        max_carried_changes=effective["max_carried_changes"],
+                    )
+            except Exception as exc:
+                if fail_on_error:
+                    raise
+                # A gate preview runs on the SUCCESS PATH of a deploy that has
+                # already applied. Failing here would report red on
+                # infrastructure that is live and correct, which is a worse lie
+                # than having no preview at all. Degrade to a version that says
+                # so, and let the rendered body tell the reviewer the preview is
+                # missing rather than implying there is nothing to see.
+                print(f"preview failed, continuing without it: {exc}")  # noqa: T201
+                stack_update = pulumi_utils.preview_failed(str(exc))
             version_id = 0
-            preview_data = json.loads(preview_file.read_text())
-            metadata["preview_file"] = str(preview_file)
-            metadata["changes"] = json.dumps(preview_data.get("change_summary", {}))
+            if preview_file.exists():
+                metadata["preview_file"] = str(preview_file)
+            metadata.update(stack_update.to_flat_dict())
 
         else:
             if effective_action == "create":
@@ -350,7 +372,11 @@ def _apply_os_env(env_vars: dict[str, str]) -> None:
 _NOTABLE_OPS = ("create", "update", "replace", "delete")
 
 
-def _render_summary(version: PulumiVersion, build_metadata: BuildMetadata) -> str:
+def _render_summary(
+    version: PulumiVersion,
+    build_metadata: BuildMetadata,
+    preview_stack: str = "",
+) -> str:
     """Render the deploy summary carried on *version* as Markdown.
 
     This ends up as the body of the `[bot] Pulumi <project> <stack> deployed.`
@@ -380,6 +406,9 @@ def _render_summary(version: PulumiVersion, build_metadata: BuildMetadata) -> st
         )
 
     summary = json.loads(version.summary)
+    if summary.get("result") in ("preview", "preview-failed"):
+        return _render_preview(summary, build_metadata, preview_stack)
+
     changes: dict[str, int] = json.loads(summary.get("resource_changes", "{}"))
 
     lines = [
@@ -418,6 +447,76 @@ def _render_summary(version: PulumiVersion, build_metadata: BuildMetadata) -> st
         )
     )
     lines.extend(["", f"Deployed by {build_link}.", ""])
+    return "\n".join(lines)
+
+
+def _render_preview(
+    summary: dict[str, Any], build_metadata: BuildMetadata, preview_stack: str
+) -> str:
+    """Render a preview of the NEXT environment as Markdown.
+
+    This is the other half of a promotion gate. The applied diff above says what
+    this deploy *did*; this says what closing the issue *will do* to the next
+    environment -- which is the decision actually being made, and the only part
+    that can surface drift the deployed environment does not have.
+
+    It is deliberately framed as a prediction, and timestamped. A gate can sit
+    open for days, and what finally applies may differ (drift, other merges
+    landing meanwhile). A preview presented as a guarantee would be worse than
+    no preview, because it would be trusted.
+    """
+    target = f" `{preview_stack}`" if preview_stack else " the next environment"
+    taken = build_metadata.build_url()
+
+    if summary.get("result") == "preview-failed":
+        return (
+            f"\n---\n\n## :warning: Could not preview{target}\n\n"
+            "The deploy above succeeded; only the preview of the next "
+            "environment failed, so **this does not mean anything is wrong with "
+            "what was just deployed**.\n\n"
+            f"```\n{summary.get('error', 'unknown error')}\n```\n\n"
+            "Promoting is still safe to consider on the evidence above -- there "
+            "is simply no preview of what the next environment will receive. "
+            f"See [the build log]({taken}).\n"
+        )
+
+    changes: dict[str, int] = json.loads(summary.get("resource_changes", "{}"))
+    events = json.loads(summary.get("changes", "[]"))
+    total = int(summary.get("changes_total", 0))
+
+    lines = [
+        "",
+        "---",
+        "",
+        f"## Promoting this will apply to{target}",
+        "",
+        f"A `pulumi preview` run against the next environment at the time of "
+        f"[this build]({taken}).",
+        "",
+        ":hourglass: **This is a prediction, not a guarantee.** It was taken when "
+        "this issue was opened; if the gate sits open, drift or other merges can "
+        "change what actually applies.",
+        "",
+    ]
+
+    if not events and not changes:
+        lines.extend(
+            [
+                ":white_check_mark: No changes -- the next environment is already "
+                "in the state this deploy produced.",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+    lines.extend(["| Change | Count |", "| --- | --- |"])
+    for op in _NOTABLE_OPS:
+        lines.append(f"| {op} | {changes.get(op, 0)} |")
+    for op in sorted(set(changes) - set(_NOTABLE_OPS)):
+        lines.append(f"| {op} | {changes[op]} |")
+
+    lines.extend(_render_changes(events, total))
+    lines.append("")
     return "\n".join(lines)
 
 

@@ -55,6 +55,7 @@ class StackUpdate:
     duration_seconds: int | None = None
     changes: list[dict[str, Any]] = field(default_factory=list)
     changes_total: int = 0
+    error: str = ""
 
     def to_flat_dict(self) -> dict[str, str]:
         """Flatten to strings, for a Concourse version or metadata payload."""
@@ -68,6 +69,8 @@ class StackUpdate:
         if self.changes:
             flat["changes"] = json.dumps(self.changes)
             flat["changes_total"] = str(self.changes_total)
+        if self.error:
+            flat["error"] = self.error
         return flat
 
 
@@ -220,8 +223,8 @@ def create_stack(  # noqa: PLR0913
     _apply_stack_config(stack, stack_config)
 
     if preview:
-        _run_preview_on_stack(stack, preview_file)
-        return _preview_stack_update()
+        payload = _run_preview_on_stack(stack, preview_file)
+        return _preview_stack_update(payload, max_carried_changes)
 
     events, on_event = _collect_resource_events()
     result = _with_lock_recovery(
@@ -230,9 +233,43 @@ def create_stack(  # noqa: PLR0913
     return summarize_up_result(result, events, max_carried_changes)
 
 
-def _preview_stack_update() -> StackUpdate:
-    """Return the StackUpdate for a preview run, which applies nothing."""
-    return StackUpdate(version=0, result="preview", resource_changes={})
+def _preview_stack_update(
+    payload: dict[str, Any] | None = None,
+    max_carried_changes: int = DEFAULT_MAX_CARRIED_CHANGES,
+) -> StackUpdate:
+    """Return the StackUpdate for a preview run, which applies nothing.
+
+    A preview emits the same per-resource shape an update does, so it carries
+    its changes on the version the same way -- that is what lets a promotion
+    gate show "what applying this to the next environment would do" beside
+    "what this deploy actually did".  ``version`` stays 0 because a preview
+    creates no stack version.
+    """
+    payload = payload or {}
+    changed: list[dict[str, Any]] = list(payload.get("changes") or [])
+    return StackUpdate(
+        version=0,
+        result="preview",
+        resource_changes={
+            str(k): int(v) for k, v in (payload.get("change_summary") or {}).items()
+        },
+        changes=changed if max_carried_changes == 0 else changed[:max_carried_changes],
+        changes_total=len(changed),
+    )
+
+
+def preview_failed(error: str) -> StackUpdate:
+    """Return a StackUpdate standing in for a preview that could not run.
+
+    Carried on the version so the reviewer is told the preview is missing.
+    Silence would read as "nothing to see", which is the opposite of the truth.
+    """
+    return StackUpdate(
+        version=0,
+        result="preview-failed",
+        resource_changes={},
+        error=error,
+    )
 
 
 def update_stack(  # noqa: PLR0913
@@ -272,8 +309,8 @@ def update_stack(  # noqa: PLR0913
         _with_lock_recovery(lambda: stack.refresh(on_output=print), stack, stack_name)
 
     if preview:
-        _run_preview_on_stack(stack, preview_file)
-        return _preview_stack_update()
+        payload = _run_preview_on_stack(stack, preview_file)
+        return _preview_stack_update(payload, max_carried_changes)
 
     events, on_event = _collect_resource_events()
     result = _with_lock_recovery(
