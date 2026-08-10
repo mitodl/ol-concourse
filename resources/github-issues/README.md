@@ -43,6 +43,7 @@ Marks the issue as consumed by prefixing the title with `[CONSUMED #<build_numbe
 | `assignees` | No | List of GitHub usernames to assign |
 | `labels` | No | List of label names to apply |
 | `body_file` | No | Path to a file whose contents are used as the issue body, overriding `issue_body_template` |
+| `body_files` | No | List of paths whose contents are concatenated **in the order given** to form the issue body, overriding `issue_body_template`. Use this when the body is assembled from more than one step's artifact -- a Concourse `put` emits no artifact of its own, so each fragment arrives via its own implicit `get`. Takes precedence over `body_file` if both are set. Unlike `body_file`, a **missing** entry does not fail the put: it is replaced by a visible warning naming the absent path, because a fragment's producing step may be allowed to fail without failing the build. |
 | `title_template` | No | Overrides the source-level `issue_title_template` for this put. Use this to embed a value only known at build time, e.g. a release version loaded via `load_var` earlier in the same job -- put an unresolved `((.:my_var))` reference in the params value; Concourse resolves it to a plain string before this resource ever runs, so `title_template` arrives here already containing the concrete value. |
 
 The issue title and body are generated from configurable templates:

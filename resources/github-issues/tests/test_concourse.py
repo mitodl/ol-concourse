@@ -931,3 +931,15 @@ class TestBodyFilesComposition:
     def test_template_still_used_when_no_files_given(self, tmp_path):
         body = self._resource().get_issue_body_from_build(mock_build_metadata())
         assert "has completed build number" in body
+
+    def test_single_body_file_still_raises_when_missing(self, tmp_path):
+        """`body_file` is the whole body, not an optional fragment.
+
+        Tolerating a missing one would turn a typo'd path into a published gate
+        issue containing nothing but a warning. Only `body_files` entries are
+        allowed to be absent.
+        """
+        with pytest.raises(FileNotFoundError):
+            self._resource().get_issue_body_from_build(
+                mock_build_metadata(), body_file="typo.md", sources_dir=tmp_path
+            )

@@ -327,20 +327,34 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         by two different put steps in two different artifacts -- a put step emits
         no artifact of its own, so each arrives via its own implicit get.
 
-        A file that is missing is reported in the body rather than skipped. The
-        upstream step that should have written it is allowed to fail without
-        failing the deploy, so absence is expected -- but silently dropping a
-        section would leave a body that reads as complete while omitting the
-        half a reviewer may be relying on.
+        A *body_files* entry that is missing is reported in the body rather than
+        skipped. The upstream step that writes such a fragment is allowed to fail
+        without failing the deploy, so absence is an expected state -- but
+        silently dropping a section would leave a body that reads as complete
+        while omitting the half a reviewer may be relying on.
+
+        A missing *body_file* still raises, as it always has. That one is the
+        entire body rather than an optional fragment, so tolerating it would turn
+        a typo'd path into a published gate issue containing nothing but a
+        warning.
         """
         if body_files:
-            return "\n".join(self._read_body_file(f, sources_dir) for f in body_files)
+            return "\n".join(
+                self._read_body_file(f, sources_dir, required=False) for f in body_files
+            )
         if body_file is not None:
             return self._read_body_file(body_file, sources_dir)
         return self.issue_body_template.format(**build_metadata_dict(build_metadata))
 
-    def _read_body_file(self, body_file: str, sources_dir: Path | None) -> str:
-        """Read one body fragment, refusing to escape the workspace."""
+    def _read_body_file(
+        self, body_file: str, sources_dir: Path | None, *, required: bool = True
+    ) -> str:
+        """Read one body fragment, refusing to escape the workspace.
+
+        *required* False substitutes a visible warning for a missing file instead
+        of raising -- correct for an optional composed fragment, wrong for a sole
+        body, where absence means the caller got the path wrong.
+        """
         if sources_dir is None:
             msg = "sources_dir is required when body_file is provided"
             raise ValueError(msg)
@@ -352,12 +366,12 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         if not resolved.is_relative_to(sources_dir.resolve()):
             msg = "body_file must be within the workspace sources directory"
             raise ValueError(msg)
-        if not resolved.exists():
-            return (
-                f"\n> :warning: Expected content from `{body_file}` was not "
-                "produced by this build.\n"
-            )
-        return resolved.read_text()
+        if required or resolved.exists():
+            return resolved.read_text()
+        return (
+            f"\n> :warning: Expected content from `{body_file}` was not "
+            "produced by this build.\n"
+        )
 
     def get_title_from_build(
         self, build_metadata: BuildMetadata, title_template: str | None = None
