@@ -776,12 +776,20 @@ class TestPreviewGatedStageInputs:
         fragment = _gated_chain(
             custom_dependencies={1: [self._dep("built", passed=["some-upstream-job"])]}
         )
-        for job_name in (
+        preview = self._gets(
+            _job(fragment, "preview-ol-substructure-keycloak-qa"), "built"
+        )[0]
+        assert preview.passed == ["some-upstream-job"]
+
+        # The deploy keeps the caller's constraint and adds the preview, so it
+        # cannot apply a version the approved diff was not rendered against.
+        deploy = self._gets(
+            _job(fragment, "deploy-ol-substructure-keycloak-qa"), "built"
+        )[0]
+        assert deploy.passed == [
+            "some-upstream-job",
             "preview-ol-substructure-keycloak-qa",
-            "deploy-ol-substructure-keycloak-qa",
-        ):
-            dep = self._gets(_job(fragment, job_name), "built")[0]
-            assert dep.passed == ["some-upstream-job"]
+        ]
 
     def test_callers_step_objects_are_not_mutated(self):
         """The existing chain mutates shared dependencies in place; do not."""
@@ -879,3 +887,98 @@ class TestPreviewGatedSideEffects:
             "pulumi-ol-substructure-keycloak",
             "ci-post",
         ]
+
+
+class TestGateAndRecordLabels:
+    """A gate describes what closing it will DO; a record describes what happened.
+
+    The deploy-chained labels describe the NEXT stage, because there the issue is
+    posted after a stage deploys. Reusing them here labelled the QA gate
+    `promotion-to-production` and the Production gate `finalized-deployment`
+    before anything had deployed at all.
+    """
+
+    @staticmethod
+    def _labels(fragment, job_name):
+        return ((_job(fragment, job_name).on_success.params) or {}).get("labels")
+
+    def test_gate_names_the_stage_it_authorises(self):
+        fragment = _gated_chain()
+        assert "promotion-to-qa" in self._labels(
+            fragment, "preview-ol-substructure-keycloak-qa"
+        )
+        assert "promotion-to-production" in self._labels(
+            fragment, "preview-ol-substructure-keycloak-production"
+        )
+
+    def test_gate_is_not_labelled_finalized_before_deploying(self):
+        fragment = _gated_chain()
+        gate = self._labels(fragment, "preview-ol-substructure-keycloak-production")
+        assert "finalized-deployment" not in gate
+
+    def test_record_carries_completion_labels(self):
+        fragment = _gated_chain()
+        qa = self._labels(fragment, "deploy-ol-substructure-keycloak-qa")
+        assert qa is not None, "the gated deploy record had no labels at all"
+        assert "deployed" in qa
+
+    def test_production_record_is_the_finalized_one(self):
+        fragment = _gated_chain()
+        assert "finalized-deployment" in self._labels(
+            fragment, "deploy-ol-substructure-keycloak-production"
+        )
+
+    def test_exempt_stage_record_is_labelled_too(self):
+        fragment = _gated_chain()
+        assert "deployed" in self._labels(
+            fragment, "deploy-ol-substructure-keycloak-ci"
+        )
+
+    def test_explicit_labels_still_override_everything(self):
+        fragment = _gated_chain(github_issue_labels=["mine"])
+        assert self._labels(fragment, "preview-ol-substructure-keycloak-qa") == ["mine"]
+        assert self._labels(fragment, "deploy-ol-substructure-keycloak-qa") == ["mine"]
+
+
+class TestStageInputsAreCorrelatedWithThePreview:
+    """The deploy must not apply a version the approved diff was not rendered from.
+
+    Only the Pulumi code get was tied to the preview. A newer image landing while
+    the gate was open would be picked up by the deploy — and edxapp feeds that
+    digest straight into Pulumi, so it would be a different deploy than the one
+    on the issue.
+    """
+
+    @staticmethod
+    def _chain():
+        return _gated_chain(
+            dependencies=[
+                GetStep(
+                    get=Identifier("app-image"),
+                    trigger=True,
+                    passed=["build-image"],
+                )
+            ]
+        )
+
+    def test_deploy_input_requires_the_preview(self):
+        deploy = _job(self._chain(), "deploy-ol-substructure-keycloak-qa")
+        dep = next(s for s in deploy.plan if str(getattr(s, "get", "")) == "app-image")
+        assert "preview-ol-substructure-keycloak-qa" in (dep.passed or [])
+
+    def test_existing_passed_constraints_are_kept(self):
+        deploy = _job(self._chain(), "deploy-ol-substructure-keycloak-qa")
+        dep = next(s for s in deploy.plan if str(getattr(s, "get", "")) == "app-image")
+        assert "build-image" in (dep.passed or [])
+
+    def test_preview_input_is_not_self_correlated(self):
+        """The preview cannot require having passed itself."""
+        preview = _job(self._chain(), "preview-ol-substructure-keycloak-qa")
+        dep = next(s for s in preview.plan if str(getattr(s, "get", "")) == "app-image")
+        assert dep.passed == ["build-image"]
+
+    def test_exempt_stage_input_is_untouched(self):
+        deploy = _job(self._chain(), "deploy-ol-substructure-keycloak-ci")
+        dep = next(s for s in deploy.plan if str(getattr(s, "get", "")) == "app-image")
+        assert dep.passed == ["build-image"]
+        assert dep.trigger is True
