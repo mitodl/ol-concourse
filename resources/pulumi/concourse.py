@@ -111,7 +111,12 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         """
         if summary_file:
             (destination_dir / summary_file).write_text(
-                _render_summary(version, build_metadata, preview_stack)
+                _render_summary(
+                    version,
+                    build_metadata,
+                    preview_stack,
+                    work_dir=destination_dir.parent,
+                )
             )
 
         metadata: dict[str, str] = {}
@@ -381,6 +386,7 @@ def _render_summary(
     version: PulumiVersion,
     build_metadata: BuildMetadata,
     preview_stack: str = "",
+    work_dir: Path | None = None,
 ) -> str:
     """Render the deploy summary carried on *version* as Markdown.
 
@@ -412,7 +418,7 @@ def _render_summary(
 
     summary = json.loads(version.summary)
     if summary.get("result") in ("preview", "preview-failed"):
-        return _render_preview(summary, build_metadata, preview_stack)
+        return _render_preview(summary, build_metadata, preview_stack, work_dir)
 
     changes: dict[str, int] = json.loads(summary.get("resource_changes", "{}"))
 
@@ -456,7 +462,10 @@ def _render_summary(
 
 
 def _render_preview(
-    summary: dict[str, Any], build_metadata: BuildMetadata, preview_stack: str
+    summary: dict[str, Any],
+    build_metadata: BuildMetadata,
+    preview_stack: str,
+    work_dir: Path | None,
 ) -> str:
     """Render a preview of the NEXT environment as Markdown.
 
@@ -502,7 +511,28 @@ def _render_preview(
         "this issue was opened; if the gate sits open, drift or other merges can "
         "change what actually applies.",
         "",
+        # ★ Closing an issue is an untyped signal: Concourse emits a version of
+        # the ISSUE resource, not of git, so a gate cannot bind to the revision
+        # it was rendered from. If another commit lands and previews while this
+        # gate is open, closing it deploys the newer one. Naming the revision is
+        # the cheapest honest defence -- a reviewer can compare it against the
+        # branch head before closing.
     ]
+
+    revisions = _previewed_revision(work_dir)
+    if revisions:
+        lines += [
+            # ★ Closing an issue is an untyped signal: Concourse emits a version
+            # of the ISSUE resource, not of git, so a gate cannot bind to the
+            # revision it was rendered from. If another commit lands and previews
+            # while this gate is open, closing it deploys the newer one. Naming
+            # the revision is the cheapest honest defence -- a reviewer can
+            # compare it against the branch head before closing.
+            f"Previewed from {revisions}. **If that is not the current head, "
+            "close this gate only after checking the newer preview** -- "
+            "approval is not bound to a revision.",
+            "",
+        ]
 
     # A no-op preview still reports {"same": N}, so `changes` alone is always
     # truthy and would skip this branch -- leaving the reader a table of zeros to
@@ -527,6 +557,35 @@ def _render_preview(
     lines.extend(_render_changes(events, total))
     lines.append("")
     return "\n".join(lines)
+
+
+_SHORT_SHA_CHARS = 8
+
+
+def _previewed_revision(work_dir: Path | None) -> str:
+    """Name the source revision(s) this preview was rendered from.
+
+    The Concourse git resource writes the checked-out SHA to ``.git/ref`` in its
+    output directory, and every fetched input sits beside this resource's own
+    output dir. Reading that file needs no git binary and degrades to nothing
+    when the inputs are not git checkouts.
+    """
+    if work_dir is None:
+        return ""
+    refs = []
+    try:
+        candidates = sorted(work_dir.iterdir())
+    except OSError:
+        return ""
+    for candidate in candidates:
+        ref_file = candidate / ".git" / "ref"
+        try:
+            ref = ref_file.read_text().strip()
+        except OSError:
+            continue
+        if ref:
+            refs.append(f"`{candidate.name}@{ref[:_SHORT_SHA_CHARS]}`")
+    return ", ".join(refs)
 
 
 def _resource_name(urn: str) -> str:

@@ -943,3 +943,110 @@ class TestBodyFilesComposition:
             self._resource().get_issue_body_from_build(
                 mock_build_metadata(), body_file="typo.md", sources_dir=tmp_path
             )
+
+
+def _update_in_place_resource() -> ConcourseGithubIssuesResource:
+    return ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_title_template="[bot] Pulumi proj QA ready to deploy.",
+        issue_body_template="diff",
+        update_in_place=True,
+    )
+
+
+def _publish_onto_existing(mock_github, existing_labels, desired_labels):
+    mock_gh_instance, _ = mock_github
+    issue = create_mock_issue(
+        number=9,
+        title="[bot] Pulumi proj QA ready to deploy.",
+        state="open",
+        created_at=T_MINUS_1,
+        labels=existing_labels,
+    )
+    issue.body = ""
+    issue.edit = MagicMock()
+    mock_gh_instance.search_issues.return_value = [issue]
+    _update_in_place_resource().publish_new_version(
+        sources_dir="dummy",
+        build_metadata=mock_build_metadata(
+            pipeline_name="p", job_name="j", build_name="b1"
+        ),
+        labels=desired_labels,
+    )
+    return issue
+
+
+def test_update_in_place_reconciles_stale_labels(mock_github):
+    """An issue outlives a change to its labels.
+
+    A gate opened before the label semantics were corrected kept
+    `promotion-to-production` on a QA gate for the issue's whole life, because
+    labels were applied at creation only -- and a label is what routing and
+    queries actually read.
+    """
+    issue = _publish_onto_existing(
+        mock_github,
+        existing_labels=["DevOps", "promotion-to-production"],
+        desired_labels=["DevOps", "promotion-to-qa"],
+    )
+    relabels = [c for c in issue.edit.call_args_list if "labels" in c.kwargs]
+    assert relabels, "the stale label was never corrected"
+    assert relabels[0].kwargs["labels"] == ["DevOps", "promotion-to-qa"]
+
+
+def test_update_in_place_does_not_rewrite_labels_that_already_match(mock_github):
+    """Every re-preview edits the body; it must not also write labels each time."""
+    issue = _publish_onto_existing(
+        mock_github,
+        existing_labels=["DevOps", "promotion-to-qa"],
+        desired_labels=["promotion-to-qa", "DevOps"],  # same set, different order
+    )
+    assert not [c for c in issue.edit.call_args_list if "labels" in c.kwargs]
+
+
+def test_update_in_place_still_edits_the_body(mock_github):
+    issue = _publish_onto_existing(
+        mock_github, existing_labels=[], desired_labels=["DevOps"]
+    )
+    assert [c for c in issue.edit.call_args_list if "body" in c.kwargs]
+
+
+def test_update_in_place_leaves_assignees_alone(mock_github):
+    """Someone assigning themselves to review a gate is a human workflow."""
+    issue = _publish_onto_existing(
+        mock_github, existing_labels=[], desired_labels=["DevOps"]
+    )
+    assert not [c for c in issue.edit.call_args_list if "assignees" in c.kwargs]
+
+
+def test_comment_path_does_not_touch_labels(mock_github):
+    """Without update_in_place the resource does not own the issue."""
+    mock_gh_instance, _ = mock_github
+    issue = create_mock_issue(
+        number=9,
+        title="[bot] Pulumi proj QA ready to deploy.",
+        state="open",
+        created_at=T_MINUS_1,
+        labels=["promotion-to-production"],
+    )
+    issue.body = ""
+    issue.edit = MagicMock()
+    issue.create_comment = MagicMock()
+    mock_gh_instance.search_issues.return_value = [issue]
+    ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_title_template="[bot] Pulumi proj QA ready to deploy.",
+        issue_body_template="diff",
+    ).publish_new_version(
+        sources_dir="dummy",
+        build_metadata=mock_build_metadata(
+            pipeline_name="p", job_name="j", build_name="b1"
+        ),
+        labels=["promotion-to-qa"],
+    )
+    issue.edit.assert_not_called()
+    issue.create_comment.assert_called_once()

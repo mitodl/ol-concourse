@@ -452,6 +452,24 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             )
             print(f"about to update {working_issue=} with {merged_body=}")  # noqa: T201
             working_issue.edit(body=merged_body)
+            # ★ Labels are only applied at creation, so an issue outlives any
+            # later change to them -- a gate opened before the labels were
+            # corrected keeps the wrong ones for its whole life, and a label is
+            # what routing and queries actually read. update_in_place already
+            # means "this resource owns this issue", so reconcile them here.
+            #
+            # This is a replace, unlike the body, which is merged to preserve a
+            # reviewer's ticked checkboxes. There is no equivalent of a ticked
+            # box for labels: nothing distinguishes one a human added from a
+            # stale one this resource wrote, and leaving a contradictory label
+            # in place is worse than dropping a hand-added one. Assignees are
+            # deliberately NOT reconciled -- someone assigning themselves to
+            # review a gate is a human workflow, and overwriting that would
+            # fight them.
+            desired_labels = labels or []
+            if set(desired_labels) != {label.name for label in working_issue.labels}:
+                print(f"about to relabel {working_issue=} with {desired_labels=}")  # noqa: T201
+                working_issue.edit(labels=desired_labels)
         else:
             working_issue = already_exists[0]
             print(f"about to comment on {working_issue=} with {issue_body=}")  # noqa: T201

@@ -1693,3 +1693,63 @@ class TestPropertyPathIsSanitized:
 
     def test_newline_in_path_cannot_break_the_list_item(self) -> None:
         assert "\n" not in self._line('labels["a\nb"]')
+
+
+class TestPreviewNamesTheRevisionItRenderedFrom:
+    """Closing a gate issue is an untyped signal.
+
+    Concourse emits a version of the ISSUE resource, not of git, so the deploy
+    cannot bind to the revision the approved diff was rendered from. If another
+    commit lands and previews while the gate sits open, closing it deploys the
+    newer one. Naming the revision lets a reviewer check before closing.
+    """
+
+    @staticmethod
+    def _render(tmp_path: Path, checkouts: dict[str, str]) -> str:
+        for name, ref in checkouts.items():
+            git_dir = tmp_path / name / ".git"
+            git_dir.mkdir(parents=True)
+            (git_dir / "ref").write_text(ref + "\n")
+        destination = tmp_path / "pulumi-resource-output"
+        destination.mkdir()
+        update = pulumi_utils._preview_stack_update(
+            {"change_summary": {"update": 1}, "changes": []}
+        )
+        _make_resource().download_version(
+            PulumiVersion(id="0", summary=json.dumps(update.to_flat_dict())),
+            destination,
+            MagicMock(),
+            summary_file="preview.md",
+            read_outputs=False,
+            preview_stack="QA",
+        )
+        return (destination / "preview.md").read_text()
+
+    def test_body_names_the_checked_out_sha(self, tmp_path: Path) -> None:
+        body = self._render(tmp_path, {"ol-infrastructure": "a1b2c3d4e5f6a7b8c9d0"})
+        assert "`ol-infrastructure@a1b2c3d4`" in body
+
+    def test_body_warns_that_approval_is_not_bound_to_it(self, tmp_path: Path) -> None:
+        body = self._render(tmp_path, {"ol-infrastructure": "a1b2c3d4e5f6"})
+        assert "approval is not bound to a revision" in body
+
+    def test_every_git_input_is_named(self, tmp_path: Path) -> None:
+        """The Pulumi code is not always the only input a deploy is built from."""
+        body = self._render(
+            tmp_path, {"ol-infrastructure": "aaaaaaaa1111", "ol-django": "bbbbbbbb2222"}
+        )
+        assert "`ol-django@bbbbbbbb`" in body
+        assert "`ol-infrastructure@aaaaaaaa`" in body
+
+    def test_no_git_inputs_omits_the_claim_entirely(self, tmp_path: Path) -> None:
+        """Better to say nothing than to name a revision that is not the source."""
+        body = self._render(tmp_path, {})
+        assert "Previewed from" not in body
+        assert "Promoting this will apply" in body, "the rest of the body still renders"
+
+    def test_an_unreadable_ref_is_skipped_not_fatal(self, tmp_path: Path) -> None:
+        (tmp_path / "not-a-checkout").mkdir()
+        (tmp_path / "not-a-checkout" / ".git").mkdir()
+        body = self._render(tmp_path, {"ol-infrastructure": "cccccccc3333"})
+        assert "`ol-infrastructure@cccccccc`" in body
+        assert "not-a-checkout" not in body

@@ -623,7 +623,12 @@ def pulumi_job(  # noqa: PLR0913
 PREVIEW_SUMMARY_FILENAME = "preview_summary.md"
 
 
-def _stage_inputs(deps: list[GetStep] | None, *, allow_trigger: bool) -> list[GetStep]:
+def _stage_inputs(
+    deps: list[GetStep] | None,
+    *,
+    allow_trigger: bool,
+    correlate_with: str | None = None,
+) -> list[GetStep]:
     """Copy a stage's extra inputs for one job, neutering triggers where unsafe.
 
     Stage inputs are not merely triggers -- callers pass artifacts the Pulumi run
@@ -643,6 +648,16 @@ def _stage_inputs(deps: list[GetStep] | None, *, allow_trigger: bool) -> list[Ge
         step = dep.model_copy(deep=True)
         if not allow_trigger and getattr(step, "trigger", None):
             step.trigger = False
+        if correlate_with:
+            # ★ Constrain the input to a version the PREVIEW actually saw.
+            # Without this only the Pulumi code get is tied to the preview, so
+            # a newer image landing while the gate is open would be applied by
+            # the deploy even though the approved diff was rendered against the
+            # old one -- edxapp passes the image digest straight into Pulumi as
+            # EDXAPP_DOCKER_IMAGE_DIGEST, so that is a different deploy than the
+            # one on the issue. Still set membership rather than equality, but
+            # it bounds the set to versions the preview ran with.
+            step.passed = [*(step.passed or []), correlate_with]
         inputs.append(step)
     return inputs
 
@@ -814,16 +829,29 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
         **({"refresh_stack": False} if not refresh_stack else {}),
     }
 
-    def _labels(stack: str) -> list[str]:
+    _BASE_LABELS = ["product:infrastructure", "DevOps", "pipeline-workflow"]
+
+    def _gate_labels(stack: str) -> list[str]:
+        """Labels for the "ready to deploy" gate.
+
+        ★ A GATE DESCRIBES WHAT CLOSING IT WILL DO, which under this topology is
+        deploying THIS stage. The deploy-chained labels describe the NEXT stage,
+        because there the issue is posted *after* a stage deploys and closing it
+        promotes onward. Reusing them here labelled the QA gate
+        `promotion-to-production` and the Production gate `finalized-deployment`
+        before anything had been deployed at all.
+        """
         if github_issue_labels is not None:
             return github_issue_labels
-        base = ["product:infrastructure", "DevOps", "pipeline-workflow"]
-        lowered = stack.lower()
-        if lowered.endswith("ci"):
-            base.append("promotion-to-qa")
-        elif lowered.endswith("qa"):
-            base.append("promotion-to-production")
-        elif lowered.endswith("production"):
+        target = stack.rsplit(".", 1)[-1].lower()
+        return [*_BASE_LABELS, f"promotion-to-{target}"]
+
+    def _record_labels(stack: str) -> list[str]:
+        """Labels for the "deployed" record -- completion, not approval."""
+        if github_issue_labels is not None:
+            return github_issue_labels
+        base = [*_BASE_LABELS, "deployed"]
+        if stack.rsplit(".", 1)[-1].lower() == "production":
             base.append("finalized-deployment")
         return base
 
@@ -898,7 +926,7 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
                     put=record_issue.name,
                     params={
                         "assignees": github_issue_assignees or [],
-                        "labels": _labels(stack_name),
+                        "labels": _record_labels(stack_name),
                         "body_files": [
                             f"{pulumi_resource.name}/{DEPLOY_SUMMARY_FILENAME}"
                         ],
@@ -966,7 +994,7 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
                 put=gate_post.name,
                 params={
                     "assignees": github_issue_assignees or [],
-                    "labels": _labels(stack_name),
+                    "labels": _gate_labels(stack_name),
                     "body_files": [
                         f"{pulumi_resource.name}/{PREVIEW_SUMMARY_FILENAME}"
                     ],
@@ -979,8 +1007,12 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
             name=Identifier(f"deploy-{project_name}-{slug}"),
             serial_groups=[Identifier(serial_group)],
             plan=[
-                # Same inputs, triggers stripped: only the gate starts this job.
-                *_stage_inputs(stage_inputs, allow_trigger=False),
+                # Same inputs, triggers stripped so only the gate starts this
+                # job, and correlated with the preview so the deploy cannot
+                # apply a version the approved diff was not rendered against.
+                *_stage_inputs(
+                    stage_inputs, allow_trigger=False, correlate_with=str(preview.name)
+                ),
                 GetStep(get=gate_trigger.name, trigger=True),
                 # `passed` is the guarantee: only code that went through this
                 # stack's own preview is eligible to deploy to it.
@@ -1005,6 +1037,7 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
                 put=record_issue.name,
                 params={
                     "assignees": github_issue_assignees or [],
+                    "labels": _record_labels(stack_name),
                     "body_files": [f"{pulumi_resource.name}/{DEPLOY_SUMMARY_FILENAME}"],
                 },
             ),
