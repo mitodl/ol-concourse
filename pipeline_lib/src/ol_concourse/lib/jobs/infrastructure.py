@@ -14,7 +14,6 @@ from ol_concourse.lib.models.pipeline import (
     PutStep,
     Resource,
     TaskStep,
-    TryStep,
 )
 from ol_concourse.lib.notifications import notification
 from ol_concourse.lib.resource_types import (
@@ -43,39 +42,6 @@ def _pulumi_put_step(fragment: PipelineFragment) -> PutStep:
             return step
     msg = "pulumi_job produced no pulumi-provisioner PutStep"
     raise ValueError(msg)
-
-
-def _next_stack_preview_step(pulumi_put: PutStep, next_stack: str) -> PutStep:
-    """Build the advisory `pulumi preview` of the next environment.
-
-    Re-labelled rather than given its own resource: ``put`` names the *artifact*
-    and ``resource`` names what to actually run, so this reuses the same
-    pulumi-provisioner while landing its implicit get under a distinct name.
-    Two puts to one resource name in a single job would otherwise collide on
-    that artifact.
-
-    ``fail_on_error: false`` is the load-bearing part. This runs after the
-    deploy has already applied, so a preview that cannot reach the next
-    environment must degrade to a note in the issue body -- never report red on
-    infrastructure that is live and correct.
-    """
-    return PutStep(
-        put=Identifier(f"{pulumi_put.put}-next-preview"),
-        resource=str(pulumi_put.put),
-        inputs="all",
-        no_get=False,
-        get_params={
-            "summary_file": DEPLOY_SUMMARY_FILENAME,
-            "read_outputs": False,
-            "preview_stack": next_stack,
-        },
-        params={
-            **(pulumi_put.params or {}),
-            "stack_name": next_stack,
-            "preview": True,
-            "fail_on_error": False,
-        },
-    )
 
 
 def _summary_artifact_path(pulumi_put: PutStep) -> str:
@@ -214,7 +180,6 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
     refresh_stack: bool = True,
     pulumi_put_attempts: int | None = None,
     max_carried_changes: int | str | None = None,
-    preview_next_stack: bool = False,
     topology: Literal["deploy-chained", "preview-gated"] = "deploy-chained",
     auto_deploy_stages: list[str] | None = None,
 ) -> PipelineFragment:
@@ -249,21 +214,6 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
     :param max_carried_changes: How many per-resource changes the promotion-gate
         issue body lists.  ``0`` means no cap.  Omit for the resource's default
         (200).  See :func:`pulumi_job`.
-    :param preview_next_stack: When ``True``, each gate issue also carries a
-        ``pulumi preview`` of the NEXT stack in the chain -- what closing the
-        issue will actually apply.  Defaults to ``False``.
-
-        This is additive, not a replacement for the applied diff.  The applied
-        diff is evidence the deploy *happened*; a preview of the next
-        environment says nothing about that, and the last stack in a chain has
-        no next environment to preview.  What it adds is the one thing the
-        applied diff structurally cannot show: drift in the target environment,
-        which is precisely the surprise a promotion gate exists to catch.
-
-        Off by default because it is not free -- it runs a real ``pulumi
-        preview`` against the next environment on the success path of every
-        deploy, with the API load on that environment's control plane that
-        implies.  The preview is failure-tolerant and cannot fail the deploy.
     :type custom_dependencies: Dict[int, list[GetStep]]
 
     :returns: A `PipelineFragment` object that can be composed with other fragments to
@@ -293,7 +243,6 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
             max_carried_changes=max_carried_changes,
             slack_url_path=slack_url_path,
             enable_github_issue_resource=enable_github_issue_resource,
-            preview_next_stack=preview_next_stack,
             custom_dependencies=custom_dependencies,
             additional_post_steps=additional_post_steps,
         )
@@ -418,37 +367,12 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
                 # deploy -- where a failure would redden a deploy that worked.
                 "read_outputs": False,
             }
-            body_files = [_summary_artifact_path(pulumi_put)]
-
-            next_stack = (
-                stack_names[index + 1] if index + 1 < len(stack_names) else None
-            )
-            if preview_next_stack and next_stack:
-                preview_put = _next_stack_preview_step(pulumi_put, next_stack)
-                # Appended to the job's own plan rather than to on_success: the
-                # gate issue must read its artifact, and on_success is a single
-                # step.
-                #
-                # Wrapped in `try` because `fail_on_error` only covers exceptions
-                # raised INSIDE the resource script. A Concourse-level failure --
-                # container creation, image pull, worker loss, the implicit get --
-                # happens outside it, and would fail the job, suppress the
-                # on_success gate entirely, and report red on a deploy that has
-                # already applied. `try` is what makes "cannot fail the deploy"
-                # actually true. When it swallows a failure no artifact is
-                # produced, and the issue body's missing-fragment warning says so.
-                step_fragment.jobs[0].plan.append(TryStep(try_=preview_put))
-                body_files.append(_summary_artifact_path(preview_put))
-
             create_gh_issue = PutStep(
                 put=gh_issues_post.name,
                 params={
                     "labels": github_issue_labels or default_github_issue_labels,
                     "assignees": github_issue_assignees or [],
-                    # A single body_file would only ever be the applied diff.
-                    # body_files composes the applied diff and, when enabled, the
-                    # preview of what promoting will do to the next environment.
-                    "body_files": body_files,
+                    "body_files": [_summary_artifact_path(pulumi_put)],
                 },
             )
             chain_fragment.resources.append(gh_issues_post)
@@ -703,7 +627,6 @@ def _stack_serial_group(project_name: str, stack_name: str) -> str:
 def _dispatch_preview_gated(
     *,
     enable_github_issue_resource: bool,
-    preview_next_stack: bool,
     github_issue_repository: str | None,
     **kwargs: Any,
 ) -> PipelineFragment:
@@ -721,12 +644,6 @@ def _dispatch_preview_gated(
         raise ValueError(msg)
     if github_issue_repository is None:
         msg = "github_issue_repository is required for topology='preview-gated'"
-        raise ValueError(msg)
-    if preview_next_stack:
-        msg = (
-            "preview_next_stack is redundant with topology='preview-gated' -- "
-            "each stack already previews itself. Drop preview_next_stack."
-        )
         raise ValueError(msg)
     return _preview_gated_chain(
         github_issue_repository=github_issue_repository, **kwargs
@@ -762,14 +679,14 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
                                     issue being closed
 
     Why this beats previewing the *next* stack from the current stack's deploy
-    job (`preview_next_stack`):
+    job, which is what the retired `preview_next_stack` option did:
 
     - IT WORKS FOR SINGLETONS. A one-stack chain -- a production-only stack, or
-      a `default` stack -- has no "next" to preview, so it gets no gate at all
-      today. Here every gated stack previews itself.
+      a `default` stack -- has no "next" to preview, so it got no gate at all.
+      Here every gated stack previews itself.
     - IT WORKS ACROSS CHAINS. edxapp splits one deployment across Open edX
       releases, so mitx CI and mitx QA live in different `pulumi_jobs_chain`
-      calls and the next-stack preview cannot span them. Self-preview does not
+      calls and a next-stack preview cannot span them. Self-preview does not
       care.
     - THE DIFF IS OF THE THING BEING APPROVED, and taken immediately before the
       deploy it authorises, rather than one stage and possibly days earlier.
@@ -781,11 +698,15 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
     its body always shows the diff that will actually apply rather than the
     first one posted.
 
-    ★ THIS INVERTS THE FAIL-OPEN PROPERTY of `preview_next_stack`. There the
-    preview was advisory and could never fail a deploy. Here it generates the
-    gate, so a preview that fails means no gate opens and nothing deploys.
-    That is fail-closed and correct for a promotion gate, but it puts preview
-    reliability on the deploy path.
+    ★ THIS IS FAIL-CLOSED, where the retired next-stack preview was advisory
+    and could never fail a deploy. Here the preview generates the gate, so a
+    preview that fails means no gate opens and nothing deploys. That is correct
+    for a promotion gate, but it puts preview reliability on the deploy path:
+    anything the Pulumi *program* does at construction time that can fail --
+    notably an imperative AWS call -- now blocks the environment rather than
+    printing a warning. (This is not hypothetical: edxapp `xpro.Production`
+    was blocked on exactly that within hours of adoption, by a boto3
+    ModifyDBInstance call made while building the program.)
 
     *auto_deploy_stages* names the stages that keep today's behaviour: no gate,
     auto-deploy on code change. Typically ``["CI"]`` -- gating CI would destroy
