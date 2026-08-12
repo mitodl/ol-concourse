@@ -93,13 +93,16 @@ class ReleaseVersion(TypedVersion):
     Concourse version object alone (e.g. ``/release-notes``) without needing
     to trigger the full pipeline.  They are not used for version ordering.
 
-    ``in_flight`` reports a release that was cut but has not yet reached
-    production — i.e. a ``releases/YYYY.M.D.N`` branch still present on the
-    remote.  It is reported rather than acted upon: ``check`` always advances
-    to the true next version so that an unfinished release can never freeze
-    the resource, and superseding the in-flight release is the explicit job of
-    ``action=create``.  Defaults to empty so version dicts recorded before
-    this field existed still deserialize.
+    ``in_flight`` reports a release that was cut but never *finished* — i.e.
+    a ``releases/YYYY.M.D.N`` branch still present on the remote.  It is not a
+    deployment status: a release whose production deploy succeeded and whose
+    ``action=finish`` then failed is still in flight by this definition, and
+    that is exactly the case this field exists to surface.  It is reported
+    rather than acted upon: ``check`` always advances to the true next version
+    so that an unfinished release can never freeze the resource, and
+    superseding the in-flight release is the explicit job of ``action=create``.
+    Defaults to empty so version dicts recorded before this field existed
+    still deserialize.
     """
 
     version: str  # YYYY.M.D.N (no leading zeros — PEP 440 compliant)
@@ -660,14 +663,40 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         also leaves the tag as the ``since`` boundary for this new release,
         which is correct: its contents are already live.
 
-        Re-cutting the version that is *already* in flight is a retrigger, not
-        a supersede, and deletes nothing.
+        Re-cutting the version that is *already* in flight deletes nothing
+        *provided that cut completed* — see :meth:`_clear_partial_cut` for the
+        case where it did not.
+
+        Only an *older* release is ever superseded.  ``create`` binds the
+        version Concourse resolved when the build was scheduled, so a delayed
+        or concurrent build can carry a version older than the release now in
+        flight; letting it proceed would delete a newer release's refs and
+        replace them with an older cut.
+
+        :raises RuntimeError: If the superseded refs are still present on the
+            remote afterwards.
         """
         in_flight = _get_in_flight_release_version(repo_path, env=env)
-        if not in_flight or in_flight == version:
+        if not in_flight:
             return "", False
+        if in_flight == version:
+            self._clear_partial_cut(repo_path, version, env=env)
+            return "", False
+        if _parse_version_tuple(in_flight) > _parse_version_tuple(version):
+            msg = (
+                f"Refusing to supersede release {in_flight!r} with the older "
+                f"version {version!r}. This build resolved its version before "
+                f"{in_flight} was cut; re-run it against a current check."
+            )
+            raise RuntimeError(msg)
         tag_kept = self._reached_production(in_flight)
         self._abandon_release(repo_path, in_flight, env=env, delete_tag=not tag_kept)
+        _assert_refs_deleted(
+            repo_path,
+            branch=f"releases/{in_flight}",
+            tag=None if tag_kept else in_flight,
+            env=env,
+        )
         if not tag_kept:
             # The abandoned tag is gone from the remote but still present
             # locally, where _get_release_tags reads from when picking the
@@ -787,6 +816,38 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             cwd=repo_path,
             env=env,
         ).strip()
+
+    def _clear_partial_cut(
+        self, repo_path: Path, version: str, *, env: dict[str, str]
+    ) -> None:
+        """Delete a ``releases/<version>`` branch left behind by a failed cut.
+
+        ``_create_release`` pushes the branch *before* the tag, so a failed tag
+        push leaves the branch present with no tag.  That state looks like an
+        in-flight release of the very version being cut, but it is not a
+        completed one: the genuine retrigger path is guarded by ``version in
+        prior_tags`` further down and never reaches this method.
+
+        Left alone, the stale branch holds the previous attempt's release
+        commit, so this run's push of a freshly built branch is rejected as a
+        non-fast-forward and every retry fails identically.  Deleting it lets
+        the cut start clean.  The tag is untouched — there isn't one, which is
+        precisely what identifies this state.
+        """
+        if version in _get_release_tags(repo_path, env=env):
+            return
+        branch_name = f"releases/{version}"
+        print(  # noqa: T201
+            f"[release] {branch_name} exists with no {version} tag — clearing a "
+            "partially-created release before re-cutting it",
+            file=sys.stderr,
+        )
+        _run(
+            ["git", "push", "origin", "--delete", branch_name],
+            cwd=repo_path,
+            env=env,
+        )
+        _assert_refs_deleted(repo_path, branch=branch_name, tag=None, env=env)
 
     def _reached_production(self, version: str) -> bool:
         """Return True if *version* has a successful production deployment.
@@ -1034,6 +1095,45 @@ def _remote_branch_exists(
         env=env,
     )
     return bool(output.strip())
+
+
+def _assert_refs_deleted(
+    repo_path: Path,
+    *,
+    branch: str | None,
+    tag: str | None,
+    env: dict[str, str],
+) -> None:
+    """Raise unless the named refs are absent from the remote.
+
+    Ref deletion is best-effort — ``_abandon_release`` suppresses
+    ``CalledProcessError`` so that abandoning an already-abandoned release
+    stays idempotent.  That same suppression hides a genuine failure, e.g. a
+    protected ref or a transient remote error.  Callers that go on to cut a
+    replacement release must not report success in that case: the surviving
+    branch would be rediscovered as in-flight by a later ``check``, which is
+    the failure mode this resource exists to prevent.
+
+    :raises RuntimeError: If any named ref still exists on the remote.
+    """
+    survivors = []
+    if branch and _remote_branch_exists(repo_path, branch, env=env):
+        survivors.append(f"refs/heads/{branch}")
+    if tag:
+        output = _run(
+            ["git", "ls-remote", "--tags", "origin", f"refs/tags/{tag}"],
+            cwd=repo_path,
+            env=env,
+        )
+        if output.strip():
+            survivors.append(f"refs/tags/{tag}")
+    if survivors:
+        msg = (
+            f"Failed to delete {', '.join(survivors)} from the remote. Refusing "
+            "to continue: leaving these in place would let a later check "
+            "rediscover a release that was meant to be superseded."
+        )
+        raise RuntimeError(msg)
 
 
 def _is_release_machinery(subject: str) -> bool:

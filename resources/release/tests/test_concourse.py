@@ -1866,6 +1866,55 @@ def test_commit_info_range_keeps_subjects_containing_a_pipe(mock_run, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+class _FakeRemote:
+    """A stateful `_run` stub that models ref deletion actually taking effect.
+
+    `_assert_refs_deleted` re-queries the remote after a delete, so a stub that
+    always reports the same refs would make every supersede look like a failed
+    deletion.
+    """
+
+    def __init__(self, *, branches=(), tags=(), head="prebump1" * 5):
+        self.branches = set(branches)
+        self.tags = set(tags)
+        self.head = head
+        self.commands: list[str] = []
+
+    def __call__(self, cmd, **_kwargs):
+        self.commands.append(" ".join(cmd))
+        if cmd[:2] == ["git", "ls-remote"]:
+            return self._ls_remote(cmd[-1])
+        if cmd[:4] == ["git", "push", "origin", "--delete"]:
+            ref = cmd[4]
+            if ref.startswith("refs/tags/"):
+                self.tags.discard(ref[len("refs/tags/") :])
+            else:
+                self.branches.discard(ref)
+            return ""
+        if cmd[:2] == ["git", "rev-parse"]:
+            return self.head
+        if "tag" in cmd and "--list" in cmd:
+            return "\n".join(sorted(self.tags))
+        if cmd[:3] == ["git", "rev-list", "-n1"]:
+            return "othersha" * 5
+        return ""
+
+    def _ls_remote(self, pattern: str) -> str:
+        if pattern.startswith("refs/tags/"):
+            name = pattern[len("refs/tags/") :]
+            return f"aaa\trefs/tags/{name}\n" if name in self.tags else ""
+        prefix = "refs/heads/"
+        if pattern.endswith("*"):
+            stem = pattern[len(prefix) : -1]
+            return "".join(
+                f"aaa\t{prefix}{b}\n"
+                for b in sorted(self.branches)
+                if b.startswith(stem)
+            )
+        name = pattern[len(prefix) :]
+        return f"aaa\t{prefix}{name}\n" if name in self.branches else ""
+
+
 @patch("concourse.ReleaseResource._reached_production", return_value=False)
 @patch("concourse._run")
 def test_create_supersedes_a_release_that_never_shipped(
@@ -1883,16 +1932,8 @@ def test_create_supersedes_a_release_that_never_shipped(
     version_file.write_text(version_str)
     (tmp_path / "app-source").mkdir()
 
-    def fake_run(cmd, **kw):
-        if cmd[:2] == ["git", "ls-remote"]:
-            return f"abc\trefs/heads/releases/{stale}\n"
-        if cmd[:2] == ["git", "rev-parse"]:
-            return "prebump1" * 5
-        if "tag" in cmd and "--list" in cmd:
-            return ""
-        return ""
-
-    mock_run.side_effect = fake_run
+    remote = _FakeRemote(branches={f"releases/{stale}"}, tags={stale})
+    mock_run.side_effect = remote
     resource = make_resource()
     returned_version, metadata = resource.publish_new_version(
         tmp_path,
@@ -1902,7 +1943,7 @@ def test_create_supersedes_a_release_that_never_shipped(
         version_file="release/version",
     )
 
-    all_cmds = [" ".join(c.args[0]) for c in mock_run.call_args_list]
+    all_cmds = remote.commands
     assert any("--delete" in c and f"releases/{stale}" in c for c in all_cmds), (
         "Must delete the superseded release branch"
     )
@@ -1934,18 +1975,8 @@ def test_create_keeps_the_tag_of_a_superseded_release_that_shipped(
     version_file.write_text(version_str)
     (tmp_path / "app-source").mkdir()
 
-    def fake_run(cmd, **kw):
-        if cmd[:2] == ["git", "ls-remote"]:
-            return f"abc\trefs/heads/releases/{stale}\n"
-        if cmd[:2] == ["git", "rev-parse"]:
-            return "prebump1" * 5
-        if "tag" in cmd and "--list" in cmd:
-            return stale
-        if cmd[:3] == ["git", "rev-list", "-n1"]:
-            return "othersha" * 5
-        return ""
-
-    mock_run.side_effect = fake_run
+    remote = _FakeRemote(branches={f"releases/{stale}"}, tags={stale})
+    mock_run.side_effect = remote
     resource = make_resource()
     _, metadata = resource.publish_new_version(
         tmp_path,
@@ -1955,7 +1986,7 @@ def test_create_keeps_the_tag_of_a_superseded_release_that_shipped(
         version_file="release/version",
     )
 
-    all_cmds = [" ".join(c.args[0]) for c in mock_run.call_args_list]
+    all_cmds = remote.commands
     assert any("--delete" in c and f"releases/{stale}" in c for c in all_cmds), (
         "Must still delete the superseded release branch"
     )
@@ -2118,3 +2149,150 @@ def test_reached_production_is_true_when_the_api_fails(_mock_github):
     """An API failure must not be read as "never shipped" and delete the tag."""
     resource = make_resource(access_token="tok", repository="mitodl/my-app")
     assert resource._reached_production("2026.4.14.1") is True
+
+
+# ---------------------------------------------------------------------------
+# create — partial cuts, stale-ref survival, and version ordering
+# ---------------------------------------------------------------------------
+
+
+class _UndeletableSet(set):  # type: ignore[type-arg]
+    """A set whose discard() is a no-op, standing in for a protected ref."""
+
+    def discard(self, value):
+        return
+
+
+@patch("concourse._run")
+def test_create_clears_a_branch_left_by_a_failed_tag_push(mock_run, tmp_path):
+    """A cut that pushed its branch but not its tag must not wedge retries.
+
+    `_create_release` pushes the branch before the tag, so a failed tag push
+    leaves `releases/X` present with no X tag. That is not a completed release
+    -- the genuine retrigger path is guarded by `version in prior_tags` -- but
+    the stale branch still holds the previous attempt's release commit, so this
+    run's push would be rejected as a non-fast-forward and every retry after it
+    would fail identically.
+    """
+    version_str = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    # Branch present, tag absent -- the partial-cut state.
+    remote = _FakeRemote(branches={f"releases/{version_str}"}, tags=set())
+    mock_run.side_effect = remote
+
+    resource = make_resource()
+    _, metadata = resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    assert any(
+        "--delete" in c and f"releases/{version_str}" in c for c in remote.commands
+    ), "Must clear the partially-created release branch before re-cutting"
+    # Not a supersede -- it is the same version being re-cut.
+    assert "superseded" not in metadata
+    # The branch is pushed again as part of the fresh cut.
+    assert any(c == f"git push origin releases/{version_str}" for c in remote.commands)
+
+
+@patch("concourse._run")
+def test_create_leaves_a_complete_cut_alone(mock_run, tmp_path):
+    """Branch *and* tag present is a real retrigger -- delete nothing."""
+    version_str = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    remote = _FakeRemote(
+        branches={f"releases/{version_str}"}, tags={version_str}, head="othersha" * 5
+    )
+    mock_run.side_effect = remote
+
+    resource = make_resource()
+    resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    assert not any("--delete" in c for c in remote.commands), (
+        "A completed cut being retriggered must not have its refs deleted"
+    )
+
+
+@patch("concourse.ReleaseResource._reached_production", return_value=False)
+@patch("concourse._run")
+def test_create_fails_loudly_when_a_superseded_ref_survives(
+    mock_run, _mock_shipped, tmp_path
+):
+    """A suppressed deletion failure must not be reported as a supersede.
+
+    `_abandon_release` silences CalledProcessError to stay idempotent, which
+    equally hides a protected ref or a transient remote failure. Continuing
+    would leave a branch that a later check rediscovers as in-flight -- the
+    exact failure this resource exists to prevent.
+    """
+    version_str = "2026.4.14.2"
+    stale = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    remote = _FakeRemote(branches={f"releases/{stale}"}, tags={stale})
+    # Deletion silently does nothing, as a protected ref would.
+    remote.branches = _UndeletableSet(remote.branches)
+    mock_run.side_effect = remote
+
+    resource = make_resource()
+    with pytest.raises(RuntimeError, match="Failed to delete"):
+        resource.publish_new_version(
+            tmp_path,
+            MagicMock(),
+            action="create",
+            repo_dir="app-source",
+            version_file="release/version",
+        )
+
+
+@patch("concourse._run")
+def test_create_refuses_to_supersede_a_newer_release(mock_run, tmp_path):
+    """An older build must not delete a newer release's refs.
+
+    `create` binds the version Concourse resolved when the build was
+    scheduled, so a delayed or concurrent build can carry a version older than
+    the release now in flight.
+    """
+    version_str = "2026.4.14.1"
+    newer = "2026.4.14.2"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    remote = _FakeRemote(branches={f"releases/{newer}"}, tags={newer})
+    mock_run.side_effect = remote
+
+    resource = make_resource()
+    with pytest.raises(RuntimeError, match="Refusing to supersede"):
+        resource.publish_new_version(
+            tmp_path,
+            MagicMock(),
+            action="create",
+            repo_dir="app-source",
+            version_file="release/version",
+        )
+
+    assert not any("--delete" in c for c in remote.commands), (
+        "Must not delete the newer release's refs before refusing"
+    )

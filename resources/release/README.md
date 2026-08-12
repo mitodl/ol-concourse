@@ -100,9 +100,14 @@ not immediately propose its own bookkeeping as the next release's contents.
 
 ### In-flight releases are reported, not obeyed
 
-`in_flight` names a release that was cut but has not yet reached production —
-a `releases/YYYY.MM.DD.N` branch still present on the remote. It is also
-written to the `in_flight` file by `in`, and set as `get`/`put` metadata.
+`in_flight` names a release that was cut but never **finished** — a
+`releases/YYYY.MM.DD.N` branch still present on the remote. It is also written
+to the `in_flight` file by `in`, and set as `get`/`put` metadata.
+
+It is **not** a deployment status. A release whose production deploy succeeded
+and whose `action: finish` then failed is still in flight by this definition —
+that case is precisely what this field exists to surface, and what decides
+whether superseding it keeps its tag.
 
 `check` **always advances** to the true next version regardless. It used to
 pin to the in-flight version until the release finished or was abandoned,
@@ -126,7 +131,7 @@ Clones the repository and generates release artefacts from `version.since..versi
 | File | Description |
 |------|-------------|
 | `version` | Plain version string, e.g. `2026.4.14.1` |
-| `in_flight` | Version of a release cut but not yet in production, or empty |
+| `in_flight` | Version of a release cut but not yet finished, or empty (may already be in production — see below) |
 | `commits.json` | Structured list of `{sha, author, author_name, pr_number, pr_title, message}` -- `author` is the commit email (matched against `auto_check_authors` by the `github-issues` resource), `author_name` is the git-configured display name |
 | `checklist.md` | GitHub Issue body with a markdown task list grouped by author (`### <author_name>` headings, newest contributor first); use as `body_file` in `github-issues` resource |
 | `changelog_entry.md` | Single [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) entry for this version |
@@ -162,8 +167,25 @@ already updated by `bump_version_task`.
 6. Pushes the branch.
 7. Creates and pushes the `YYYY.MM.DD.N` tag on the pre-bumpver HEAD.
 
-Re-running `create` for the version that is *already* in flight is a no-op, not
-a supersede — it does not delete the refs it is re-creating.
+Only an **older** release is ever superseded. `create` binds the version
+Concourse resolved when the build was scheduled, so a delayed or concurrent
+build can carry a version older than the release now in flight; that is
+refused rather than allowed to replace a newer cut with an older one.
+
+If any superseded ref survives deletion (a protected ref, a transient remote
+failure — both silenced by the best-effort deletion in `abandon`), `create`
+**fails** rather than reporting a supersede. Continuing would leave a branch
+for a later `check` to rediscover as in-flight, which is the failure this
+resource exists to prevent.
+
+Re-running `create` for the version that is *already* in flight does not delete
+the refs it is re-creating — **provided that cut completed**. The branch is
+pushed before the tag, so a failed tag push leaves `releases/X` present with no
+`X` tag. That is a partially-created release, not a retrigger: the stale branch
+carries the previous attempt's release commit, so the next push is rejected as
+a non-fast-forward and every retry fails identically. That branch is deleted
+before re-cutting. A cut with **both** branch and tag present is a true
+retrigger and is left completely alone.
 
 ### `action: finish`
 
