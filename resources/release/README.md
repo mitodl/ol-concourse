@@ -62,6 +62,7 @@ resources:
 | `changelog_style` | No | `null` | `"cumulative"` or `"per_release"`; omit to disable |
 | `changelog_file` | No | `CHANGELOG.md` | Changelog filename (cumulative mode) |
 | `changelog_dir` | No | `releases` | Directory for per-release files |
+| `production_environment` | No | `Production` | GitHub Deployment environment consulted to decide whether a superseded release already shipped |
 
 ## `check` — Detect unreleased commits
 
@@ -137,11 +138,23 @@ Clones the repository and generates release artefacts from `version.since..versi
 Requires a checked-out git repository (from `get: app-source`) with version files
 already updated by `bump_version_task`.
 
-1. **Supersedes any older in-flight release** — deletes its `releases/` branch and
-   tag from the remote, and reports it as `superseded` in the put metadata.
-   Leaving it in place would keep reporting a release that will never ship, and
-   leave a stale tag between the real releases that corrupts the `since`
-   boundary of every later release.
+1. **Supersedes any older in-flight release** — deletes its `releases/` branch
+   from the remote and reports it as `superseded` in the put metadata.
+   Whether its *tag* is deleted depends on whether that release ever shipped:
+
+   | In-flight release | Branch | Tag | `superseded_tag` |
+   |---|---|---|---|
+   | Never reached production | deleted | deleted | `deleted` |
+   | Reached production, `finish` failed | deleted | **kept** | `kept` |
+
+   The two are indistinguishable in git, so the resource asks the GitHub
+   Deployments API for a successful deployment of that version to
+   `production_environment` (default `Production`). A shipped release's tag is
+   the only thing tying what production runs back to a commit, so it must
+   outlive its branch — and it is then the correct `since` boundary for the new
+   release, whose predecessor really is live. When the answer cannot be
+   established (no credentials, no `repository`, or an API failure) the tag is
+   **kept**: an unnecessary tag is recoverable, a deleted one is not.
 2. Records the pre-bumpver HEAD SHA (this becomes the release tag, marking the code cut for RC).
 3. Optionally cherry-picks `commit_hash` (hotfix) before the release commit.
 4. Creates `releases/YYYY.MM.DD.N` branch.

@@ -144,6 +144,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         changelog_dir: str = "releases",
         clone_depth: int = _DEFAULT_CLONE_DEPTH,
         semver_tag_fallback: bool = False,
+        production_environment: str = "Production",
     ) -> None:
         """Initialize the release resource with git and GitHub configuration.
 
@@ -181,6 +182,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         self.changelog_dir = changelog_dir
         self.clone_depth = clone_depth
         self.semver_tag_fallback = semver_tag_fallback
+        self.production_environment = production_environment
 
     @property
     def github_token(self) -> str | None:
@@ -434,6 +436,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         repo_path = sources_dir / repo_dir
 
         superseded = ""
+        superseded_tag_kept = False
         with _git_ssh_env(self.private_key) as env:
             _configure_git_identity(
                 repo_path, self.git_user_name, self.git_user_email, env=env
@@ -442,9 +445,12 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 _configure_https_auth(repo_path, token, env=env)
 
             if action == "create":
-                head_sha, since, superseded = self._create_release(
-                    repo_path, version_str, commit_hash, env=env
-                )
+                (
+                    head_sha,
+                    since,
+                    superseded,
+                    superseded_tag_kept,
+                ) = self._create_release(repo_path, version_str, commit_hash, env=env)
             elif action == "finish":
                 head_sha = self._finish_release(repo_path, version_str, env=env)
                 since = ""
@@ -455,6 +461,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         metadata = {"version": version_str, "action": action}
         if superseded:
             metadata["superseded"] = superseded
+            metadata["superseded_tag"] = "kept" if superseded_tag_kept else "deleted"
         return (
             ReleaseVersion(
                 version=version_str,
@@ -475,14 +482,16 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         version: str,
         commit_hash: str | None,
         env: dict[str, str],
-    ) -> tuple[str, str, str]:
+    ) -> tuple[str, str, str, bool]:
         """Create the release branch and version tag.
 
-        Returns ``(pre_bump_sha, since_ref, superseded)`` where *pre_bump_sha*
-        is the HEAD SHA that was tagged, *since_ref* is the baseline ref used
-        for commit range computation (previous date-format tag, semver
-        fallback, or empty), and *superseded* is the version of an earlier
-        in-flight release that this one replaced (or empty).
+        Returns ``(pre_bump_sha, since_ref, superseded, superseded_tag_kept)``
+        where *pre_bump_sha* is the HEAD SHA that was tagged, *since_ref* is
+        the baseline ref used for commit range computation (previous
+        date-format tag, semver fallback, or empty), *superseded* is the
+        version of an earlier in-flight release that this one replaced (or
+        empty), and *superseded_tag_kept* records whether that release's tag
+        was left in place because it had already reached production.
 
         Commit ordering:
           1. Cherry-pick hotfix (if any) onto the branch first so it is
@@ -495,7 +504,9 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
         _run(["git", "fetch", "origin", self.branch, "--tags"], cwd=repo_path, env=env)
 
-        superseded = self._supersede_in_flight_release(repo_path, version, env=env)
+        superseded, superseded_tag_kept = self._supersede_in_flight_release(
+            repo_path, version, env=env
+        )
 
         # Stash uncommitted changes (version-bump files from bump_version_task) after
         # fetch but before the hard reset.  git reset --hard discards working-tree
@@ -582,7 +593,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             if not since_ref and self.semver_tag_fallback:
                 semver_tags = _get_semver_tags(repo_path, env=env)
                 since_ref = semver_tags[-1] if semver_tags else ""
-            return pre_bump_sha, since_ref, superseded
+            return pre_bump_sha, since_ref, superseded, superseded_tag_kept
 
         if prior_tags:
             since_ref = prior_tags[-1]
@@ -628,31 +639,42 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             cwd=repo_path,
             env=env,
         )
-        return pre_bump_sha, since_ref, superseded
+        return pre_bump_sha, since_ref, superseded, superseded_tag_kept
 
     def _supersede_in_flight_release(
         self, repo_path: Path, version: str, *, env: dict[str, str]
-    ) -> str:
-        """Abandon an older in-flight release, returning its version or "".
+    ) -> tuple[str, bool]:
+        """Supersede an older in-flight release.
 
-        Cutting a new release supersedes one that was cut but never shipped.
-        Left in place, the stale branch keeps reporting an in-flight release
-        that will never ship, and the stale tag sits between the real releases,
-        corrupting the ``since`` boundary every later release is computed
-        against.
+        Returns ``(superseded_version, tag_kept)``, or ``("", False)`` when
+        there was nothing to supersede.
+
+        Cutting a new release supersedes one still in flight.  Left in place,
+        its branch keeps reporting a release that will never finish.
+
+        Its *tag*, though, is only safe to remove if the release never
+        shipped.  A release whose ``action=finish`` failed after a successful
+        production deploy is still in flight by this definition, and its tag
+        is the only thing tying what production is running back to a commit —
+        so a shipped release keeps its tag and loses only its branch.  That
+        also leaves the tag as the ``since`` boundary for this new release,
+        which is correct: its contents are already live.
 
         Re-cutting the version that is *already* in flight is a retrigger, not
         a supersede, and deletes nothing.
         """
         in_flight = _get_in_flight_release_version(repo_path, env=env)
         if not in_flight or in_flight == version:
-            return ""
-        self._abandon_release(repo_path, in_flight, env=env)
-        # The abandoned tag is gone from the remote but still present locally,
-        # where _get_release_tags reads from when picking the since boundary.
-        with suppress(subprocess.CalledProcessError):
-            _run(["git", "tag", "-d", in_flight], cwd=repo_path, env=env)
-        return in_flight
+            return "", False
+        tag_kept = self._reached_production(in_flight)
+        self._abandon_release(repo_path, in_flight, env=env, delete_tag=not tag_kept)
+        if not tag_kept:
+            # The abandoned tag is gone from the remote but still present
+            # locally, where _get_release_tags reads from when picking the
+            # since boundary below.
+            with suppress(subprocess.CalledProcessError):
+                _run(["git", "tag", "-d", in_flight], cwd=repo_path, env=env)
+        return in_flight, tag_kept
 
     def _finish_release(
         self, repo_path: Path, version: str, env: dict[str, str]
@@ -727,13 +749,22 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         return _run(["git", "rev-parse", "HEAD"], cwd=repo_path, env=env).strip()
 
     def _abandon_release(
-        self, repo_path: Path, version: str, env: dict[str, str]
+        self,
+        repo_path: Path,
+        version: str,
+        env: dict[str, str],
+        *,
+        delete_tag: bool = True,
     ) -> str:
-        """Delete the in-flight release branch and version tag.
+        """Delete the in-flight release branch, and by default its version tag.
 
         Cancels a release that was cut but never finalised.  After abandonment
         ``check`` sees no in-flight branch and recomputes the next version
         normally, allowing a corrected release to be cut from the same commits.
+
+        *delete_tag* is ``False`` when superseding a release that already
+        reached production — its tag is the only marker of what is running
+        there, so it must outlive the branch.
 
         Deletions are best-effort: a ``CalledProcessError`` from either push is
         silenced so the operation is idempotent — abandoning an already-abandoned
@@ -741,7 +772,10 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         """
         branch_name = f"releases/{version}"
         _run(["git", "fetch", "origin", "--tags"], cwd=repo_path, env=env)
-        for ref in (branch_name, f"refs/tags/{version}"):
+        refs = [branch_name]
+        if delete_tag:
+            refs.append(f"refs/tags/{version}")
+        for ref in refs:
             with suppress(subprocess.CalledProcessError):
                 _run(
                     ["git", "push", "origin", "--delete", ref],
@@ -753,6 +787,42 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             cwd=repo_path,
             env=env,
         ).strip()
+
+    def _reached_production(self, version: str) -> bool:
+        """Return True if *version* has a successful production deployment.
+
+        Distinguishes the two ways a release can still be in flight, which
+        look identical in git: one that was cut and never shipped (safe to
+        discard entirely) and one that shipped but whose ``action=finish``
+        never completed (its tag marks live code and must be kept).
+
+        Errs toward ``True`` — treat the release as shipped — whenever the
+        answer cannot be established, including when the resource has no
+        GitHub credentials or repository configured.  Keeping a tag that
+        turns out to be unnecessary is recoverable; deleting the only
+        reference to what production is running is not.
+        """
+        token = self.github_token
+        if not (token and self.repository):
+            return True
+        try:
+            deployments = (
+                Github(auth=Auth.Token(token))
+                .get_repo(self.repository)
+                .get_deployments(ref=version, environment=self.production_environment)
+            )
+            return any(
+                status.state == "success"
+                for deployment in deployments
+                for status in deployment.get_statuses()
+            )
+        except Exception:
+            print(  # noqa: T201
+                f"[release] could not confirm whether {version} reached "
+                f"{self.production_environment}; keeping its tag",
+                file=sys.stderr,
+            )
+            return True
 
     def _collect_commits_range(
         self, repo_path: Path, since_ref: str, until_ref: str, env: dict[str, str]

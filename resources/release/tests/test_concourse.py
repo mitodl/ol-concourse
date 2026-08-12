@@ -1866,12 +1866,14 @@ def test_commit_info_range_keeps_subjects_containing_a_pipe(mock_run, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@patch("concourse.ReleaseResource._reached_production", return_value=False)
 @patch("concourse._run")
-def test_create_supersedes_an_older_in_flight_release(mock_run, tmp_path):
-    """Cutting a release abandons one that was cut but never shipped.
+def test_create_supersedes_a_release_that_never_shipped(
+    mock_run, _mock_shipped, tmp_path
+):
+    """A cut that never reached production is discarded branch and tag.
 
-    Left in place, the stale branch keeps reporting a release that will never
-    ship and the stale tag sits between the real releases, corrupting the
+    Its tag would otherwise sit between the real releases and corrupt the
     `since` boundary of every later release.
     """
     version_str = "2026.4.14.2"
@@ -1905,11 +1907,65 @@ def test_create_supersedes_an_older_in_flight_release(mock_run, tmp_path):
         "Must delete the superseded release branch"
     )
     assert any("--delete" in c and f"refs/tags/{stale}" in c for c in all_cmds), (
-        "Must delete the superseded release tag"
+        "An unshipped release's tag must go with its branch"
     )
     assert metadata["superseded"] == stale
-    # The new release is the one now in flight.
+    assert metadata["superseded_tag"] == "deleted"
     assert returned_version.in_flight == version_str
+
+
+@patch("concourse.ReleaseResource._reached_production", return_value=True)
+@patch("concourse._run")
+def test_create_keeps_the_tag_of_a_superseded_release_that_shipped(
+    mock_run, _mock_shipped, tmp_path
+):
+    """A release whose finish failed after shipping keeps its tag.
+
+    ol-analytics-api sat exactly here: 2026.8.3.1 deployed to production
+    repeatedly while its releases/ branch never merged. That tag is the only
+    thing tying what production runs back to a commit, so superseding must
+    take the branch and leave the tag -- which also makes it the correct
+    `since` boundary for the new release, whose predecessor really is live.
+    """
+    version_str = "2026.4.14.2"
+    stale = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ["git", "ls-remote"]:
+            return f"abc\trefs/heads/releases/{stale}\n"
+        if cmd[:2] == ["git", "rev-parse"]:
+            return "prebump1" * 5
+        if "tag" in cmd and "--list" in cmd:
+            return stale
+        if cmd[:3] == ["git", "rev-list", "-n1"]:
+            return "othersha" * 5
+        return ""
+
+    mock_run.side_effect = fake_run
+    resource = make_resource()
+    _, metadata = resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    all_cmds = [" ".join(c.args[0]) for c in mock_run.call_args_list]
+    assert any("--delete" in c and f"releases/{stale}" in c for c in all_cmds), (
+        "Must still delete the superseded release branch"
+    )
+    assert not any("--delete" in c and f"refs/tags/{stale}" in c for c in all_cmds), (
+        "Must not delete the tag for code that reached production"
+    )
+    assert not any(c.startswith("git tag -d") for c in all_cmds), (
+        "Must not delete the shipped tag locally either -- it is the since boundary"
+    )
+    assert metadata["superseded_tag"] == "kept"
 
 
 @patch("concourse._run")
@@ -1997,3 +2053,68 @@ def test_finish_is_a_noop_when_the_release_branch_is_gone(mock_run, tmp_path):
         "Nothing to merge when the release branch is already gone"
     )
     assert not any("--delete" in c for c in all_cmds)
+
+
+# ---------------------------------------------------------------------------
+# _reached_production — did an in-flight release actually ship?
+# ---------------------------------------------------------------------------
+
+
+def _deployments(*states: str):
+    """Build a fake get_deployments() result with the given status states."""
+    deployment = MagicMock()
+    deployment.get_statuses.return_value = [MagicMock(state=state) for state in states]
+    return [deployment]
+
+
+def test_reached_production_is_true_without_credentials():
+    """Unknowable means "keep the tag" -- never destroy the only prod marker."""
+    resource = make_resource(access_token=None, repository=None)
+    assert resource._reached_production("2026.4.14.1") is True
+
+
+@patch("concourse.Github")
+def test_reached_production_true_on_a_successful_deployment(mock_github):
+    mock_github.return_value.get_repo.return_value.get_deployments.return_value = (
+        _deployments("in_progress", "success")
+    )
+    resource = make_resource(access_token="tok", repository="mitodl/my-app")
+    assert resource._reached_production("2026.4.14.1") is True
+
+
+@patch("concourse.Github")
+def test_reached_production_false_when_no_deployment_succeeded(mock_github):
+    """A cut that only ever failed to deploy is safe to discard entirely."""
+    mock_github.return_value.get_repo.return_value.get_deployments.return_value = (
+        _deployments("failure", "error")
+    )
+    resource = make_resource(access_token="tok", repository="mitodl/my-app")
+    assert resource._reached_production("2026.4.14.1") is False
+
+
+@patch("concourse.Github")
+def test_reached_production_false_when_never_deployed(mock_github):
+    mock_github.return_value.get_repo.return_value.get_deployments.return_value = []
+    resource = make_resource(access_token="tok", repository="mitodl/my-app")
+    assert resource._reached_production("2026.4.14.1") is False
+
+
+@patch("concourse.Github")
+def test_reached_production_queries_the_configured_environment(mock_github):
+    """The environment name must match the pipeline's GitHub Deployment."""
+    get_deployments = mock_github.return_value.get_repo.return_value.get_deployments
+    get_deployments.return_value = []
+    resource = make_resource(
+        access_token="tok",
+        repository="mitodl/my-app",
+        production_environment="prod",
+    )
+    resource._reached_production("2026.4.14.1")
+    get_deployments.assert_called_once_with(ref="2026.4.14.1", environment="prod")
+
+
+@patch("concourse.Github", side_effect=RuntimeError("GitHub is down"))
+def test_reached_production_is_true_when_the_api_fails(_mock_github):
+    """An API failure must not be read as "never shipped" and delete the tag."""
+    resource = make_resource(access_token="tok", repository="mitodl/my-app")
+    assert resource._reached_production("2026.4.14.1") is True
