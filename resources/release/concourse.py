@@ -47,6 +47,17 @@ from github import Auth, Github, GithubIntegration
 VERSION_PATTERN = re.compile(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})\.(\d+)$")
 SEMVER_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
+# Commits this resource itself creates during a release: the version-bump /
+# changelog commit written by ``action=create`` and the no-ff merge commit
+# written by ``action=finish``.  Because the tag is planted on the *pre-bump*
+# HEAD, both of these land on the tracked branch *after* the tag, so the range
+# ``<latest tag>..origin/<branch>`` is never empty once a release finishes.
+# Left unfiltered, every completed release immediately looks like two
+# unreleased commits and offers itself as the content of the next release.
+RELEASE_MACHINERY_PATTERN = re.compile(
+    r"^(Release|Merge releases/)\s*\d{4}\.\d{1,2}\.\d{1,2}\.\d+$"
+)
+
 # Default minimum clone depth.  Configurable via the ``clone_depth`` source
 # param.  Increase if the previous release tag is more than this many commits
 # back — a full clone (``clone_depth: 0``) is the safest option for busy repos.
@@ -81,6 +92,14 @@ class ReleaseVersion(TypedVersion):
     that the Slack release bot can surface a human-readable summary from the
     Concourse version object alone (e.g. ``/release-notes``) without needing
     to trigger the full pipeline.  They are not used for version ordering.
+
+    ``in_flight`` reports a release that was cut but has not yet reached
+    production — i.e. a ``releases/YYYY.M.D.N`` branch still present on the
+    remote.  It is reported rather than acted upon: ``check`` always advances
+    to the true next version so that an unfinished release can never freeze
+    the resource, and superseding the in-flight release is the explicit job of
+    ``action=create``.  Defaults to empty so version dicts recorded before
+    this field existed still deserialize.
     """
 
     version: str  # YYYY.M.D.N (no leading zeros — PEP 440 compliant)
@@ -88,6 +107,7 @@ class ReleaseVersion(TypedVersion):
     since: str  # previous tag (YYYY.M.D.N, vX.Y.Z/X.Y.Z semver, or empty string)
     commit_count: str  # number of commits since last release tag
     authors: str  # comma-separated sorted author email list
+    in_flight: str = ""  # cut-but-unfinished release version, or empty string
 
 
 # ---------------------------------------------------------------------------
@@ -229,68 +249,41 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             env=env,
         ).strip()
 
-        in_flight = _get_in_flight_release_version(repo_path, env=env)
-        if in_flight and in_flight in tags:
-            # Return the in-flight version so the pipeline does not advance
-            # until the release is finished or abandoned.
-            in_flight_sha = _run(
-                ["git", "rev-list", "-n1", in_flight],
-                cwd=repo_path,
-                env=env,
-            ).strip()
-            idx = tags.index(in_flight)
-            prev_tag = tags[idx - 1] if idx > 0 else ""
-            since = prev_tag
-            if not since and self.semver_tag_fallback:
-                semver_tags = _get_semver_tags(repo_path, env=env)
-                if semver_tags:
-                    since = semver_tags[-1]
-            count, authors = _commit_info_range(
-                repo_path, since, in_flight_sha, env=env
-            )
-            return [
-                ReleaseVersion(
-                    version=in_flight,
-                    head_sha=in_flight_sha,
-                    since=since,
-                    commit_count=str(count),
-                    authors=authors,
-                )
-            ]
+        # An unfinished release is reported, never obeyed.  This used to pin
+        # check to the in-flight version until the release was finished or
+        # abandoned, which meant a single failed `action=finish` froze the
+        # resource indefinitely: no new version, no new commits, no signal.
+        # Superseding an in-flight release is `action=create`'s job.
+        in_flight = _get_in_flight_release_version(repo_path, env=env) or ""
 
         if latest_tag:
-            tag_sha = _run(
-                ["git", "rev-list", "-n1", latest_tag],
-                cwd=repo_path,
-                env=env,
-            ).strip()
-            prev_tag = tags[-2] if len(tags) >= 2 else ""  # noqa: PLR2004
-
-            if tag_sha == head_sha:
-                # HEAD is already tagged — no new commits.
-                # Use prev_tag as the baseline; when there is no prior date-format
-                # tag, fall back to the latest semver tag (same logic as the
-                # no-date-tags branch) so that commit_count and authors reflect the
-                # commits included in this release rather than the entire history.
-                since = prev_tag
+            count, authors = _commit_info_range(
+                repo_path, latest_tag, head_sha, env=env
+            )
+            if count == 0:
+                # Nothing to release: either HEAD is the tagged commit, or the
+                # only commits on top of the tag are this resource's own
+                # release machinery.  Report the existing version, summarised
+                # against the release *before* it so commit_count and authors
+                # describe what that release contained.
+                since = tags[-2] if len(tags) >= 2 else ""  # noqa: PLR2004
                 if not since and self.semver_tag_fallback:
                     semver_tags = _get_semver_tags(repo_path, env=env)
                     if semver_tags:
                         since = semver_tags[-1]
-                count, authors = _commit_info_range(repo_path, since, head_sha, env=env)
+                prior_count, prior_authors = _commit_info_range(
+                    repo_path, since, head_sha, env=env
+                )
                 return [
                     ReleaseVersion(
                         version=latest_tag,
                         head_sha=head_sha,
                         since=since,
-                        commit_count=str(count),
-                        authors=authors,
+                        commit_count=str(prior_count),
+                        authors=prior_authors,
+                        in_flight=in_flight,
                     )
                 ]
-
-            count, authors = _commit_info_range(
-                repo_path, latest_tag, head_sha, env=env
-            )
             since = latest_tag
         else:
             # No date-format tags yet — optionally anchor diff at latest semver tag.
@@ -313,6 +306,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 since=since,
                 commit_count=str(count),
                 authors=authors,
+                in_flight=in_flight,
             )
         ]
 
@@ -351,6 +345,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         destination_dir.mkdir(parents=True, exist_ok=True)
         (destination_dir / "version").write_text(version.version)
         (destination_dir / "since").write_text(version.since)
+        (destination_dir / "in_flight").write_text(version.in_flight)
         (destination_dir / "commits.json").write_text(json.dumps(commits, indent=2))
         (destination_dir / "checklist.md").write_text(
             _build_checklist(version.version, commits)
@@ -366,10 +361,13 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         (git_dir / "ref").write_text(version.head_sha)
         (git_dir / "short_ref").write_text(version.head_sha[:7])
 
-        return version, {
+        metadata = {
             "version": version.version,
             "commit_count": version.commit_count,
         }
+        if version.in_flight:
+            metadata["in_flight"] = version.in_flight
+        return version, metadata
 
     def _collect_commits(
         self, repo_path: Path, version: ReleaseVersion, env: dict[str, str]
@@ -435,6 +433,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         version_str = (sources_dir / version_file).read_text().strip()
         repo_path = sources_dir / repo_dir
 
+        superseded = ""
         with _git_ssh_env(self.private_key) as env:
             _configure_git_identity(
                 repo_path, self.git_user_name, self.git_user_email, env=env
@@ -443,7 +442,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 _configure_https_auth(repo_path, token, env=env)
 
             if action == "create":
-                head_sha, since = self._create_release(
+                head_sha, since, superseded = self._create_release(
                     repo_path, version_str, commit_hash, env=env
                 )
             elif action == "finish":
@@ -453,6 +452,9 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 head_sha = self._abandon_release(repo_path, version_str, env=env)
                 since = ""
 
+        metadata = {"version": version_str, "action": action}
+        if superseded:
+            metadata["superseded"] = superseded
         return (
             ReleaseVersion(
                 version=version_str,
@@ -460,8 +462,11 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 since=since,
                 commit_count="0",
                 authors="",
+                # A freshly created release is, by definition, the one now in
+                # flight; finishing or abandoning clears it.
+                in_flight=version_str if action == "create" else "",
             ),
-            {"version": version_str, "action": action},
+            metadata,
         )
 
     def _create_release(
@@ -470,12 +475,14 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         version: str,
         commit_hash: str | None,
         env: dict[str, str],
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, str]:
         """Create the release branch and version tag.
 
-        Returns ``(pre_bump_sha, since_ref)`` where *pre_bump_sha* is the HEAD
-        SHA that was tagged and *since_ref* is the baseline ref used for commit
-        range computation (previous date-format tag, semver fallback, or empty).
+        Returns ``(pre_bump_sha, since_ref, superseded)`` where *pre_bump_sha*
+        is the HEAD SHA that was tagged, *since_ref* is the baseline ref used
+        for commit range computation (previous date-format tag, semver
+        fallback, or empty), and *superseded* is the version of an earlier
+        in-flight release that this one replaced (or empty).
 
         Commit ordering:
           1. Cherry-pick hotfix (if any) onto the branch first so it is
@@ -487,6 +494,8 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         branch_name = f"releases/{version}"
 
         _run(["git", "fetch", "origin", self.branch, "--tags"], cwd=repo_path, env=env)
+
+        superseded = self._supersede_in_flight_release(repo_path, version, env=env)
 
         # Stash uncommitted changes (version-bump files from bump_version_task) after
         # fetch but before the hard reset.  git reset --hard discards working-tree
@@ -573,7 +582,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             if not since_ref and self.semver_tag_fallback:
                 semver_tags = _get_semver_tags(repo_path, env=env)
                 since_ref = semver_tags[-1] if semver_tags else ""
-            return pre_bump_sha, since_ref
+            return pre_bump_sha, since_ref, superseded
 
         if prior_tags:
             since_ref = prior_tags[-1]
@@ -619,7 +628,31 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             cwd=repo_path,
             env=env,
         )
-        return pre_bump_sha, since_ref
+        return pre_bump_sha, since_ref, superseded
+
+    def _supersede_in_flight_release(
+        self, repo_path: Path, version: str, *, env: dict[str, str]
+    ) -> str:
+        """Abandon an older in-flight release, returning its version or "".
+
+        Cutting a new release supersedes one that was cut but never shipped.
+        Left in place, the stale branch keeps reporting an in-flight release
+        that will never ship, and the stale tag sits between the real releases,
+        corrupting the ``since`` boundary every later release is computed
+        against.
+
+        Re-cutting the version that is *already* in flight is a retrigger, not
+        a supersede, and deletes nothing.
+        """
+        in_flight = _get_in_flight_release_version(repo_path, env=env)
+        if not in_flight or in_flight == version:
+            return ""
+        self._abandon_release(repo_path, in_flight, env=env)
+        # The abandoned tag is gone from the remote but still present locally,
+        # where _get_release_tags reads from when picking the since boundary.
+        with suppress(subprocess.CalledProcessError):
+            _run(["git", "tag", "-d", in_flight], cwd=repo_path, env=env)
+        return in_flight
 
     def _finish_release(
         self, repo_path: Path, version: str, env: dict[str, str]
@@ -627,8 +660,24 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         """Merge the release branch into the configured tracked branch.
 
         Returns the merge commit SHA.
+
+        Idempotent: if the release branch is already gone from the remote the
+        release has been finished (or abandoned) and there is nothing to do,
+        so this returns the current tip of the tracked branch instead of
+        failing.  That matters because the production job can legitimately
+        re-run without a new release — callers should therefore treat a raised
+        error here as a real, unfinished release rather than routine noise to
+        swallow.
         """
         branch_name = f"releases/{version}"
+
+        if not _remote_branch_exists(repo_path, branch_name, env=env):
+            _run(["git", "fetch", "origin", self.branch], cwd=repo_path, env=env)
+            return _run(
+                ["git", "rev-parse", f"origin/{self.branch}"],
+                cwd=repo_path,
+                env=env,
+            ).strip()
 
         # Plain `git fetch origin <name>` only creates a `refs/remotes/origin/<name>`
         # tracking ref if one is already configured for that name. The checkout's
@@ -877,22 +926,49 @@ def _get_in_flight_release_version(
     A release is in-flight while its ``releases/YYYY.M.D.N`` branch exists on
     the remote — created by ``action=create`` and removed by ``action=finish``
     or ``action=abandon``.
+
+    Asks the remote via ``git ls-remote`` rather than reading local
+    ``origin/releases/*`` tracking refs.  Those refs only exist if the
+    checkout's fetch refspec happens to cover release branches, which is true
+    for ``check``'s own ``--no-single-branch`` clone but *not* for the
+    workspace checkout an ``out`` step is handed by the ``git`` resource — the
+    same trap ``_finish_release`` documents.  Querying the remote gives the
+    same answer in both contexts.
     """
     output = _run(
-        ["git", "branch", "-r", "--list", "origin/releases/*"],
+        ["git", "ls-remote", "--heads", "origin", "refs/heads/releases/*"],
         cwd=repo_path,
         env=env,
     )
-    prefix = "origin/releases/"
-    versions = [
-        branch[len(prefix) :]
-        for line in output.splitlines()
-        if (branch := line.strip()).startswith(prefix)
-        and VERSION_PATTERN.match(branch[len(prefix) :])
-    ]
+    prefix = "refs/heads/releases/"
+    versions = []
+    for line in output.splitlines():
+        ref = line.strip().partition("\t")[2]
+        if not ref.startswith(prefix):
+            continue
+        version = ref[len(prefix) :]
+        if VERSION_PATTERN.match(version):
+            versions.append(version)
     if not versions:
         return None
     return sorted(versions, key=_parse_version_tuple)[-1]
+
+
+def _remote_branch_exists(
+    repo_path: Path, branch_name: str, *, env: dict[str, str]
+) -> bool:
+    """Return True if *branch_name* exists on the ``origin`` remote."""
+    output = _run(
+        ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch_name}"],
+        cwd=repo_path,
+        env=env,
+    )
+    return bool(output.strip())
+
+
+def _is_release_machinery(subject: str) -> bool:
+    """Return True if *subject* is a commit this resource authored for a release."""
+    return bool(RELEASE_MACHINERY_PATTERN.match(subject.strip()))
 
 
 def _parse_semver_tuple(tag: str) -> tuple[int, int, int]:
@@ -903,23 +979,41 @@ def _parse_semver_tuple(tag: str) -> tuple[int, int, int]:
     return (0, 0, 0)
 
 
+def _commit_info(
+    repo_path: Path, range_spec: str, *, env: dict[str, str]
+) -> tuple[int, str]:
+    """Return (commit_count, comma-separated unique author emails) for a rev range.
+
+    Release-machinery commits are excluded, so a completed release does not
+    read as unreleased work.  ``%s`` is placed last and split with
+    ``maxsplit=1`` so a subject containing a literal ``|`` stays intact.
+    """
+    output = _run(["git", "log", "--format=%ae|%s", range_spec], cwd=repo_path, env=env)
+    emails = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        email, _, subject = line.partition("|")
+        if _is_release_machinery(subject):
+            continue
+        emails.append(email.strip())
+    return len(emails), ",".join(sorted(set(emails)))
+
+
 def _commit_info_range(
     repo_path: Path, since_ref: str, until_ref: str, *, env: dict[str, str]
 ) -> tuple[int, str]:
     """Return (commit_count, comma-separated unique author emails) for a range."""
     range_spec = f"{since_ref}..{until_ref}" if since_ref else until_ref
-    output = _run(["git", "log", "--format=%ae", range_spec], cwd=repo_path, env=env)
-    emails = [e.strip() for e in output.splitlines() if e.strip()]
-    return len(emails), ",".join(sorted(set(emails)))
+    return _commit_info(repo_path, range_spec, env=env)
 
 
 def _commit_info_all(
     repo_path: Path, until_ref: str, *, env: dict[str, str]
 ) -> tuple[int, str]:
     """Return (commit_count, comma-separated unique author emails) for all commits."""
-    output = _run(["git", "log", "--format=%ae", until_ref], cwd=repo_path, env=env)
-    emails = [e.strip() for e in output.splitlines() if e.strip()]
-    return len(emails), ",".join(sorted(set(emails)))
+    return _commit_info(repo_path, until_ref, env=env)
 
 
 def _configure_git_identity(
@@ -989,6 +1083,9 @@ def _configure_https_auth(
 def _parse_commit_log(output: str) -> list[dict[str, Any]]:
     """Parse ``git log --format=%H|%ae|%an|%s`` output into commit dicts.
 
+    Release-machinery commits are dropped so the checklist and changelog for
+    a release never contain the previous release's bookkeeping commits.
+
     ``author`` is the commit author's email (used as the checklist line's
     "by <author>" identity, matched against ``auto_check_authors`` by the
     github-issues resource); ``author_name`` is their git-configured display
@@ -1004,6 +1101,8 @@ def _parse_commit_log(output: str) -> list[dict[str, Any]]:
         if len(parts) < 4:  # noqa: PLR2004
             continue
         sha, author_email, author_name, message = parts
+        if _is_release_machinery(message.strip()):
+            continue
         commits.append(
             {
                 "sha": sha.strip(),
