@@ -62,6 +62,7 @@ resources:
 | `changelog_style` | No | `null` | `"cumulative"` or `"per_release"`; omit to disable |
 | `changelog_file` | No | `CHANGELOG.md` | Changelog filename (cumulative mode) |
 | `changelog_dir` | No | `releases` | Directory for per-release files |
+| `production_environment` | No | `Production` | GitHub Deployment environment consulted to decide whether a superseded release already shipped |
 
 ## `check` — Detect unreleased commits
 
@@ -76,16 +77,47 @@ The version object carries lightweight metadata for use by the Slack release bot
 
 ```json
 {
-  "version": "2026.04.14.1",
+  "version": "2026.4.14.1",
   "head_sha": "<full SHA of HEAD at check time>",
-  "since": "2026.04.10.2",
+  "since": "2026.4.10.2",
   "commit_count": "7",
-  "authors": "alice@example.com,bob@example.com"
+  "authors": "alice@example.com,bob@example.com",
+  "in_flight": ""
 }
 ```
 
 `head_sha` binds subsequent `in` and `out` steps to the exact commit evaluated
 during `check`, preventing race conditions if new commits land between steps.
+
+### Release-machinery commits are not releasable work
+
+The version tag is planted on the **pre-bump** HEAD, and `action: finish` then
+lands two more commits on the tracked branch — `Release <version>` and
+`Merge releases/<version>`. So `<latest tag>..origin/<branch>` is never empty
+once a release completes. Both are excluded from `commit_count`, `authors`,
+`commits.json`, `checklist.md`, and the changelog, so a finished release does
+not immediately propose its own bookkeeping as the next release's contents.
+
+### In-flight releases are reported, not obeyed
+
+`in_flight` names a release that was cut but never **finished** — a
+`releases/YYYY.MM.DD.N` branch still present on the remote. It is also written
+to the `in_flight` file by `in`, and set as `get`/`put` metadata.
+
+It is **not** a deployment status. A release whose production deploy succeeded
+and whose `action: finish` then failed is still in flight by this definition —
+that case is precisely what this field exists to surface, and what decides
+whether superseding it keeps its tag.
+
+`check` **always advances** to the true next version regardless. It used to
+pin to the in-flight version until the release finished or was abandoned,
+which meant a single failed `action: finish` froze the resource indefinitely:
+no new version and no new commits reported, with no signal that anything was
+wrong. Superseding an in-flight release is `action: create`'s job.
+
+Detection queries the remote with `git ls-remote` rather than reading local
+`origin/releases/*` tracking refs, because an `out` step's workspace checkout
+comes from the `git` resource and only tracks the configured branch.
 
 > **Depth note**: The resource uses a shallow clone (`--depth=200`). For repositories
 > where the previous release tag is more than 200 commits back, consider a full clone.
@@ -98,7 +130,8 @@ Clones the repository and generates release artefacts from `version.since..versi
 
 | File | Description |
 |------|-------------|
-| `version` | Plain version string, e.g. `2026.04.14.1` |
+| `version` | Plain version string, e.g. `2026.4.14.1` |
+| `in_flight` | Version of a release cut but not yet finished, or empty (may already be in production — see below) |
 | `commits.json` | Structured list of `{sha, author, author_name, pr_number, pr_title, message}` -- `author` is the commit email (matched against `auto_check_authors` by the `github-issues` resource), `author_name` is the git-configured display name |
 | `checklist.md` | GitHub Issue body with a markdown task list grouped by author (`### <author_name>` headings, newest contributor first); use as `body_file` in `github-issues` resource |
 | `changelog_entry.md` | Single [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) entry for this version |
@@ -110,17 +143,60 @@ Clones the repository and generates release artefacts from `version.since..versi
 Requires a checked-out git repository (from `get: app-source`) with version files
 already updated by `bump_version_task`.
 
-1. Records the pre-bumpver HEAD SHA (this becomes the release tag, marking the code cut for RC).
-2. Optionally cherry-picks `commit_hash` (hotfix) before the release commit.
-3. Creates `release/YYYY.MM.DD.N` branch.
-4. Stages version-bump changes and optional changelog update in a single `"Release YYYY.MM.DD.N"` commit.
-5. Pushes the branch.
-6. Creates and pushes the `YYYY.MM.DD.N` tag on the pre-bumpver HEAD.
+1. **Supersedes any older in-flight release** — deletes its `releases/` branch
+   from the remote and reports it as `superseded` in the put metadata.
+   Whether its *tag* is deleted depends on whether that release ever shipped:
+
+   | In-flight release | Branch | Tag | `superseded_tag` |
+   |---|---|---|---|
+   | Never reached production | deleted | deleted | `deleted` |
+   | Reached production, `finish` failed | deleted | **kept** | `kept` |
+
+   The two are indistinguishable in git, so the resource asks the GitHub
+   Deployments API for a successful deployment of that version to
+   `production_environment` (default `Production`). A shipped release's tag is
+   the only thing tying what production runs back to a commit, so it must
+   outlive its branch — and it is then the correct `since` boundary for the new
+   release, whose predecessor really is live. When the answer cannot be
+   established (no credentials, no `repository`, or an API failure) the tag is
+   **kept**: an unnecessary tag is recoverable, a deleted one is not.
+2. Records the pre-bumpver HEAD SHA (this becomes the release tag, marking the code cut for RC).
+3. Optionally cherry-picks `commit_hash` (hotfix) before the release commit.
+4. Creates `releases/YYYY.MM.DD.N` branch.
+5. Stages version-bump changes and optional changelog update in a single `"Release YYYY.MM.DD.N"` commit.
+6. Pushes the branch.
+7. Creates and pushes the `YYYY.MM.DD.N` tag on the pre-bumpver HEAD.
+
+Only an **older** release is ever superseded. `create` binds the version
+Concourse resolved when the build was scheduled, so a delayed or concurrent
+build can carry a version older than the release now in flight; that is
+refused rather than allowed to replace a newer cut with an older one.
+
+If any superseded ref survives deletion (a protected ref, a transient remote
+failure — both silenced by the best-effort deletion in `abandon`), `create`
+**fails** rather than reporting a supersede. Continuing would leave a branch
+for a later `check` to rediscover as in-flight, which is the failure this
+resource exists to prevent.
+
+Re-running `create` for the version that is *already* in flight does not delete
+the refs it is re-creating — **provided that cut completed**. The branch is
+pushed before the tag, so a failed tag push leaves `releases/X` present with no
+`X` tag. That is a partially-created release, not a retrigger: the stale branch
+carries the previous attempt's release commit, so the next push is rejected as
+a non-fast-forward and every retry fails identically. That branch is deleted
+before re-cutting. A cut with **both** branch and tag present is a true
+retrigger and is left completely alone.
 
 ### `action: finish`
 
-Merges `release/YYYY.MM.DD.N` back into the configured `branch` (no fast-forward).
+Merges `releases/YYYY.MM.DD.N` back into the configured `branch` (no fast-forward),
+then deletes the release branch from the remote.
 Run as the final step of the `deploy-production` job after production deployment is verified.
+
+**Idempotent**: if the release branch is already gone the release has been
+finished (or abandoned), so this returns the current tip of the tracked branch
+instead of failing. Callers should therefore **not** wrap this put in a `try` —
+an error raised here means a real, unfinished release.
 
 ### Parameters
 

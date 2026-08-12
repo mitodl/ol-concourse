@@ -19,8 +19,10 @@ from concourse import (
     _build_changelog_entry,
     _build_checklist,
     _clone,
+    _commit_info_range,
     _compute_next_version,
     _get_in_flight_release_version,
+    _is_release_machinery,
     _get_semver_tags,
     _parse_commit_log,
     _parse_semver_tuple,
@@ -633,44 +635,43 @@ def test_create_release_semver_fallback_disabled_no_since(mock_run, tmp_path):
     )
 
 
-def _make_run_side_effects(
-    tag_list: list[str],
+def _check_git_stub(
+    *,
+    tags: list[str],
     head_sha: str,
-    tag_sha: str = "",
-    in_flight_branch: str = "",
-) -> list[str]:
-    """Build a list of subprocess outputs for check's _run calls.
+    in_flight: list[str] | None = None,
+    logs: dict[str, str] | None = None,
+):
+    """Return a ``_run`` replacement that dispatches on the git command.
 
-    Call order in _compute_versions:
-      0  git clone
-      1  git fetch --tags
-      2  git tag --list
-      3  git rev-parse origin/main  → head_sha
-      4  git branch -r --list origin/releases/*  → in_flight_branch (empty = none)
-      5  git rev-list -n1 <latest_tag>  (only when tags exist and no in-flight)
-      6  git log --format=%ae  (commit range / all)
+    Dispatching on the command rather than on call position keeps these tests
+    from breaking every time ``check`` gains or drops a git invocation, which
+    is what made the previous positional-output fixtures unmaintainable.
+
+    *logs* maps a ``git log`` rev-range (``"a..b"`` or a bare ref) to that
+    call's output in ``%ae|%s`` format; ranges not listed produce no commits.
     """
-    tags_output = "\n".join(tag_list)
-    effects = [
-        "",  # git clone
-        "",  # git fetch --tags
-        tags_output,  # git tag --list
-        head_sha,  # git rev-parse origin/main
-        in_flight_branch,  # git branch -r --list origin/releases/*
-    ]
-    if in_flight_branch:
-        # In-flight path: rev-list -n1 in_flight_version + commit_info_range
-        effects.append(tag_sha or head_sha)  # git rev-list -n1 in_flight_tag
-        effects.append("dev@example.com")
-    elif tag_list:
-        effects.append(tag_sha or head_sha)  # git rev-list -n1 latest_tag
-        if tag_sha != head_sha:
-            effects.append("dev@example.com\nalice@example.com")
-        else:
-            effects.append("dev@example.com")
-    else:
-        effects.append("dev@example.com\nalice@example.com")  # commit_info_all
-    return effects
+    logs = logs or {}
+
+    def run(cmd, **_kwargs):
+        if cmd[1] == "tag" and cmd[2] == "--list":
+            return "\n".join(tags)
+        if cmd[1] == "rev-parse":
+            return head_sha
+        if cmd[1] == "ls-remote":
+            return "\n".join(
+                f"{'ab' * 20}\trefs/heads/releases/{v}" for v in (in_flight or [])
+            )
+        if cmd[1] == "log":
+            return logs.get(cmd[-1], "")
+        return ""
+
+    return run
+
+
+def _log(*commits: tuple[str, str]) -> str:
+    """Render ``(email, subject)`` pairs as ``git log --format=%ae|%s`` output."""
+    return "\n".join(f"{email}|{subject}" for email, subject in commits)
 
 
 @patch("concourse._run")
@@ -708,30 +709,25 @@ def test_fetch_new_versions_head_equals_tag(mock_tmpdir, mock_run, tmp_path):
     mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
     head_sha = "tagged1234" * 4
 
-    outputs = [
-        "",  # 0: git clone
-        "",  # 1: git fetch --tags
-        "2026.4.10.1\n2026.4.14.1",  # 2: git tag --list
-        head_sha,  # 3: git rev-parse origin/main
-        "",  # 4: git branch -r (no in-flight)
-        head_sha,  # 5: git rev-list -n1 2026.4.14.1 (same → tagged)
-        "dev@example.com",  # 6: git log (commit_info_range)
-    ]
-    call_index = 0
-
-    def run_side_effect(cmd, **kwargs):
-        nonlocal call_index
-        out = outputs[call_index]
-        call_index += 1
-        return out
-
-    mock_run.side_effect = run_side_effect
+    mock_run.side_effect = _check_git_stub(
+        tags=["2026.4.10.1", "2026.4.14.1"],
+        head_sha=head_sha,
+        logs={
+            # Nothing between the latest tag and HEAD -- HEAD *is* the tag.
+            f"2026.4.14.1..{head_sha}": "",
+            # Summarised against the release before it.
+            f"2026.4.10.1..{head_sha}": _log(("dev@example.com", "a fix")),
+        },
+    )
     resource = make_resource()
     versions = resource.fetch_new_versions(None)
 
     assert len(versions) == 1
     assert versions[0].version == "2026.4.14.1"
     assert versions[0].head_sha == head_sha
+    assert versions[0].since == "2026.4.10.1"
+    assert versions[0].commit_count == "1"
+    assert versions[0].in_flight == ""
 
 
 @patch("concourse._run")
@@ -740,26 +736,17 @@ def test_fetch_new_versions_new_commits(mock_tmpdir, mock_run, tmp_path, monkeyp
     """When HEAD is ahead of the latest tag, return the next version."""
     mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
     head_sha = "newcommit1" * 4
-    tag_sha = "oldtagsha1" * 4
 
-    outputs = [
-        "",  # 0: git clone
-        "",  # 1: git fetch --tags
-        "2026.4.14.1",  # 2: git tag --list
-        head_sha,  # 3: git rev-parse origin/main
-        "",  # 4: git branch -r (no in-flight)
-        tag_sha,  # 5: git rev-list -n1 2026.4.14.1
-        "dev@example.com\nalice@example.com",  # 6: git log (commit_info_range)
-    ]
-    call_index = 0
-
-    def run_side_effect(cmd, **kwargs):
-        nonlocal call_index
-        out = outputs[call_index]
-        call_index += 1
-        return out
-
-    mock_run.side_effect = run_side_effect
+    mock_run.side_effect = _check_git_stub(
+        tags=["2026.4.14.1"],
+        head_sha=head_sha,
+        logs={
+            f"2026.4.14.1..{head_sha}": _log(
+                ("dev@example.com", "feat: a thing"),
+                ("alice@example.com", "fix: another thing"),
+            )
+        },
+    )
     resource = make_resource()
 
     with patch("concourse.datetime") as mock_dt:
@@ -898,6 +885,7 @@ def test_publish_new_version_create(mock_run, tmp_path):
             "",  # git config user.name
             "",  # git config user.email
             "",  # git fetch origin main --tags
+            "",  # git ls-remote (no in-flight release to supersede)
             "",  # git status --porcelain (check dirty before reset — no dirty files)
             "",  # git checkout main
             "",  # git reset --hard origin/main
@@ -1360,7 +1348,7 @@ def test_get_in_flight_release_version_none_when_no_branches(mock_run, tmp_path)
 def test_get_in_flight_release_version_returns_latest(mock_run, tmp_path):
     """Returns the most recent date-format version when multiple branches exist."""
     mock_run.return_value = (
-        "  origin/releases/2026.4.10.1\n  origin/releases/2026.4.14.1\n"
+        "aaa\trefs/heads/releases/2026.4.10.1\nbbb\trefs/heads/releases/2026.4.14.1\n"
     )
     result = _get_in_flight_release_version(tmp_path, env={})
     assert result == "2026.4.14.1"
@@ -1370,45 +1358,58 @@ def test_get_in_flight_release_version_returns_latest(mock_run, tmp_path):
 def test_get_in_flight_release_version_ignores_non_date_branches(mock_run, tmp_path):
     """Non date-format branch names under releases/ are ignored."""
     mock_run.return_value = (
-        "  origin/releases/my-feature\n  origin/releases/2026.4.14.1\n"
+        "aaa\trefs/heads/releases/my-feature\nbbb\trefs/heads/releases/2026.4.14.1\n"
     )
     result = _get_in_flight_release_version(tmp_path, env={})
     assert result == "2026.4.14.1"
 
 
+@patch("concourse._run")
+def test_get_in_flight_release_version_asks_the_remote(mock_run, tmp_path):
+    """Detection must query the remote, not local origin/* tracking refs.
+
+    An ``out`` step's workspace checkout is produced by the ``git`` resource
+    and only tracks the configured branch, so ``git branch -r`` would report
+    no in-flight release there no matter how many exist on the remote.
+    """
+    mock_run.return_value = ""
+    _get_in_flight_release_version(tmp_path, env={})
+    cmd = mock_run.call_args.args[0]
+    assert cmd[:2] == ["git", "ls-remote"]
+    assert "refs/heads/releases/*" in cmd
+
+
 # ---------------------------------------------------------------------------
-# fetch_new_versions — in-flight blocking
+# fetch_new_versions — in-flight releases are reported, not obeyed
 # ---------------------------------------------------------------------------
 
 
 @patch("concourse._run")
 @patch("concourse.tempfile.TemporaryDirectory")
-def test_fetch_new_versions_blocks_while_release_in_flight(
-    mock_tmpdir, mock_run, tmp_path, monkeypatch
+def test_fetch_new_versions_advances_past_an_in_flight_release(
+    mock_tmpdir, mock_run, tmp_path
 ):
-    """Check returns the in-flight version even when new commits exist on main."""
+    """An unfinished release must never freeze check.
+
+    Pinning check to the in-flight version meant one failed `action=finish`
+    stopped the resource from ever reporting a new version or new commits
+    again -- silently, for as long as the abandoned `releases/X` branch sat on
+    the remote. Check now advances and reports the in-flight release instead,
+    leaving it to `action=create` to supersede it.
+    """
     mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
-    in_flight_sha = "releasesha" * 4  # SHA the release tag points to
-    new_head_sha = "newcommit1" * 4  # new commit pushed to main after the cut
+    new_head_sha = "newcommit1" * 4  # commit pushed to main after the cut
 
-    outputs = [
-        "",  # 0: git clone
-        "",  # 1: git fetch --tags
-        "2026.4.10.1\n2026.4.14.1",  # 2: git tag --list (release tag exists)
-        new_head_sha,  # 3: git rev-parse origin/main (new commit!)
-        "  origin/releases/2026.4.14.1\n",  # 4: git branch -r → in-flight!
-        in_flight_sha,  # 5: git rev-list -n1 2026.4.14.1
-        "dev@example.com",  # 6: git log (commit_info_range)
-    ]
-    idx = 0
-
-    def run_side_effect(cmd, **kwargs):
-        nonlocal idx
-        out = outputs[idx]
-        idx += 1
-        return out
-
-    mock_run.side_effect = run_side_effect
+    mock_run.side_effect = _check_git_stub(
+        tags=["2026.4.10.1", "2026.4.14.1"],
+        head_sha=new_head_sha,
+        in_flight=["2026.4.14.1"],
+        logs={
+            f"2026.4.14.1..{new_head_sha}": _log(
+                ("dev@example.com", "feat: landed while the release was stuck")
+            )
+        },
+    )
     resource = make_resource()
 
     with patch("concourse.datetime") as mock_dt:
@@ -1419,41 +1420,32 @@ def test_fetch_new_versions_blocks_while_release_in_flight(
 
     assert len(versions) == 1
     v = versions[0]
-    # Must return the in-flight version, not a new one
-    assert v.version == "2026.4.14.1"
-    # head_sha is the tagged commit, not the new commit
-    assert v.head_sha == in_flight_sha
-    assert v.since == "2026.4.10.1"
+    assert v.version == "2026.4.14.2"
+    assert v.head_sha == new_head_sha
+    assert v.since == "2026.4.14.1"
+    assert v.commit_count == "1"
+    assert v.in_flight == "2026.4.14.1"
 
 
 @patch("concourse._run")
 @patch("concourse.tempfile.TemporaryDirectory")
-def test_fetch_new_versions_unblocked_after_branch_deleted(
-    mock_tmpdir, mock_run, tmp_path, monkeypatch
+def test_fetch_new_versions_clears_in_flight_after_branch_deleted(
+    mock_tmpdir, mock_run, tmp_path
 ):
-    """After the release branch is deleted, check advances to the next version."""
+    """Once the release branch is gone, nothing is in flight."""
     mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
     head_sha = "newcommit1" * 4
-    tag_sha = "releasesha" * 4
 
-    outputs = [
-        "",  # 0: git clone
-        "",  # 1: git fetch --tags
-        "2026.4.14.1",  # 2: git tag --list
-        head_sha,  # 3: git rev-parse origin/main
-        "",  # 4: git branch -r → no in-flight branch
-        tag_sha,  # 5: git rev-list -n1
-        "dev@example.com\nalice@example.com",  # 6: git log
-    ]
-    idx = 0
-
-    def run_side_effect(cmd, **kwargs):
-        nonlocal idx
-        out = outputs[idx]
-        idx += 1
-        return out
-
-    mock_run.side_effect = run_side_effect
+    mock_run.side_effect = _check_git_stub(
+        tags=["2026.4.14.1"],
+        head_sha=head_sha,
+        logs={
+            f"2026.4.14.1..{head_sha}": _log(
+                ("dev@example.com", "feat: a thing"),
+                ("alice@example.com", "fix: another"),
+            )
+        },
+    )
     resource = make_resource()
 
     with patch("concourse.datetime") as mock_dt:
@@ -1463,9 +1455,48 @@ def test_fetch_new_versions_unblocked_after_branch_deleted(
         versions = resource.fetch_new_versions(None)
 
     assert len(versions) == 1
-    # New commits → next version
     assert versions[0].version == "2026.4.14.2"
     assert versions[0].head_sha == head_sha
+    assert versions[0].in_flight == ""
+
+
+@patch("concourse._run")
+@patch("concourse.tempfile.TemporaryDirectory")
+def test_fetch_new_versions_ignores_its_own_release_commits(
+    mock_tmpdir, mock_run, tmp_path
+):
+    """A finished release must not read as two commits waiting to be released.
+
+    `finish` lands "Release X" and "Merge releases/X" on the tracked branch,
+    on top of a tag planted on the pre-bump HEAD -- so `<tag>..origin/main` is
+    never empty once a release completes.
+    """
+    mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
+    head_sha = "mergecommit" * 4
+
+    mock_run.side_effect = _check_git_stub(
+        tags=["2026.4.10.1", "2026.4.14.1"],
+        head_sha=head_sha,
+        logs={
+            f"2026.4.14.1..{head_sha}": _log(
+                ("ci@example.com", "Merge releases/2026.4.14.1"),
+                ("ci@example.com", "Release 2026.4.14.1"),
+            ),
+            f"2026.4.10.1..{head_sha}": _log(("dev@example.com", "feat: real work")),
+        },
+    )
+    resource = make_resource()
+
+    with patch("concourse.datetime") as mock_dt:
+        mock_dt.now.return_value.date.return_value = datetime(
+            2026, 4, 14, tzinfo=UTC
+        ).date()
+        versions = resource.fetch_new_versions(None)
+
+    assert len(versions) == 1
+    # Still the released version -- not 2026.4.14.2 containing its own bookkeeping.
+    assert versions[0].version == "2026.4.14.1"
+    assert versions[0].commit_count == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -1763,4 +1794,505 @@ def test_check_clones_with_installation_token(
     assert (
         "https://x-access-token:ghs_minted@github.com/mitodl/my-app.git"
         in clone_cmd.args[0]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Release-machinery commit filtering
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        "Release 2026.4.14.1",
+        "Release 2026.12.1.3",
+        "Merge releases/2026.4.14.1",
+    ],
+)
+def test_is_release_machinery_matches_this_resources_own_commits(subject):
+    assert _is_release_machinery(subject)
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        "Release the kraken",
+        "feat: release notes page",
+        "Merge releases/my-feature",
+        "Merge pull request #12 from mitodl/fix",
+        "Release 2026.4.14.1 was broken, reverting",
+    ],
+)
+def test_is_release_machinery_leaves_real_commits_alone(subject):
+    assert not _is_release_machinery(subject)
+
+
+def test_parse_commit_log_drops_release_machinery_commits():
+    """A release's checklist must not list the previous release's bookkeeping."""
+    output = (
+        "aaa111|ci@example.com|Concourse CI|Merge releases/2026.4.14.1\n"
+        "bbb222|ci@example.com|Concourse CI|Release 2026.4.14.1\n"
+        "ccc333|dev@example.com|Dev|feat: something real\n"
+    )
+    commits = _parse_commit_log(output)
+    assert [c["message"] for c in commits] == ["feat: something real"]
+
+
+@patch("concourse._run")
+def test_commit_info_range_excludes_release_machinery(mock_run, tmp_path):
+    """Machinery commits must not inflate commit_count or the author list."""
+    mock_run.return_value = (
+        "ci@example.com|Merge releases/2026.4.14.1\n"
+        "ci@example.com|Release 2026.4.14.1\n"
+        "dev@example.com|feat: something real\n"
+    )
+    count, authors = _commit_info_range(tmp_path, "2026.4.14.1", "headsha", env={})
+    assert count == 1
+    assert authors == "dev@example.com"
+
+
+@patch("concourse._run")
+def test_commit_info_range_keeps_subjects_containing_a_pipe(mock_run, tmp_path):
+    """%s is last and split with maxsplit=1, so a piped subject stays intact."""
+    mock_run.return_value = "dev@example.com|feat: support a|b syntax\n"
+    count, authors = _commit_info_range(tmp_path, "", "headsha", env={})
+    assert count == 1
+    assert authors == "dev@example.com"
+
+
+# ---------------------------------------------------------------------------
+# publish_new_version — create supersedes an in-flight release
+# ---------------------------------------------------------------------------
+
+
+class _FakeRemote:
+    """A stateful `_run` stub that models ref deletion actually taking effect.
+
+    `_assert_refs_deleted` re-queries the remote after a delete, so a stub that
+    always reports the same refs would make every supersede look like a failed
+    deletion.
+    """
+
+    def __init__(self, *, branches=(), tags=(), head="prebump1" * 5):
+        self.branches = set(branches)
+        self.tags = set(tags)
+        self.head = head
+        self.commands: list[str] = []
+
+    def __call__(self, cmd, **_kwargs):
+        self.commands.append(" ".join(cmd))
+        if cmd[:2] == ["git", "ls-remote"]:
+            return self._ls_remote(cmd[-1])
+        if cmd[:4] == ["git", "push", "origin", "--delete"]:
+            ref = cmd[4]
+            if ref.startswith("refs/tags/"):
+                self.tags.discard(ref[len("refs/tags/") :])
+            else:
+                self.branches.discard(ref)
+            return ""
+        if cmd[:2] == ["git", "rev-parse"]:
+            return self.head
+        if "tag" in cmd and "--list" in cmd:
+            return "\n".join(sorted(self.tags))
+        if cmd[:3] == ["git", "rev-list", "-n1"]:
+            return "othersha" * 5
+        return ""
+
+    def _ls_remote(self, pattern: str) -> str:
+        if pattern.startswith("refs/tags/"):
+            name = pattern[len("refs/tags/") :]
+            return f"aaa\trefs/tags/{name}\n" if name in self.tags else ""
+        prefix = "refs/heads/"
+        if pattern.endswith("*"):
+            stem = pattern[len(prefix) : -1]
+            return "".join(
+                f"aaa\t{prefix}{b}\n"
+                for b in sorted(self.branches)
+                if b.startswith(stem)
+            )
+        name = pattern[len(prefix) :]
+        return f"aaa\t{prefix}{name}\n" if name in self.branches else ""
+
+
+@patch("concourse.ReleaseResource._reached_production", return_value=False)
+@patch("concourse._run")
+def test_create_supersedes_a_release_that_never_shipped(
+    mock_run, _mock_shipped, tmp_path
+):
+    """A cut that never reached production is discarded branch and tag.
+
+    Its tag would otherwise sit between the real releases and corrupt the
+    `since` boundary of every later release.
+    """
+    version_str = "2026.4.14.2"
+    stale = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    remote = _FakeRemote(branches={f"releases/{stale}"}, tags={stale})
+    mock_run.side_effect = remote
+    resource = make_resource()
+    returned_version, metadata = resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    all_cmds = remote.commands
+    assert any("--delete" in c and f"releases/{stale}" in c for c in all_cmds), (
+        "Must delete the superseded release branch"
+    )
+    assert any("--delete" in c and f"refs/tags/{stale}" in c for c in all_cmds), (
+        "An unshipped release's tag must go with its branch"
+    )
+    assert metadata["superseded"] == stale
+    assert metadata["superseded_tag"] == "deleted"
+    assert returned_version.in_flight == version_str
+
+
+@patch("concourse.ReleaseResource._reached_production", return_value=True)
+@patch("concourse._run")
+def test_create_keeps_the_tag_of_a_superseded_release_that_shipped(
+    mock_run, _mock_shipped, tmp_path
+):
+    """A release whose finish failed after shipping keeps its tag.
+
+    ol-analytics-api sat exactly here: 2026.8.3.1 deployed to production
+    repeatedly while its releases/ branch never merged. That tag is the only
+    thing tying what production runs back to a commit, so superseding must
+    take the branch and leave the tag -- which also makes it the correct
+    `since` boundary for the new release, whose predecessor really is live.
+    """
+    version_str = "2026.4.14.2"
+    stale = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    remote = _FakeRemote(branches={f"releases/{stale}"}, tags={stale})
+    mock_run.side_effect = remote
+    resource = make_resource()
+    _, metadata = resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    all_cmds = remote.commands
+    assert any("--delete" in c and f"releases/{stale}" in c for c in all_cmds), (
+        "Must still delete the superseded release branch"
+    )
+    assert not any("--delete" in c and f"refs/tags/{stale}" in c for c in all_cmds), (
+        "Must not delete the tag for code that reached production"
+    )
+    assert not any(c.startswith("git tag -d") for c in all_cmds), (
+        "Must not delete the shipped tag locally either -- it is the since boundary"
+    )
+    assert metadata["superseded_tag"] == "kept"
+
+
+@patch("concourse._run")
+def test_create_does_not_supersede_itself(mock_run, tmp_path):
+    """A retriggered create for the in-flight version must not delete its own refs."""
+    version_str = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    pre_bump_sha = "prebump1" * 5
+
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ["git", "ls-remote"]:
+            return f"abc\trefs/heads/releases/{version_str}\n"
+        if cmd[:2] == ["git", "rev-parse"]:
+            return pre_bump_sha
+        if "tag" in cmd and "--list" in cmd:
+            return version_str
+        if cmd[:3] == ["git", "rev-list", "-n1"]:
+            return pre_bump_sha
+        return ""
+
+    mock_run.side_effect = fake_run
+    resource = make_resource()
+    _, metadata = resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    all_cmds = [" ".join(c.args[0]) for c in mock_run.call_args_list]
+    assert not any("--delete" in c for c in all_cmds), (
+        "A retrigger must not delete the release it is re-creating"
+    )
+    assert "superseded" not in metadata
+
+
+# ---------------------------------------------------------------------------
+# publish_new_version — finish is idempotent
+# ---------------------------------------------------------------------------
+
+
+@patch("concourse._run")
+def test_finish_is_a_noop_when_the_release_branch_is_gone(mock_run, tmp_path):
+    """Re-running finish must succeed rather than fail on a missing branch.
+
+    The production job legitimately re-runs without a new release. That used
+    to fail every time, which is why the pipeline wrapped this put in a
+    `try` -- and that `try` then silently swallowed the genuine finish
+    failure that froze the resource.
+    """
+    version_str = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    head = "mainhead" * 5
+
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ["git", "ls-remote"]:
+            return ""  # branch already deleted by a prior successful finish
+        if cmd[:2] == ["git", "rev-parse"]:
+            return head
+        return ""
+
+    mock_run.side_effect = fake_run
+    resource = make_resource()
+    returned_version, metadata = resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="finish",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    assert returned_version.head_sha == head
+    assert metadata["action"] == "finish"
+    all_cmds = [" ".join(c.args[0]) for c in mock_run.call_args_list]
+    assert not any("merge" in c for c in all_cmds), (
+        "Nothing to merge when the release branch is already gone"
+    )
+    assert not any("--delete" in c for c in all_cmds)
+
+
+# ---------------------------------------------------------------------------
+# _reached_production — did an in-flight release actually ship?
+# ---------------------------------------------------------------------------
+
+
+def _deployments(*states: str):
+    """Build a fake get_deployments() result with the given status states."""
+    deployment = MagicMock()
+    deployment.get_statuses.return_value = [MagicMock(state=state) for state in states]
+    return [deployment]
+
+
+def test_reached_production_is_true_without_credentials():
+    """Unknowable means "keep the tag" -- never destroy the only prod marker."""
+    resource = make_resource(access_token=None, repository=None)
+    assert resource._reached_production("2026.4.14.1") is True
+
+
+@patch("concourse.Github")
+def test_reached_production_true_on_a_successful_deployment(mock_github):
+    mock_github.return_value.get_repo.return_value.get_deployments.return_value = (
+        _deployments("in_progress", "success")
+    )
+    resource = make_resource(access_token="tok", repository="mitodl/my-app")
+    assert resource._reached_production("2026.4.14.1") is True
+
+
+@patch("concourse.Github")
+def test_reached_production_false_when_no_deployment_succeeded(mock_github):
+    """A cut that only ever failed to deploy is safe to discard entirely."""
+    mock_github.return_value.get_repo.return_value.get_deployments.return_value = (
+        _deployments("failure", "error")
+    )
+    resource = make_resource(access_token="tok", repository="mitodl/my-app")
+    assert resource._reached_production("2026.4.14.1") is False
+
+
+@patch("concourse.Github")
+def test_reached_production_false_when_never_deployed(mock_github):
+    mock_github.return_value.get_repo.return_value.get_deployments.return_value = []
+    resource = make_resource(access_token="tok", repository="mitodl/my-app")
+    assert resource._reached_production("2026.4.14.1") is False
+
+
+@patch("concourse.Github")
+def test_reached_production_queries_the_configured_environment(mock_github):
+    """The environment name must match the pipeline's GitHub Deployment."""
+    get_deployments = mock_github.return_value.get_repo.return_value.get_deployments
+    get_deployments.return_value = []
+    resource = make_resource(
+        access_token="tok",
+        repository="mitodl/my-app",
+        production_environment="prod",
+    )
+    resource._reached_production("2026.4.14.1")
+    get_deployments.assert_called_once_with(ref="2026.4.14.1", environment="prod")
+
+
+@patch("concourse.Github", side_effect=RuntimeError("GitHub is down"))
+def test_reached_production_is_true_when_the_api_fails(_mock_github):
+    """An API failure must not be read as "never shipped" and delete the tag."""
+    resource = make_resource(access_token="tok", repository="mitodl/my-app")
+    assert resource._reached_production("2026.4.14.1") is True
+
+
+# ---------------------------------------------------------------------------
+# create — partial cuts, stale-ref survival, and version ordering
+# ---------------------------------------------------------------------------
+
+
+class _UndeletableSet(set):  # type: ignore[type-arg]
+    """A set whose discard() is a no-op, standing in for a protected ref."""
+
+    def discard(self, value):
+        return
+
+
+@patch("concourse._run")
+def test_create_clears_a_branch_left_by_a_failed_tag_push(mock_run, tmp_path):
+    """A cut that pushed its branch but not its tag must not wedge retries.
+
+    `_create_release` pushes the branch before the tag, so a failed tag push
+    leaves `releases/X` present with no X tag. That is not a completed release
+    -- the genuine retrigger path is guarded by `version in prior_tags` -- but
+    the stale branch still holds the previous attempt's release commit, so this
+    run's push would be rejected as a non-fast-forward and every retry after it
+    would fail identically.
+    """
+    version_str = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    # Branch present, tag absent -- the partial-cut state.
+    remote = _FakeRemote(branches={f"releases/{version_str}"}, tags=set())
+    mock_run.side_effect = remote
+
+    resource = make_resource()
+    _, metadata = resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    assert any(
+        "--delete" in c and f"releases/{version_str}" in c for c in remote.commands
+    ), "Must clear the partially-created release branch before re-cutting"
+    # Not a supersede -- it is the same version being re-cut.
+    assert "superseded" not in metadata
+    # The branch is pushed again as part of the fresh cut.
+    assert any(c == f"git push origin releases/{version_str}" for c in remote.commands)
+
+
+@patch("concourse._run")
+def test_create_leaves_a_complete_cut_alone(mock_run, tmp_path):
+    """Branch *and* tag present is a real retrigger -- delete nothing."""
+    version_str = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    remote = _FakeRemote(
+        branches={f"releases/{version_str}"}, tags={version_str}, head="othersha" * 5
+    )
+    mock_run.side_effect = remote
+
+    resource = make_resource()
+    resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    assert not any("--delete" in c for c in remote.commands), (
+        "A completed cut being retriggered must not have its refs deleted"
+    )
+
+
+@patch("concourse.ReleaseResource._reached_production", return_value=False)
+@patch("concourse._run")
+def test_create_fails_loudly_when_a_superseded_ref_survives(
+    mock_run, _mock_shipped, tmp_path
+):
+    """A suppressed deletion failure must not be reported as a supersede.
+
+    `_abandon_release` silences CalledProcessError to stay idempotent, which
+    equally hides a protected ref or a transient remote failure. Continuing
+    would leave a branch that a later check rediscovers as in-flight -- the
+    exact failure this resource exists to prevent.
+    """
+    version_str = "2026.4.14.2"
+    stale = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    remote = _FakeRemote(branches={f"releases/{stale}"}, tags={stale})
+    # Deletion silently does nothing, as a protected ref would.
+    remote.branches = _UndeletableSet(remote.branches)
+    mock_run.side_effect = remote
+
+    resource = make_resource()
+    with pytest.raises(RuntimeError, match="Failed to delete"):
+        resource.publish_new_version(
+            tmp_path,
+            MagicMock(),
+            action="create",
+            repo_dir="app-source",
+            version_file="release/version",
+        )
+
+
+@patch("concourse._run")
+def test_create_refuses_to_supersede_a_newer_release(mock_run, tmp_path):
+    """An older build must not delete a newer release's refs.
+
+    `create` binds the version Concourse resolved when the build was
+    scheduled, so a delayed or concurrent build can carry a version older than
+    the release now in flight.
+    """
+    version_str = "2026.4.14.1"
+    newer = "2026.4.14.2"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    remote = _FakeRemote(branches={f"releases/{newer}"}, tags={newer})
+    mock_run.side_effect = remote
+
+    resource = make_resource()
+    with pytest.raises(RuntimeError, match="Refusing to supersede"):
+        resource.publish_new_version(
+            tmp_path,
+            MagicMock(),
+            action="create",
+            repo_dir="app-source",
+            version_file="release/version",
+        )
+
+    assert not any("--delete" in c for c in remote.commands), (
+        "Must not delete the newer release's refs before refusing"
     )
