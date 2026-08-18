@@ -489,6 +489,37 @@ def test_publish_new_version_creates_new_issue(mock_github):
     assert metadata == {}
 
 
+def test_publish_new_version_truncates_oversized_body(mock_github):
+    """An oversized body must be shortened, not sent to GitHub to 422 on.
+
+    GitHub rejects any issue/comment body over 65536 characters. A large
+    enough Pulumi diff or body_files composition can produce one; this
+    resource has to guarantee the API call it makes stays within that limit
+    regardless of what template or artifact produced the body.
+    """
+    mock_gh_instance, mock_repo = mock_github
+    mock_gh_instance.search_issues.return_value = []
+    mock_repo.create_issue.return_value = create_mock_issue(
+        number=11, title="[bot] oversized", state="open", created_at=NOW
+    )
+
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo",
+        access_token="dummy_token",
+        issue_state="open",
+        issue_title_template="[bot] oversized",
+        issue_body_template="x" * 100_000,
+    )
+
+    resource.publish_new_version(
+        sources_dir="dummy", build_metadata=mock_build_metadata()
+    )
+
+    _, kwargs = mock_repo.create_issue.call_args
+    assert len(kwargs["body"]) <= 65536
+    assert "truncated" in kwargs["body"]
+
+
 def test_publish_new_version_comments_on_existing_by_default(mock_github):
     """Without update_in_place, publish comments on an existing issue.
 
