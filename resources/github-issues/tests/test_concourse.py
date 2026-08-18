@@ -8,8 +8,11 @@ from datetime import datetime, timedelta
 from concourse import (
     ConcourseGithubIssuesResource,
     ConcourseGithubIssuesVersion,
+    GITHUB_MAX_BODY_CHARS,
     ISO_8601_FORMAT,
+    _fit_fragments,
     _merge_checklist_preserving_checked,
+    _truncate_body,
 )
 from concoursetools import BuildMetadata  # Import the actual class
 from concoursetools.testing import SimpleTestResourceWrapper
@@ -1050,3 +1053,92 @@ def test_comment_path_does_not_touch_labels(mock_github):
     )
     issue.edit.assert_not_called()
     issue.create_comment.assert_called_once()
+
+
+class TestBodySizeLimit:
+    """GitHub 422s a body over 65536 characters.
+
+    A put that trips it fails after the deploy it reports on has already
+    happened, so the gate issue never gets written at all -- the pipeline is
+    left red with nothing for a reviewer to act on.
+    """
+
+    @staticmethod
+    def _resource() -> ConcourseGithubIssuesResource:
+        with patch("concourse.Github"):
+            return ConcourseGithubIssuesResource(
+                repository="test/repo", access_token="dummy_token"
+            )
+
+    def test_oversized_body_file_is_cut_to_the_limit(self, tmp_path):
+        (tmp_path / "big.md").write_text("- a line of diff\n" * 8000)
+
+        body = self._resource().get_issue_body_from_build(
+            mock_build_metadata(), body_file="big.md", sources_dir=tmp_path
+        )
+
+        assert len(body) <= GITHUB_MAX_BODY_CHARS
+
+    def test_a_cut_body_says_it_was_cut(self, tmp_path):
+        (tmp_path / "big.md").write_text("- a line of diff\n" * 8000)
+
+        body = self._resource().get_issue_body_from_build(
+            mock_build_metadata(), body_file="big.md", sources_dir=tmp_path
+        )
+
+        assert "truncated" in body
+        assert "- a line of diff" in body
+
+    def test_body_within_the_limit_is_untouched(self, tmp_path):
+        (tmp_path / "small.md").write_text("nothing to see here")
+
+        body = self._resource().get_issue_body_from_build(
+            mock_build_metadata(), body_file="small.md", sources_dir=tmp_path
+        )
+
+        assert body == "nothing to see here"
+
+    def test_cut_lands_on_a_line_boundary(self):
+        cut = _truncate_body("0123456789\n" * 100, 200)
+
+        content, _, _ = cut.partition("\n> :warning:")
+        assert content.endswith("0123456789\n")
+
+    def test_an_open_code_fence_is_closed_before_the_notice(self):
+        cut = _truncate_body("```\n" + "x" * 500, 200)
+
+        assert cut.index("```", 3) < cut.index(":warning:")
+
+    def test_an_open_details_block_is_closed_before_the_notice(self):
+        cut = _truncate_body("<details open>\n" + "x\n" * 500, 300)
+
+        assert cut.index("</details>") < cut.index(":warning:")
+        assert len(cut) <= 300
+
+    def test_every_fragment_survives_a_joint_overrun(self):
+        """No section is dropped wholesale to make room for another.
+
+        Both halves of a promotion gate matter to the reviewer; showing only
+        the first would read as a complete body that is missing the half they
+        were about to approve.
+        """
+        first = "first\n" * 20000
+        second = "second\n" * 20000
+
+        body = _fit_fragments([first, second])
+
+        assert len(body) <= GITHUB_MAX_BODY_CHARS
+        assert "first" in body
+        assert "second" in body
+
+    def test_a_short_fragment_hands_its_unused_share_to_a_long_one(self):
+        short = "short\n"
+        long = "long\n" * 20000
+
+        body = _fit_fragments([short, long])
+
+        assert body.startswith(short)
+        assert len(body) > GITHUB_MAX_BODY_CHARS // 2
+
+    def test_fragments_within_the_limit_are_joined_unchanged(self):
+        assert _fit_fragments(["one", "two"]) == "one\ntwo"

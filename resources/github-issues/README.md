@@ -46,6 +46,19 @@ Marks the issue as consumed by prefixing the title with `[CONSUMED #<build_numbe
 | `body_files` | No | List of paths whose contents are concatenated **in the order given** to form the issue body, overriding `issue_body_template`. Use this when the body is assembled from more than one step's artifact -- a Concourse `put` emits no artifact of its own, so each fragment arrives via its own implicit `get`. Takes precedence over `body_file` if both are set. Unlike `body_file`, a **missing** entry does not fail the put: it is replaced by a visible warning naming the absent path, because a fragment's producing step may be allowed to fail without failing the build. |
 | `title_template` | No | Overrides the source-level `issue_title_template` for this put. Use this to embed a value only known at build time, e.g. a release version loaded via `load_var` earlier in the same job -- put an unresolved `((.:my_var))` reference in the params value; Concourse resolves it to a plain string before this resource ever runs, so `title_template` arrives here already containing the concrete value. |
 
+### Body size
+
+GitHub rejects an issue body (or comment) longer than 65536 characters with a
+`422 Validation Failed`, which fails the `put` *after* the deploy it reports on
+has already run -- the gate issue never gets written and the build goes red with
+nothing for a reviewer to act on. Bodies are therefore capped, and a body that
+was cut says so in its own text; the full content stays in the build log.
+
+With `body_files`, the cap is shared out between the fragments rather than
+applied to the joined body, so an oversized first section cannot push a later
+one out of the issue entirely. Each fragment gets an equal share and any share a
+short fragment does not use goes to the ones that overflow.
+
 The issue title and body are generated from configurable templates:
 - `issue_title_template` — default: `[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed`
 - `issue_body_template` — Markdown body with build details and a link to the build log

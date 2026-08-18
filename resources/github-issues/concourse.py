@@ -14,6 +14,95 @@ from github.Issue import Issue
 
 ISO_8601_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
+
+# GitHub rejects a create/edit whose body exceeds this with a 422, and a put has
+# no way to recover from that: by the time the gate issue is written the deploy
+# it is reporting on has already happened, so the build fails red having done
+# the work. A pulumi preview of a large stack clears this comfortably.
+GITHUB_MAX_BODY_CHARS = 65536
+
+
+def _close_unbalanced_markup(text: str) -> str:
+    """Return the closers *text* needs so a cut does not swallow what follows.
+
+    A body cut mid-``<details>`` or mid-code-fence leaves the block open, and
+    GitHub then renders everything appended after it -- including the notice
+    saying the body was truncated -- as part of that block. The notice is the
+    one line a reviewer most needs to actually see.
+    """
+    closers = ""
+    if text.count("```") % 2:
+        closers += "```\n"
+    unclosed_details = text.count("<details") - text.count("</details>")
+    closers += "</details>\n" * max(unclosed_details, 0)
+    return closers
+
+
+def _truncate_body(text: str, max_chars: int = GITHUB_MAX_BODY_CHARS) -> str:
+    """Cut *text* to *max_chars*, saying so in the text itself.
+
+    Never truncate silently: a shortened diff that reads as complete is worse
+    than no diff at all, because a reviewer approves a gate on the strength of
+    what the body shows. The cut lands on a line boundary so the last thing
+    shown is a whole entry rather than half a resource name.
+    """
+    if len(text) <= max_chars:
+        return text
+
+    notice = (
+        "\n> :warning: This content was truncated to fit GitHub's "
+        f"{GITHUB_MAX_BODY_CHARS}-character issue body limit "
+        f"({len(text)} characters of content). "
+        "See the build log for the full output.\n"
+    )
+    if max_chars <= len(notice):
+        return text[:max_chars]
+
+    head = text[: max_chars - len(notice)]
+    boundary = head.rfind("\n")
+    if boundary > 0:
+        head = head[: boundary + 1]
+    # Closing the open markup costs characters of its own, and trimming to pay
+    # for them can expose further unclosed markup, so settle it by iteration.
+    while True:
+        closers = _close_unbalanced_markup(head)
+        if len(head) + len(closers) + len(notice) <= max_chars:
+            return head + closers + notice
+        head = head[: max_chars - len(notice) - len(closers)]
+
+
+def _fit_fragments(fragments: list[str], max_chars: int = GITHUB_MAX_BODY_CHARS) -> str:
+    """Join *fragments* into one body of at most *max_chars* characters.
+
+    Each fragment gets an equal share of the budget, and whatever a short
+    fragment leaves unused is redistributed to the ones that overflow. Trimming
+    the tail of the joined body would instead drop whole sections, and the
+    sections are the reason ``body_files`` exists: a promotion gate composes
+    "what this deploy did" with "what promoting it will do next" precisely
+    because a reviewer needs both. Both, marked where they were cut, beats one
+    of them in full.
+    """
+    separators = len(fragments) - 1
+    joined = "\n".join(fragments)
+    if len(joined) <= max_chars:
+        return joined
+
+    budget = max_chars - separators
+    budgets = [0] * len(fragments)
+    # Shortest first, so a fragment that cannot spend its share hands the
+    # remainder on to the ones that can.
+    by_length = sorted(range(len(fragments)), key=lambda i: len(fragments[i]))
+    for position, index in enumerate(by_length):
+        share = budget // (len(by_length) - position)
+        budgets[index] = min(len(fragments[index]), share)
+        budget -= budgets[index]
+
+    return "\n".join(
+        _truncate_body(fragment, allowance)
+        for fragment, allowance in zip(fragments, budgets, strict=True)
+    )
+
+
 # Generic checklist-line matcher: "- [ ] <anything>" / "- [x] <anything>".
 # Deliberately loose (no assumption about what follows the checkbox) so this
 # works for any checklist-style issue body, not just the release resource's
@@ -337,14 +426,24 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         entire body rather than an optional fragment, so tolerating it would turn
         a typo'd path into a published gate issue containing nothing but a
         warning.
+
+        Whatever the source, the result is capped at GitHub's issue body limit
+        and says where it was cut. Overrunning it fails the put with a 422 after
+        the deploy has already happened, which loses the whole gate rather than
+        the tail of a diff.
         """
         if body_files:
-            return "\n".join(
-                self._read_body_file(f, sources_dir, required=False) for f in body_files
+            return _fit_fragments(
+                [
+                    self._read_body_file(f, sources_dir, required=False)
+                    for f in body_files
+                ]
             )
         if body_file is not None:
-            return self._read_body_file(body_file, sources_dir)
-        return self.issue_body_template.format(**build_metadata_dict(build_metadata))
+            return _truncate_body(self._read_body_file(body_file, sources_dir))
+        return _truncate_body(
+            self.issue_body_template.format(**build_metadata_dict(build_metadata))
+        )
 
     def _read_body_file(
         self, body_file: str, sources_dir: Path | None, *, required: bool = True
