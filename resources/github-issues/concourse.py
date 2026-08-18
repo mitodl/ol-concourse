@@ -14,6 +14,33 @@ from github.Issue import Issue
 
 ISO_8601_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
+# GitHub hard-rejects an issue or comment body over this length (422
+# "body is too long"). None of the templates or summary files this resource
+# is fed enforce that limit themselves -- a large enough Pulumi diff or
+# body_files composition can produce one that does -- so this is the last
+# point that can actually guarantee the API call succeeds.
+GITHUB_BODY_MAX_CHARS = 65536
+_TRUNCATION_NOTICE = (
+    "\n\n> :warning: **Body truncated** -- this content exceeded GitHub's "
+    f"{GITHUB_BODY_MAX_CHARS}-character limit for issues and comments. See "
+    "the build log for the full content."
+)
+
+
+def _fit_to_github_limit(body: str, max_chars: int = GITHUB_BODY_MAX_CHARS) -> str:
+    """Truncate *body* to fit GitHub's issue/comment size limit, visibly.
+
+    Cutting silently would leave a body that reads as complete while hiding
+    whatever came after the cut -- exactly the failure the "Showing N of M"
+    messages elsewhere in this pipeline exist to prevent. The notice always
+    fits: it is reserved out of the budget before the cut, not appended after.
+    """
+    if len(body) <= max_chars:
+        return body
+    keep = max_chars - len(_TRUNCATION_NOTICE)
+    return body[:keep] + _TRUNCATION_NOTICE
+
+
 # Generic checklist-line matcher: "- [ ] <anything>" / "- [x] <anything>".
 # Deliberately loose (no assumption about what follows the checkbox) so this
 # works for any checklist-style issue body, not just the release resource's
@@ -404,11 +431,13 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         # Assume that: title is enough uniqueness to discern whether the issue
         # already exists
 
-        issue_body = self.get_issue_body_from_build(
-            build_metadata,
-            body_file=body_file,
-            sources_dir=sources_dir,
-            body_files=body_files,
+        issue_body = _fit_to_github_limit(
+            self.get_issue_body_from_build(
+                build_metadata,
+                body_file=body_file,
+                sources_dir=sources_dir,
+                body_files=body_files,
+            )
         )
 
         # Use GitHub Search API for efficiency instead of listing all issues
