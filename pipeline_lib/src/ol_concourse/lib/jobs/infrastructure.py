@@ -546,6 +546,12 @@ def pulumi_job(  # noqa: PLR0913
 # Filename the preview job's implicit get writes its diff to.
 PREVIEW_SUMMARY_FILENAME = "preview_summary.md"
 
+# Written alongside PREVIEW_SUMMARY_FILENAME when the preview found nothing
+# worth reviewing. The gate-post put checks for its presence to auto-close
+# the gate issue it opens, instead of leaving it for a human. Must match
+# `NO_CHANGES_MARKER_SUFFIX` in resources/pulumi/concourse.py.
+PREVIEW_NO_CHANGES_MARKER = f"{PREVIEW_SUMMARY_FILENAME}.no-changes"
+
 
 def _stage_inputs(
     deps: list[GetStep] | None,
@@ -913,12 +919,25 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
             ],
             on_success=PutStep(
                 put=gate_post.name,
+                # No implicit get: nothing downstream reads it, and one would
+                # tombstone (rename) an auto-closed issue -- see close_if_file
+                # below -- before `gate_trigger` ever gets to poll for it,
+                # which would silently break the promotion this put exists to
+                # unblock.
+                no_get=True,
                 params={
                     "assignees": github_issue_assignees or [],
                     "labels": _gate_labels(stack_name),
                     "body_files": [
                         f"{pulumi_resource.name}/{PREVIEW_SUMMARY_FILENAME}"
                     ],
+                    # No diff means nothing to approve. Still open the gate
+                    # (gate_trigger only ever advances on a *closed* issue),
+                    # but close it immediately so no human has to -- see
+                    # `close_if_file` on the github-issues resource.
+                    "close_if_file": (
+                        f"{pulumi_resource.name}/{PREVIEW_NO_CHANGES_MARKER}"
+                    ),
                 },
             ),
         )

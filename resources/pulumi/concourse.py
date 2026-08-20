@@ -15,6 +15,13 @@ from concoursetools import BuildMetadata, ConcourseResource, TypedVersion
 import io_utils
 import pulumi_utils
 
+# Appended to a preview's summary_file name to signal "nothing to review" --
+# the promotion-gate issue put checks for this file's presence (not its
+# content) to decide whether to skip opening a fresh gate for an empty diff.
+# Pipelines wiring that put must reference this same suffix; see
+# `_preview_gated_chain` in pipeline_lib's infrastructure job builder.
+NO_CHANGES_MARKER_SUFFIX = ".no-changes"
+
 
 @dataclass
 class PulumiVersion(TypedVersion):
@@ -110,14 +117,18 @@ class PulumiResource(ConcourseResource[PulumiVersion]):
         deploy, and a failure in it would redden a deploy that actually worked.
         """
         if summary_file:
-            (destination_dir / summary_file).write_text(
-                _render_summary(
-                    version,
-                    build_metadata,
-                    preview_stack,
-                    work_dir=destination_dir.parent,
-                )
+            rendered, no_material_changes = _render_summary(
+                version,
+                build_metadata,
+                preview_stack,
+                work_dir=destination_dir.parent,
             )
+            (destination_dir / summary_file).write_text(rendered)
+            if no_material_changes:
+                # Presence-only signal the promotion-gate issue put reads to
+                # skip opening a fresh gate for an empty diff -- see
+                # NO_CHANGES_MARKER_SUFFIX.
+                (destination_dir / f"{summary_file}{NO_CHANGES_MARKER_SUFFIX}").touch()
 
         metadata: dict[str, str] = {}
         if summary_file:
@@ -382,12 +393,25 @@ _NOTABLE_OPS = ("create", "update", "replace", "delete")
 _NON_MATERIAL_OPS = frozenset({"same"})
 
 
+def _preview_has_material_changes(summary: dict[str, Any]) -> bool:
+    """Return whether a preview *summary* found anything worth reviewing.
+
+    A no-op preview still reports `resource_changes={"same": N}`, so that op
+    alone must be discounted -- otherwise `resource_changes` is always truthy
+    and an empty diff looks the same as a real one.
+    """
+    changes: dict[str, int] = json.loads(summary.get("resource_changes", "{}"))
+    events = json.loads(summary.get("changes", "[]"))
+    material = {op: n for op, n in changes.items() if op not in _NON_MATERIAL_OPS and n}
+    return bool(events or material)
+
+
 def _render_summary(
     version: PulumiVersion,
     build_metadata: BuildMetadata,
     preview_stack: str = "",
     work_dir: Path | None = None,
-) -> str:
+) -> tuple[str, bool]:
     """Render the deploy summary carried on *version* as Markdown.
 
     This ends up as the body of the `[bot] Pulumi <project> <stack> deployed.`
@@ -401,6 +425,10 @@ def _render_summary(
     success having run no Pulumi at all.  An issue body that just omitted the
     counts would read as "nothing to report"; it has to read as "do not trust
     this".
+
+    Returns the rendered body and whether this is a preview that found nothing
+    worth reviewing -- the promotion-gate put reads the latter to skip opening
+    a fresh gate issue for an empty diff.
     """
     build_link = f"[build {build_metadata.BUILD_NAME}]({build_metadata.build_url()})"
 
@@ -414,7 +442,7 @@ def _render_summary(
             "reports success while emitting no summary has not been shown to have "
             "deployed anything -- check the log for `Updating`, `Resources:` and "
             "`Duration:` lines before treating this as a real deploy.\n"
-        )
+        ), False
 
     summary = json.loads(version.summary)
     if summary.get("result") in ("preview", "preview-failed"):
@@ -458,7 +486,7 @@ def _render_summary(
         )
     )
     lines.extend(["", f"Deployed by {build_link}.", ""])
-    return "\n".join(lines)
+    return "\n".join(lines), False
 
 
 def _render_preview(
@@ -466,7 +494,7 @@ def _render_preview(
     build_metadata: BuildMetadata,
     preview_stack: str,
     work_dir: Path | None,
-) -> str:
+) -> tuple[str, bool]:
     """Render a preview of the NEXT environment as Markdown.
 
     This is the other half of a promotion gate. The applied diff above says what
@@ -492,7 +520,7 @@ def _render_preview(
             "Promoting is still safe to consider on the evidence above -- there "
             "is simply no preview of what the next environment will receive. "
             f"See [the build log]({taken}).\n"
-        )
+        ), False
 
     changes: dict[str, int] = json.loads(summary.get("resource_changes", "{}"))
     events = json.loads(summary.get("changes", "[]"))
@@ -534,11 +562,7 @@ def _render_preview(
             "",
         ]
 
-    # A no-op preview still reports {"same": N}, so `changes` alone is always
-    # truthy and would skip this branch -- leaving the reader a table of zeros to
-    # interpret instead of being told plainly that there is nothing to do.
-    material = {op: n for op, n in changes.items() if op not in _NON_MATERIAL_OPS and n}
-    if not events and not material:
+    if not _preview_has_material_changes(summary):
         lines.extend(
             [
                 ":white_check_mark: No changes -- the next environment is already "
@@ -546,7 +570,7 @@ def _render_preview(
                 "",
             ]
         )
-        return "\n".join(lines)
+        return "\n".join(lines), True
 
     lines.extend(["| Change | Count |", "| --- | --- |"])
     for op in _NOTABLE_OPS:
@@ -556,7 +580,7 @@ def _render_preview(
 
     lines.extend(_render_changes(events, total))
     lines.append("")
-    return "\n".join(lines)
+    return "\n".join(lines), False
 
 
 _SHORT_SHA_CHARS = 8

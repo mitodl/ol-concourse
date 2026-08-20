@@ -77,6 +77,19 @@ def _merge_checklist_preserving_checked(old_body: str, new_body: str) -> str:
     return merged
 
 
+def _resolve_in_workspace(sources_dir: Path, relative_path: str) -> Path:
+    """Resolve *relative_path* against sources_dir, refusing to escape it."""
+    candidate = Path(relative_path)
+    if candidate.is_absolute():
+        msg = "path must be relative"
+        raise ValueError(msg)
+    resolved = (sources_dir / candidate).resolve()
+    if not resolved.is_relative_to(sources_dir.resolve()):
+        msg = "path must be within the workspace sources directory"
+        raise ValueError(msg)
+    return resolved
+
+
 def build_metadata_dict(build_metadata: BuildMetadata) -> dict[str, str]:
     """Return a flat dict of Concourse build metadata for template formatting."""
     return {
@@ -385,14 +398,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         if sources_dir is None:
             msg = "sources_dir is required when body_file is provided"
             raise ValueError(msg)
-        body_path = Path(body_file)
-        if body_path.is_absolute():
-            msg = "body_file must be a relative path"
-            raise ValueError(msg)
-        resolved = (sources_dir / body_path).resolve()
-        if not resolved.is_relative_to(sources_dir.resolve()):
-            msg = "body_file must be within the workspace sources directory"
-            raise ValueError(msg)
+        resolved = _resolve_in_workspace(sources_dir, body_file)
         if required or resolved.exists():
             return resolved.read_text()
         return (
@@ -426,8 +432,20 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         body_file: str | None = None,
         title_template: str | None = None,
         body_files: list[str] | None = None,
+        close_if_file: str | None = None,
     ) -> tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
-        """Create or comment on a GitHub Issue and return its version."""
+        """Create or comment on a GitHub Issue and return its version.
+
+        *close_if_file* names a workspace-relative file whose presence means
+        there is nothing to review -- e.g. an empty Pulumi preview diff. The
+        issue is still created/updated exactly as normal, then immediately
+        closed via the API so no human has to act on it. Closing rather than
+        skipping creation matters: a downstream ``-gate-trigger`` resource
+        polls for a *closed* issue to advance the pipeline, so an empty diff
+        still needs one -- just pre-approved, so the gate can't hang forever
+        waiting for a human to close an issue that was never opened. A
+        missing file is the same as not passing this param at all.
+        """
         # Assume that: title is enough uniqueness to discern whether the issue
         # already exists
 
@@ -503,5 +521,12 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             working_issue = already_exists[0]
             print(f"about to comment on {working_issue=} with {issue_body=}")  # noqa: T201
             working_issue.create_comment(issue_body)
+
+        if close_if_file and _resolve_in_workspace(sources_dir, close_if_file).exists():
+            print(  # noqa: T201
+                f"{close_if_file!r} says there is nothing to review -- "
+                f"auto-closing {working_issue=}"
+            )
+            working_issue.edit(state="closed")
 
         return self._to_version(working_issue), {}

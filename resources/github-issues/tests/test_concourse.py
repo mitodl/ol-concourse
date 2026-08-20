@@ -2,7 +2,7 @@
 
 from github.GithubObject import NotSet
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 from datetime import datetime, timedelta
 
 from concourse import (
@@ -974,6 +974,131 @@ class TestBodyFilesComposition:
             self._resource().get_issue_body_from_build(
                 mock_build_metadata(), body_file="typo.md", sources_dir=tmp_path
             )
+
+
+class TestCloseIfFile:
+    """A preview with nothing to review must not leave a gate for a human.
+
+    The gate issue is still created/updated exactly as normal -- a downstream
+    `-gate-trigger` resource only ever advances on a *closed* issue, so
+    skipping creation entirely would leave that stage (and everything chained
+    after it) waiting forever. `close_if_file` closes it immediately instead.
+    """
+
+    def test_creates_open_then_closes_when_marker_present_and_no_existing_issue(
+        self, mock_github, tmp_path
+    ):
+        mock_gh_instance, mock_repo = mock_github
+        mock_gh_instance.search_issues.return_value = []
+        (tmp_path / "preview.md.no-changes").touch()
+        created = create_mock_issue(
+            number=12,
+            title="[bot] Pulumi proj QA ready to deploy.",
+            state="open",
+            created_at=NOW,
+        )
+        mock_repo.create_issue.return_value = created
+
+        resource = ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template="[bot] Pulumi proj QA ready to deploy.",
+        )
+
+        resource.publish_new_version(
+            sources_dir=tmp_path,
+            build_metadata=mock_build_metadata(),
+            close_if_file="preview.md.no-changes",
+        )
+
+        mock_repo.create_issue.assert_called_once()
+        created.edit.assert_called_once_with(state="closed")
+
+    def test_creates_and_leaves_open_when_marker_absent(self, mock_github, tmp_path):
+        mock_gh_instance, mock_repo = mock_github
+        mock_gh_instance.search_issues.return_value = []
+        created = create_mock_issue(
+            number=12,
+            title="[bot] Pulumi proj QA ready to deploy.",
+            state="open",
+            created_at=NOW,
+        )
+        mock_repo.create_issue.return_value = created
+
+        resource = ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template="[bot] Pulumi proj QA ready to deploy.",
+        )
+
+        resource.publish_new_version(
+            sources_dir=tmp_path,
+            build_metadata=mock_build_metadata(),
+            close_if_file="preview.md.no-changes",
+        )
+
+        mock_repo.create_issue.assert_called_once()
+        created.edit.assert_not_called()
+
+    def test_closes_an_already_open_gate_when_marker_present(
+        self, mock_github, tmp_path
+    ):
+        """A stale open gate must not be left showing a diff that no longer applies."""
+        mock_gh_instance, _ = mock_github
+        (tmp_path / "preview.md.no-changes").touch()
+        issue = create_mock_issue(
+            number=9,
+            title="[bot] Pulumi proj QA ready to deploy.",
+            state="open",
+            created_at=T_MINUS_1,
+        )
+        issue.body = ""
+        mock_gh_instance.search_issues.return_value = [issue]
+
+        resource = ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template="[bot] Pulumi proj QA ready to deploy.",
+            issue_body_template="no changes",
+            update_in_place=True,
+        )
+        resource.publish_new_version(
+            sources_dir=tmp_path,
+            build_metadata=mock_build_metadata(),
+            close_if_file="preview.md.no-changes",
+        )
+
+        assert call(state="closed") in issue.edit.call_args_list
+
+    def test_missing_marker_file_leaves_the_gate_open(self, mock_github, tmp_path):
+        mock_gh_instance, mock_repo = mock_github
+        mock_gh_instance.search_issues.return_value = []
+        created = create_mock_issue(
+            number=13,
+            title="[bot] Pulumi proj QA ready to deploy.",
+            state="open",
+            created_at=NOW,
+        )
+        mock_repo.create_issue.return_value = created
+
+        resource = ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template="[bot] Pulumi proj QA ready to deploy.",
+        )
+
+        resource.publish_new_version(
+            sources_dir=tmp_path,
+            build_metadata=mock_build_metadata(),
+            close_if_file="never-written.no-changes",
+        )
+
+        mock_repo.create_issue.assert_called_once()
+        created.edit.assert_not_called()
 
 
 def _update_in_place_resource() -> ConcourseGithubIssuesResource:

@@ -24,6 +24,7 @@ from pulumi.automation.events import (
 
 import pulumi_utils
 from pulumi_concourse import (
+    NO_CHANGES_MARKER_SUFFIX,
     PulumiResource,
     PulumiVersion,
     _apply_os_env,
@@ -1396,6 +1397,69 @@ class TestNextEnvironmentPreview:
             self._preview([], {"same": 118, "update": 2}), tmp_path=tmp_path
         )
         assert "No changes" not in body
+
+
+class TestNoChangesMarker:
+    """The promotion-gate put reads this file's presence to skip an empty gate.
+
+    Presence, not content -- the put only needs a boolean, and a marker it can
+    check with a plain path exists() is simpler than parsing the summary body.
+    """
+
+    def _marker_path(self, tmp_path: Path) -> Path:
+        return tmp_path / f"preview.md{NO_CHANGES_MARKER_SUFFIX}"
+
+    def _render(self, update: Any, tmp_path: Path, stack: str = "QA") -> None:
+        version = PulumiVersion(id="0", summary=json.dumps(update.to_flat_dict()))
+        _make_resource().download_version(
+            version,
+            tmp_path,
+            MagicMock(),
+            summary_file="preview.md",
+            read_outputs=False,
+            preview_stack=stack,
+        )
+
+    def _preview(self, changes: list[dict[str, Any]], summary: dict[str, int]) -> Any:
+        return pulumi_utils._preview_stack_update(
+            {"change_summary": summary, "changes": changes}
+        )
+
+    def test_written_when_preview_has_no_changes(self, tmp_path: Path) -> None:
+        self._render(self._preview([], {}), tmp_path=tmp_path)
+        assert self._marker_path(tmp_path).exists()
+
+    def test_written_when_preview_reports_only_same(self, tmp_path: Path) -> None:
+        self._render(self._preview([], {"same": 118}), tmp_path=tmp_path)
+        assert self._marker_path(tmp_path).exists()
+
+    def test_not_written_when_preview_has_real_changes(self, tmp_path: Path) -> None:
+        self._render(self._preview([], {"same": 118, "update": 2}), tmp_path=tmp_path)
+        assert not self._marker_path(tmp_path).exists()
+
+    def test_not_written_when_preview_failed(self, tmp_path: Path) -> None:
+        """A failed preview means "we don't know", not "nothing to review"."""
+        failed = pulumi_utils.preview_failed("connection to sso-qa timed out")
+        self._render(failed, tmp_path=tmp_path)
+        assert not self._marker_path(tmp_path).exists()
+
+    def test_not_written_for_a_completed_deploy_summary(self, tmp_path: Path) -> None:
+        """This marker is specific to previews; a deploy record always posts."""
+        resource = _make_resource()
+        version = PulumiVersion(
+            id="9",
+            summary=json.dumps(
+                _stack_update(9, resource_changes={"same": 40}).to_flat_dict()
+            ),
+        )
+        resource.download_version(
+            version,
+            tmp_path,
+            MagicMock(),
+            summary_file="deploy_summary.md",
+            read_outputs=False,
+        )
+        assert not (tmp_path / "deploy_summary.md.no-changes").exists()
 
 
 class TestPreviewFailureTolerance:
