@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 import textwrap
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Literal
 from concoursetools import BuildMetadata, ConcourseResource
 from concoursetools.version import Version, SortableVersionMixin
@@ -136,30 +136,6 @@ class ConcourseGithubIssuesVersion(Version, SortableVersionMixin):
             )
         else:
             return int(self.issue_number) < int(other.issue_number)
-
-
-def _skipped_gate_version(title: str) -> ConcourseGithubIssuesVersion:
-    """Return a placeholder version for a put that deliberately created no issue.
-
-    Concourse's put protocol requires *some* version back, but nothing
-    downstream keys off this resource's own emitted version -- the promotion
-    gate is driven by a separate ``-gate-trigger`` resource watching for a
-    *closed* issue, not by this put's version. So this only needs to be
-    self-consistent, not point at a real issue.
-
-    ``issue_state="open"`` matters: ``download_version``'s implicit get
-    tombstones (renames) any version reporting ``closed``, which would call
-    the GitHub API for issue #0 and fail the build.
-    """
-    now = datetime.now(UTC).strftime(ISO_8601_FORMAT)
-    return ConcourseGithubIssuesVersion(
-        issue_created_at=now,
-        issue_closed_at=None,
-        issue_number=0,
-        issue_state="open",
-        issue_title=f"(skipped -- nothing to review) {title}",
-        issue_url="",
-    )
 
 
 class ConcourseGithubIssuesResource(ConcourseResource):
@@ -456,19 +432,31 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         body_file: str | None = None,
         title_template: str | None = None,
         body_files: list[str] | None = None,
-        skip_if_file: str | None = None,
+        close_if_file: str | None = None,
     ) -> tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
         """Create or comment on a GitHub Issue and return its version.
 
-        *skip_if_file* names a workspace-relative file whose presence means
-        there is nothing to review -- e.g. an empty Pulumi preview diff. It
-        only suppresses CREATING a fresh issue: an already-open gate is still
-        kept honest (updated in place, or commented on) rather than left
-        showing a diff that no longer applies. A missing file is the same as
-        not passing this param at all.
+        *close_if_file* names a workspace-relative file whose presence means
+        there is nothing to review -- e.g. an empty Pulumi preview diff. The
+        issue is still created/updated exactly as normal, then immediately
+        closed via the API so no human has to act on it. Closing rather than
+        skipping creation matters: a downstream ``-gate-trigger`` resource
+        polls for a *closed* issue to advance the pipeline, so an empty diff
+        still needs one -- just pre-approved, so the gate can't hang forever
+        waiting for a human to close an issue that was never opened. A
+        missing file is the same as not passing this param at all.
         """
         # Assume that: title is enough uniqueness to discern whether the issue
         # already exists
+
+        issue_body = _fit_to_github_limit(
+            self.get_issue_body_from_build(
+                build_metadata,
+                body_file=body_file,
+                sources_dir=sources_dir,
+                body_files=body_files,
+            )
+        )
 
         # Use GitHub Search API for efficiency instead of listing all issues
         candidate_issue_title = self.get_title_from_build(
@@ -484,26 +472,6 @@ class ConcourseGithubIssuesResource(ConcourseResource):
 
         if len(already_exists) > 1:
             print("Warning: There are multiple matches for the desired issue title!")  # noqa: T201
-
-        if (
-            not already_exists
-            and skip_if_file
-            and _resolve_in_workspace(sources_dir, skip_if_file).exists()
-        ):
-            print(  # noqa: T201
-                f"no existing gate issue and {skip_if_file!r} says there is "
-                "nothing to review -- skipping issue creation"
-            )
-            return _skipped_gate_version(candidate_issue_title), {}
-
-        issue_body = _fit_to_github_limit(
-            self.get_issue_body_from_build(
-                build_metadata,
-                body_file=body_file,
-                sources_dir=sources_dir,
-                body_files=body_files,
-            )
-        )
 
         if not already_exists:
             # Pass label names (strings) directly, avoid fetching Label objects
@@ -553,5 +521,12 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             working_issue = already_exists[0]
             print(f"about to comment on {working_issue=} with {issue_body=}")  # noqa: T201
             working_issue.create_comment(issue_body)
+
+        if close_if_file and _resolve_in_workspace(sources_dir, close_if_file).exists():
+            print(  # noqa: T201
+                f"{close_if_file!r} says there is nothing to review -- "
+                f"auto-closing {working_issue=}"
+            )
+            working_issue.edit(state="closed")
 
         return self._to_version(working_issue), {}
