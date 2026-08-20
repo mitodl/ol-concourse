@@ -546,6 +546,12 @@ def pulumi_job(  # noqa: PLR0913
 # Filename the preview job's implicit get writes its diff to.
 PREVIEW_SUMMARY_FILENAME = "preview_summary.md"
 
+# Written alongside PREVIEW_SUMMARY_FILENAME when the preview found nothing
+# worth reviewing. The gate-post put checks for its presence to skip opening
+# a fresh gate issue for an empty diff. Must match
+# `NO_CHANGES_MARKER_SUFFIX` in resources/pulumi/concourse.py.
+PREVIEW_NO_CHANGES_MARKER = f"{PREVIEW_SUMMARY_FILENAME}.no-changes"
+
 
 def _stage_inputs(
     deps: list[GetStep] | None,
@@ -919,6 +925,12 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
                     "body_files": [
                         f"{pulumi_resource.name}/{PREVIEW_SUMMARY_FILENAME}"
                     ],
+                    # No diff means nothing to approve -- skip opening a
+                    # fresh gate. An already-open gate is still updated (see
+                    # `update_in_place` above), never left stale.
+                    "skip_if_file": (
+                        f"{pulumi_resource.name}/{PREVIEW_NO_CHANGES_MARKER}"
+                    ),
                 },
             ),
         )
