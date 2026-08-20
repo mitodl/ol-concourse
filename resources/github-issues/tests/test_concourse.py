@@ -976,6 +976,122 @@ class TestBodyFilesComposition:
             )
 
 
+class TestSkipIfFile:
+    """A preview with nothing to review should not open a fresh gate.
+
+    `skip_if_file` only suppresses CREATING an issue -- an already-open gate
+    is kept honest even for an empty diff, since leaving a stale non-empty
+    diff open would be worse than a no-op update.
+    """
+
+    def test_skips_creation_when_marker_present_and_no_existing_issue(
+        self, mock_github, tmp_path
+    ):
+        mock_gh_instance, mock_repo = mock_github
+        mock_gh_instance.search_issues.return_value = []
+        (tmp_path / "preview.md.no-changes").touch()
+
+        resource = ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template="[bot] Pulumi proj QA ready to deploy.",
+        )
+
+        version, metadata = resource.publish_new_version(
+            sources_dir=tmp_path,
+            build_metadata=mock_build_metadata(),
+            skip_if_file="preview.md.no-changes",
+        )
+
+        mock_repo.create_issue.assert_not_called()
+        assert version.issue_state == "open"
+        assert version.issue_number == 0
+        assert metadata == {}
+
+    def test_creates_normally_when_marker_absent(self, mock_github, tmp_path):
+        mock_gh_instance, mock_repo = mock_github
+        mock_gh_instance.search_issues.return_value = []
+        mock_repo.create_issue.return_value = create_mock_issue(
+            number=12,
+            title="[bot] Pulumi proj QA ready to deploy.",
+            state="open",
+            created_at=NOW,
+        )
+
+        resource = ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template="[bot] Pulumi proj QA ready to deploy.",
+        )
+
+        resource.publish_new_version(
+            sources_dir=tmp_path,
+            build_metadata=mock_build_metadata(),
+            skip_if_file="preview.md.no-changes",
+        )
+
+        mock_repo.create_issue.assert_called_once()
+
+    def test_still_updates_an_already_open_gate_in_place(self, mock_github, tmp_path):
+        """A stale open gate must not be left showing a diff that no longer applies."""
+        mock_gh_instance, _ = mock_github
+        (tmp_path / "preview.md.no-changes").touch()
+        issue = create_mock_issue(
+            number=9,
+            title="[bot] Pulumi proj QA ready to deploy.",
+            state="open",
+            created_at=T_MINUS_1,
+        )
+        issue.body = ""
+        issue.edit = MagicMock()
+        mock_gh_instance.search_issues.return_value = [issue]
+
+        resource = ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template="[bot] Pulumi proj QA ready to deploy.",
+            issue_body_template="no changes",
+            update_in_place=True,
+        )
+        resource.publish_new_version(
+            sources_dir=tmp_path,
+            build_metadata=mock_build_metadata(),
+            skip_if_file="preview.md.no-changes",
+        )
+
+        issue.edit.assert_called_once()
+
+    def test_missing_skip_file_is_treated_as_something_to_review(
+        self, mock_github, tmp_path
+    ):
+        mock_gh_instance, mock_repo = mock_github
+        mock_gh_instance.search_issues.return_value = []
+        mock_repo.create_issue.return_value = create_mock_issue(
+            number=13,
+            title="[bot] Pulumi proj QA ready to deploy.",
+            state="open",
+            created_at=NOW,
+        )
+
+        resource = ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template="[bot] Pulumi proj QA ready to deploy.",
+        )
+
+        resource.publish_new_version(
+            sources_dir=tmp_path,
+            build_metadata=mock_build_metadata(),
+            skip_if_file="never-written.no-changes",
+        )
+
+        mock_repo.create_issue.assert_called_once()
+
+
 def _update_in_place_resource() -> ConcourseGithubIssuesResource:
     return ConcourseGithubIssuesResource(
         repository="test/repo",
