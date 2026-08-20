@@ -529,14 +529,22 @@ class TestPreviewGatedTopology:
         gate = next(r for r in fragment.resources if "qa-gate-post" in str(r.name))
         assert gate.source["update_in_place"] is True
 
-    def test_gate_issue_skips_empty_diffs(self):
-        """An empty preview is nothing to approve -- don't open a gate for it."""
+    def test_gate_issue_auto_closes_for_an_empty_diff(self):
+        """An empty preview is nothing to approve -- auto-close the gate for it."""
         fragment = _gated_chain()
         preview = _job(fragment, "preview-ol-substructure-keycloak-qa")
         params = preview.on_success.params or {}
-        assert params["skip_if_file"] == (
+        assert params["close_if_file"] == (
             "pulumi-ol-substructure-keycloak/preview_summary.md.no-changes"
         )
+
+    def test_gate_issue_put_has_no_implicit_get(self):
+        """An implicit get would tombstone an auto-closed gate before
+        gate-trigger ever polls for it, permanently stalling this stage.
+        """
+        fragment = _gated_chain()
+        preview = _job(fragment, "preview-ol-substructure-keycloak-qa")
+        assert preview.on_success.no_get is True
 
     def test_deploy_still_posts_the_applied_diff_record(self):
         """The gate does not replace the build-158 detector."""
