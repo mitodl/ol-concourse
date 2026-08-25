@@ -593,6 +593,46 @@ class TestPreviewGatedRejectsUnsupportedInputs:
         )
 
 
+class TestRecordDeployments:
+    """The "deployed" issue is an audit record, not a gate -- it can be dropped."""
+
+    def test_record_deployments_false_rejected_on_default_topology(self):
+        with pytest.raises(ValueError, match="only applies to"):
+            pulumi_jobs_chain(
+                _make_pulumi_code(),
+                stack_names=["CI"],
+                project_name="p",
+                project_source_path=Path("x"),
+                github_issue_repository="org/repo",
+                record_deployments=False,
+            )
+
+    def test_default_still_posts_the_record_on_both_stage_kinds(self):
+        fragment = _gated_chain()
+        exempt_deploy = _job(fragment, "deploy-ol-substructure-keycloak-ci")
+        gated_deploy = _job(fragment, "deploy-ol-substructure-keycloak-qa")
+        assert "deployed" in str(exempt_deploy.on_success.put)
+        assert "deployed" in str(gated_deploy.on_success.put)
+
+    def test_record_deployments_false_drops_the_on_success_put(self):
+        fragment = _gated_chain(record_deployments=False)
+        exempt_deploy = _job(fragment, "deploy-ol-substructure-keycloak-ci")
+        gated_deploy = _job(fragment, "deploy-ol-substructure-keycloak-qa")
+        assert exempt_deploy.on_success is None
+        assert gated_deploy.on_success is None
+
+    def test_record_deployments_false_drops_the_issue_resources(self):
+        fragment = _gated_chain(record_deployments=False)
+        assert not any("deployed" in str(r.name) for r in fragment.resources)
+
+    def test_record_deployments_false_keeps_the_gate(self):
+        """Dropping the record must not touch the actual promotion gate."""
+        fragment = _gated_chain(record_deployments=False)
+        assert _job(fragment, "preview-ol-substructure-keycloak-qa") is not None
+        assert any("gate-post" in str(r.name) for r in fragment.resources)
+        assert any("gate-trigger" in str(r.name) for r in fragment.resources)
+
+
 class TestPreviewGatedStageInputs:
     """Stage inputs are artifacts the Pulumi run consumes, not just triggers.
 
