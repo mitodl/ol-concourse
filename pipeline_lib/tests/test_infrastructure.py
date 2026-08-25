@@ -727,6 +727,55 @@ class TestPreviewGatedStageInputs:
         _gated_chain(dependencies=[dep])
         assert dep.trigger is True
 
+    def test_chain_dependencies_are_passed_constrained_to_the_previous_deploy(self):
+        """Without this, an image that only passed its OWN build job -- never
+        actually deployed to the previous stage -- could still trigger and be
+        approved here.
+        """
+        fragment = _gated_chain(dependencies=[self._dep()])
+        qa_dep = self._gets(
+            _job(fragment, "preview-ol-substructure-keycloak-qa"), "some-image"
+        )[0]
+        assert qa_dep.passed == ["deploy-ol-substructure-keycloak-ci"]
+
+        production_dep = self._gets(
+            _job(fragment, "preview-ol-substructure-keycloak-production"),
+            "some-image",
+        )[0]
+        assert production_dep.passed == ["deploy-ol-substructure-keycloak-qa"]
+
+    def test_chain_dependencies_keep_their_own_passed_constraint_too(self):
+        """The chain appends the previous deploy; it doesn't replace an
+        existing constraint such as the artifact's own build job.
+        """
+        fragment = _gated_chain(dependencies=[self._dep(passed=["build-job"])])
+        qa_dep = self._gets(
+            _job(fragment, "preview-ol-substructure-keycloak-qa"), "some-image"
+        )[0]
+        assert qa_dep.passed == [
+            "build-job",
+            "deploy-ol-substructure-keycloak-ci",
+        ]
+
+    def test_chain_dependencies_unconstrained_on_the_first_stage(self):
+        fragment = _gated_chain(dependencies=[self._dep()])
+        ci_dep = self._gets(
+            _job(fragment, "deploy-ol-substructure-keycloak-ci"), "some-image"
+        )[0]
+        assert not ci_dep.passed
+
+    def test_custom_dependencies_stay_unchained(self):
+        """Index-scoped custom_dependencies already encode explicit per-stage
+        `passed` semantics the caller controls -- chaining must not touch them.
+        """
+        fragment = _gated_chain(
+            custom_dependencies={1: [self._dep("qa-only-artifact")]}
+        )
+        dep = self._gets(
+            _job(fragment, "preview-ol-substructure-keycloak-qa"), "qa-only-artifact"
+        )[0]
+        assert not dep.passed
+
 
 class TestPreviewGatedSideEffects:
     """Nothing that writes to the outside world may fire from a preview.
@@ -902,10 +951,14 @@ class TestStageInputsAreCorrelatedWithThePreview:
         assert "build-image" in (dep.passed or [])
 
     def test_preview_input_is_not_self_correlated(self):
-        """The preview cannot require having passed itself."""
+        """The preview cannot require having passed itself.
+
+        It IS chain-constrained to the previous stage's deploy, same as any
+        other chain-wide dependency -- just not to its own not-yet-run preview.
+        """
         preview = _job(self._chain(), "preview-ol-substructure-keycloak-qa")
         dep = next(s for s in preview.plan if str(getattr(s, "get", "")) == "app-image")
-        assert dep.passed == ["build-image"]
+        assert dep.passed == ["build-image", "deploy-ol-substructure-keycloak-ci"]
 
     def test_exempt_stage_input_is_untouched(self):
         deploy = _job(self._chain(), "deploy-ol-substructure-keycloak-ci")

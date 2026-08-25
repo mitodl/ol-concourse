@@ -194,9 +194,14 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
     :param project_source_path: The path within the `pulumi_code` resource where the
         code being executed is located
     :param dependencies: A list of `Get` step definitions that are used as inputs or
-        triggers for the jobs in the chain
+        triggers for the jobs in the chain. Under ``topology="preview-gated"``, each
+        of these is also `passed`-constrained to the previous stage's deploy job (in
+        addition to whatever `passed` it already carries, typically a build job) --
+        same promotion guarantee as the Pulumi code get, applied to whatever artifact
+        the Pulumi run also consumes (a built image, an AMI, ...).
     :param custom_dependencies: A dict of indices and `Get` step definitions that are
-        used as inputs or triggers for the jobs in the chain.
+        used as inputs or triggers for the jobs in the chain. Index-scoped and NOT
+        stage-chained -- the caller sets `passed` explicitly per stage here.
     :param github_issue_assignees: A list of GitHub usernames that should be assigned
     :param github_issue_labels: A list of GitHub labels that should be applied
     :param record_deployments: Only used with ``topology="preview-gated"``. When
@@ -738,6 +743,13 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
     it back, since promotion to the next stage is `passed` on the deploy job
     itself and the gate issue already authorised the deploy. Set ``False`` to
     drop it.
+
+    *dependencies* (the chain-wide ones, not *custom_dependencies*) are
+    `passed`-chained to the previous stage's deploy job here too, on top of
+    whatever `passed` the caller already set (typically a build job) --
+    without that, a Docker image or AMI built after this stage's own build
+    step, but never actually deployed to the PREVIOUS stage, would still be
+    eligible to trigger and be approved here.
     """
     exempt = {s.lower() for s in (auto_deploy_stages or [])}
 
@@ -824,17 +836,32 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
 
     previous_deploy: Job | None = None
     for index, stack_name in enumerate(stack_names):
-        # Chain-wide dependencies plus this stage's index-keyed custom ones.
+        passed_from = [previous_deploy.name] if previous_deploy else None
+
+        # Chain-wide dependencies promote stage-to-stage exactly like
+        # pulumi_code: an artifact must have reached the PREVIOUS stage's
+        # deploy to be eligible here, same guarantee `passed_from` gives the
+        # code get. Copied (never mutating the caller's step -- see
+        # _stage_inputs), so this stacks with whatever `passed` the caller
+        # already set (typically the build job) rather than replacing it.
+        # custom_dependencies stays index-scoped and unchained: those already
+        # encode explicit per-stage semantics the caller controls directly.
+        chained_dependencies = []
+        for dep in dependencies or []:
+            dep_copy = dep.model_copy(deep=True)
+            if passed_from and hasattr(dep_copy, "passed"):
+                dep_copy.passed = [*(dep_copy.passed or []), *passed_from]
+            chained_dependencies.append(dep_copy)
+
         stage_inputs, stage_effects = _split_stage_steps(
             [
-                *(dependencies or []),
+                *chained_dependencies,
                 *((custom_dependencies or {}).get(index) or []),
             ]
         )
         post_steps = list((additional_post_steps or {}).get(index) or [])
         slug = stack_name.lower().replace(".", "-")
         serial_group = _stack_serial_group(project_name, stack_name)
-        passed_from = [previous_deploy.name] if previous_deploy else None
 
         record_issue = None
         if record_deployments:
