@@ -182,6 +182,7 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
     max_carried_changes: int | str | None = None,
     topology: Literal["deploy-chained", "preview-gated"] = "deploy-chained",
     auto_deploy_stages: list[str] | None = None,
+    record_deployments: bool = True,
 ) -> PipelineFragment:
     """Create a chained sequence of jobs for running Pulumi tasks.
 
@@ -193,11 +194,23 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
     :param project_source_path: The path within the `pulumi_code` resource where the
         code being executed is located
     :param dependencies: A list of `Get` step definitions that are used as inputs or
-        triggers for the jobs in the chain
+        triggers for the jobs in the chain. Under ``topology="preview-gated"``, each
+        of these is also `passed`-constrained to the previous stage's deploy job (in
+        addition to whatever `passed` it already carries, typically a build job) --
+        same promotion guarantee as the Pulumi code get, applied to whatever artifact
+        the Pulumi run also consumes (a built image, an AMI, ...).
     :param custom_dependencies: A dict of indices and `Get` step definitions that are
-        used as inputs or triggers for the jobs in the chain.
+        used as inputs or triggers for the jobs in the chain. Index-scoped and NOT
+        stage-chained -- the caller sets `passed` explicitly per stage here.
     :param github_issue_assignees: A list of GitHub usernames that should be assigned
     :param github_issue_labels: A list of GitHub labels that should be applied
+    :param record_deployments: Only used with ``topology="preview-gated"``. When
+        ``True`` (default), every deploy posts a ``... deployed.`` GitHub issue
+        as an audit record. Unlike in ``deploy-chained``, nothing reads that
+        issue back -- promotion is `passed` on the deploy job itself, and the
+        gate issue is what actually authorised the deploy -- so it is a record,
+        not a gate. Set ``False`` to drop it once the gate issue is doing the
+        useful work and the record is just noise.
     :param env_vars_from_files: The list of environment variables that should be set
         during the build and the files to load for populating the values (e.g. the
         `version` file from a GitHub resource)
@@ -233,6 +246,7 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
             project_source_path=project_source_path,
             github_issue_repository=github_issue_repository,
             auto_deploy_stages=auto_deploy_stages,
+            record_deployments=record_deployments,
             github_issue_assignees=github_issue_assignees,
             github_issue_labels=github_issue_labels,
             dependencies=dependencies,
@@ -248,6 +262,9 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
         )
     if auto_deploy_stages is not None:
         msg = "auto_deploy_stages only applies to topology='preview-gated'"
+        raise ValueError(msg)
+    if not record_deployments:
+        msg = "record_deployments=False only applies to topology='preview-gated'"
         raise ValueError(msg)
 
     chain_fragment = PipelineFragment(resource_types=[github_issues_resource()])
@@ -663,6 +680,7 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
     project_source_path: Path,
     github_issue_repository: str,
     auto_deploy_stages: list[str] | None = None,
+    record_deployments: bool = True,
     github_issue_assignees: list[str] | None = None,
     github_issue_labels: list[str] | None = None,
     dependencies: list[GetStep] | None = None,
@@ -719,6 +737,19 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
     the fast feedback loop it exists to provide. Matched case-insensitively
     against both the full stack name and its trailing dotted segment, so both
     ``CI`` and ``mitx.CI`` work.
+
+    *record_deployments* controls the ``... deployed.`` issue posted after
+    every stage's `pulumi up`. It is an audit record only: nothing here reads
+    it back, since promotion to the next stage is `passed` on the deploy job
+    itself and the gate issue already authorised the deploy. Set ``False`` to
+    drop it.
+
+    *dependencies* (the chain-wide ones, not *custom_dependencies*) are
+    `passed`-chained to the previous stage's deploy job here too, on top of
+    whatever `passed` the caller already set (typically a build job) --
+    without that, a Docker image or AMI built after this stage's own build
+    step, but never actually deployed to the PREVIOUS stage, would still be
+    eligible to trigger and be approved here.
     """
     exempt = {s.lower() for s in (auto_deploy_stages or [])}
 
@@ -805,27 +836,59 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
 
     previous_deploy: Job | None = None
     for index, stack_name in enumerate(stack_names):
-        # Chain-wide dependencies plus this stage's index-keyed custom ones.
+        passed_from = [previous_deploy.name] if previous_deploy else None
+
+        # Chain-wide dependencies promote stage-to-stage exactly like
+        # pulumi_code: an artifact must have reached the PREVIOUS stage's
+        # deploy to be eligible here, same guarantee `passed_from` gives the
+        # code get. Copied (never mutating the caller's step -- see
+        # _stage_inputs), so this stacks with whatever `passed` the caller
+        # already set (typically the build job) rather than replacing it.
+        # custom_dependencies stays index-scoped and unchained: those already
+        # encode explicit per-stage semantics the caller controls directly.
+        chained_dependencies = []
+        for dep in dependencies or []:
+            dep_copy = dep.model_copy(deep=True)
+            if passed_from and hasattr(dep_copy, "passed"):
+                dep_copy.passed = [*(dep_copy.passed or []), *passed_from]
+            chained_dependencies.append(dep_copy)
+
         stage_inputs, stage_effects = _split_stage_steps(
             [
-                *(dependencies or []),
+                *chained_dependencies,
                 *((custom_dependencies or {}).get(index) or []),
             ]
         )
         post_steps = list((additional_post_steps or {}).get(index) or [])
         slug = stack_name.lower().replace(".", "-")
         serial_group = _stack_serial_group(project_name, stack_name)
-        passed_from = [previous_deploy.name] if previous_deploy else None
 
-        record_issue = github_issues(
-            auth_method="token",
-            name=Identifier(f"gh-{project_name.lower()}-{slug}-deployed"),
-            repository=github_issue_repository,
-            issue_title_template=f"[bot] Pulumi {project_name} {stack_name} deployed.",
-            issue_prefix=f"[bot] Pulumi {project_name} {stack_name} deployed.",
-            issue_state="open",
-        )
-        chain.resources.append(record_issue)
+        record_issue = None
+        if record_deployments:
+            deployed_title = f"[bot] Pulumi {project_name} {stack_name} deployed."
+            record_issue = github_issues(
+                auth_method="token",
+                name=Identifier(f"gh-{project_name.lower()}-{slug}-deployed"),
+                repository=github_issue_repository,
+                issue_title_template=deployed_title,
+                issue_prefix=deployed_title,
+                issue_state="open",
+            )
+            chain.resources.append(record_issue)
+
+        def _record_put(
+            stack: str = stack_name, issue: Resource | None = record_issue
+        ) -> PutStep | None:
+            if not issue:
+                return None
+            return PutStep(
+                put=issue.name,
+                params={
+                    "assignees": github_issue_assignees or [],
+                    "labels": _record_labels(stack),
+                    "body_files": [f"{pulumi_resource.name}/{DEPLOY_SUMMARY_FILENAME}"],
+                },
+            )
 
         if is_exempt(stack_name):
             deploy = Job(
@@ -849,16 +912,7 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
                     ),
                     *post_steps,
                 ],
-                on_success=PutStep(
-                    put=record_issue.name,
-                    params={
-                        "assignees": github_issue_assignees or [],
-                        "labels": _record_labels(stack_name),
-                        "body_files": [
-                            f"{pulumi_resource.name}/{DEPLOY_SUMMARY_FILENAME}"
-                        ],
-                    },
-                ),
+                on_success=_record_put(),
             )
             _alerts(deploy, stack_name, "deploy")
             chain.jobs.append(deploy)
@@ -973,14 +1027,7 @@ def _preview_gated_chain(  # noqa: PLR0913, PLR0915
                 ),
                 *post_steps,
             ],
-            on_success=PutStep(
-                put=record_issue.name,
-                params={
-                    "assignees": github_issue_assignees or [],
-                    "labels": _record_labels(stack_name),
-                    "body_files": [f"{pulumi_resource.name}/{DEPLOY_SUMMARY_FILENAME}"],
-                },
-            ),
+            on_success=_record_put(),
         )
 
         _alerts(deploy, stack_name, "deploy")

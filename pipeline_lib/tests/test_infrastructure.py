@@ -593,6 +593,46 @@ class TestPreviewGatedRejectsUnsupportedInputs:
         )
 
 
+class TestRecordDeployments:
+    """The "deployed" issue is an audit record, not a gate -- it can be dropped."""
+
+    def test_record_deployments_false_rejected_on_default_topology(self):
+        with pytest.raises(ValueError, match="only applies to"):
+            pulumi_jobs_chain(
+                _make_pulumi_code(),
+                stack_names=["CI"],
+                project_name="p",
+                project_source_path=Path("x"),
+                github_issue_repository="org/repo",
+                record_deployments=False,
+            )
+
+    def test_default_still_posts_the_record_on_both_stage_kinds(self):
+        fragment = _gated_chain()
+        exempt_deploy = _job(fragment, "deploy-ol-substructure-keycloak-ci")
+        gated_deploy = _job(fragment, "deploy-ol-substructure-keycloak-qa")
+        assert "deployed" in str(exempt_deploy.on_success.put)
+        assert "deployed" in str(gated_deploy.on_success.put)
+
+    def test_record_deployments_false_drops_the_on_success_put(self):
+        fragment = _gated_chain(record_deployments=False)
+        exempt_deploy = _job(fragment, "deploy-ol-substructure-keycloak-ci")
+        gated_deploy = _job(fragment, "deploy-ol-substructure-keycloak-qa")
+        assert exempt_deploy.on_success is None
+        assert gated_deploy.on_success is None
+
+    def test_record_deployments_false_drops_the_issue_resources(self):
+        fragment = _gated_chain(record_deployments=False)
+        assert not any("deployed" in str(r.name) for r in fragment.resources)
+
+    def test_record_deployments_false_keeps_the_gate(self):
+        """Dropping the record must not touch the actual promotion gate."""
+        fragment = _gated_chain(record_deployments=False)
+        assert _job(fragment, "preview-ol-substructure-keycloak-qa") is not None
+        assert any("gate-post" in str(r.name) for r in fragment.resources)
+        assert any("gate-trigger" in str(r.name) for r in fragment.resources)
+
+
 class TestPreviewGatedStageInputs:
     """Stage inputs are artifacts the Pulumi run consumes, not just triggers.
 
@@ -686,6 +726,55 @@ class TestPreviewGatedStageInputs:
         dep = self._dep()
         _gated_chain(dependencies=[dep])
         assert dep.trigger is True
+
+    def test_chain_dependencies_are_passed_constrained_to_the_previous_deploy(self):
+        """Without this, an image that only passed its OWN build job -- never
+        actually deployed to the previous stage -- could still trigger and be
+        approved here.
+        """
+        fragment = _gated_chain(dependencies=[self._dep()])
+        qa_dep = self._gets(
+            _job(fragment, "preview-ol-substructure-keycloak-qa"), "some-image"
+        )[0]
+        assert qa_dep.passed == ["deploy-ol-substructure-keycloak-ci"]
+
+        production_dep = self._gets(
+            _job(fragment, "preview-ol-substructure-keycloak-production"),
+            "some-image",
+        )[0]
+        assert production_dep.passed == ["deploy-ol-substructure-keycloak-qa"]
+
+    def test_chain_dependencies_keep_their_own_passed_constraint_too(self):
+        """The chain appends the previous deploy; it doesn't replace an
+        existing constraint such as the artifact's own build job.
+        """
+        fragment = _gated_chain(dependencies=[self._dep(passed=["build-job"])])
+        qa_dep = self._gets(
+            _job(fragment, "preview-ol-substructure-keycloak-qa"), "some-image"
+        )[0]
+        assert qa_dep.passed == [
+            "build-job",
+            "deploy-ol-substructure-keycloak-ci",
+        ]
+
+    def test_chain_dependencies_unconstrained_on_the_first_stage(self):
+        fragment = _gated_chain(dependencies=[self._dep()])
+        ci_dep = self._gets(
+            _job(fragment, "deploy-ol-substructure-keycloak-ci"), "some-image"
+        )[0]
+        assert not ci_dep.passed
+
+    def test_custom_dependencies_stay_unchained(self):
+        """Index-scoped custom_dependencies already encode explicit per-stage
+        `passed` semantics the caller controls -- chaining must not touch them.
+        """
+        fragment = _gated_chain(
+            custom_dependencies={1: [self._dep("qa-only-artifact")]}
+        )
+        dep = self._gets(
+            _job(fragment, "preview-ol-substructure-keycloak-qa"), "qa-only-artifact"
+        )[0]
+        assert not dep.passed
 
 
 class TestPreviewGatedSideEffects:
@@ -862,10 +951,14 @@ class TestStageInputsAreCorrelatedWithThePreview:
         assert "build-image" in (dep.passed or [])
 
     def test_preview_input_is_not_self_correlated(self):
-        """The preview cannot require having passed itself."""
+        """The preview cannot require having passed itself.
+
+        It IS chain-constrained to the previous stage's deploy, same as any
+        other chain-wide dependency -- just not to its own not-yet-run preview.
+        """
         preview = _job(self._chain(), "preview-ol-substructure-keycloak-qa")
         dep = next(s for s in preview.plan if str(getattr(s, "get", "")) == "app-image")
-        assert dep.passed == ["build-image"]
+        assert dep.passed == ["build-image", "deploy-ol-substructure-keycloak-ci"]
 
     def test_exempt_stage_input_is_untouched(self):
         deploy = _job(self._chain(), "deploy-ol-substructure-keycloak-ci")
