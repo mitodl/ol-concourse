@@ -1,5 +1,9 @@
 """Tests for ol_concourse.lib.tasks."""
 
+import subprocess
+import sys
+import tomllib
+
 import pytest
 
 from ol_concourse.lib.models.pipeline import AnonymousResource
@@ -136,3 +140,127 @@ class TestBumpVersionTask:
         assert "release" in input_names
         assert "app-source" in input_names
         assert len(input_names) == 2
+
+    def test_shell_script_falls_back_to_transition_without_current_version(self):
+        """A repo with no [tool.bumpversion].current_version must not reach
+        bump-my-version: it cannot run without that key, even with
+        --new-version.
+        """
+        step = bump_version_task(version_file="release/version", repository="src")
+        script = step.config.run.args[1]
+        assert '[ -f pyproject.toml ] && [ -z "$PYPROJECT_VER" ]' in script
+
+
+def _transition_script() -> str:
+    """Extract the Python transition script embedded in the generated bash."""
+    args = bump_version_task().config.run.args[1]
+    opener = "python3 -c '"
+    start = args.index(opener) + len(opener)
+    end = args.index('\' "$SINCE_SEMVER" "$VERSION"')
+    # Undo shlex.quote's single-quote escaping.
+    return args[start:end].replace("'\"'\"'", "'")
+
+
+BUMPVERSION_CONFIG = """\
+[project]
+name = "demo"
+version = "{project_version}"
+
+[tool.bumpversion]
+{current_version_line}\
+commit = false
+tag = false
+
+[tool.bumpversion.parts.build]
+first_value = "1"
+
+[[tool.bumpversion.files]]
+filename = "demo/settings.py"
+search = 'VERSION = "{{current_version}}"'
+replace = 'VERSION = "{{new_version}}"'
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = 'version = "{{current_version}}"'
+replace = 'version = "{{new_version}}"'
+"""
+
+
+class TestTransitionScript:
+    """Run the embedded transition script against real pyproject.toml fixtures.
+
+    These assert behavior rather than the presence of substrings, because the
+    bug this guards against (a silent no-op that still printed success) is
+    invisible to a string check.
+    """
+
+    @staticmethod
+    def _write_repo(tmp_path, *, current_version, settings_version="0.94.0"):
+        current_version_line = (
+            f'current_version = "{current_version}"\n' if current_version else ""
+        )
+        (tmp_path / "pyproject.toml").write_text(
+            BUMPVERSION_CONFIG.format(
+                project_version=settings_version,
+                current_version_line=current_version_line,
+            )
+        )
+        (tmp_path / "demo").mkdir()
+        (tmp_path / "demo" / "settings.py").write_text(
+            f'VERSION = "{settings_version}"\n'
+        )
+
+    @staticmethod
+    def _run(tmp_path, since, new_version):
+        script = tmp_path / "_transition.py"
+        script.write_text(_transition_script())
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, str(script), since, new_version],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        script.unlink()
+        return result
+
+    @staticmethod
+    def _tracked_version(tmp_path):
+        with (tmp_path / "pyproject.toml").open("rb") as config_file:
+            config = tomllib.load(config_file)
+        return config["tool"]["bumpversion"].get("current_version")
+
+    def test_inserts_current_version_when_absent(self, tmp_path):
+        self._write_repo(tmp_path, current_version=None)
+        self._run(tmp_path, "0.94.0", "2026.9.3.1")
+        assert self._tracked_version(tmp_path) == "2026.9.3.1"
+
+    def test_rewrites_existing_current_version(self, tmp_path):
+        self._write_repo(tmp_path, current_version="0.94.0")
+        self._run(tmp_path, "0.94.0", "2026.9.3.1")
+        assert self._tracked_version(tmp_path) == "2026.9.3.1"
+
+    def test_no_semver_baseline_still_bumps_and_seeds(self, tmp_path):
+        """Once an app has a calver tag the `since` file is calver, so the
+        script gets an empty baseline and has to find the version itself.
+        """
+        self._write_repo(tmp_path, current_version=None)
+        self._run(tmp_path, "", "2026.9.3.1")
+        assert self._tracked_version(tmp_path) == "2026.9.3.1"
+        assert '"2026.9.3.1"' in (tmp_path / "demo" / "settings.py").read_text()
+
+    def test_tracking_field_written_once(self, tmp_path):
+        """The [[files]] search templates also contain the literal
+        `current_version`; only the table's own key may be rewritten.
+        """
+        self._write_repo(tmp_path, current_version=None)
+        self._run(tmp_path, "0.94.0", "2026.9.3.1")
+        content = (tmp_path / "pyproject.toml").read_text()
+        assert content.count('current_version = "2026.9.3.1"') == 1
+        assert content.count("{current_version}") == 2
+
+    def test_missing_bumpversion_table_warns_without_failing(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\n')
+        result = self._run(tmp_path, "0.94.0", "2026.9.3.1")
+        assert "no [tool.bumpversion] table" in result.stderr
