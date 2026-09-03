@@ -138,22 +138,35 @@ for file_config in bv.get("files", []):
         else:
             print("Warning: version string not found in " + filename, file=sys.stderr)
 
-# Update the current_version tracking field.  Try each candidate so that
-# drift between `since` and the field value is handled gracefully.
+# Update the current_version tracking field.  An ABSENT key has to be
+# inserted, not skipped: bump-my-version cannot determine a current version
+# without it and crashes even when --new-version is supplied (verified against
+# 1.5.1), and that is the only path a calver-to-calver bump takes.
+# Scope the edit to the [tool.bumpversion] table -- "current_version" also
+# appears inside the [[tool.bumpversion.files]] search/replace templates.
 pyproject = pathlib.Path("pyproject.toml")
 content = pyproject.read_text()
-updated = content
-for candidate in candidates:
-    next_content = updated.replace(
-        'current_version = "' + candidate + '"',
-        'current_version = "' + new_ver + '"',
-        1,
+table = re.search(r"^\[tool\.bumpversion\][^\n]*\n", content, re.MULTILINE)
+if not table:
+    print(
+        "Warning: no [tool.bumpversion] table in pyproject.toml; "
+        "current_version not tracked",
+        file=sys.stderr,
     )
-    if next_content != updated:
-        updated = next_content
-        break
-pyproject.write_text(updated)
-print("Updated pyproject.toml current_version tracking")
+else:
+    head, rest = content[: table.end()], content[table.end() :]
+    next_table = re.search(r"^\[", rest, re.MULTILINE)
+    body = rest[: next_table.start()] if next_table else rest
+    tail = rest[next_table.start() :] if next_table else ""
+    key = re.search(r"^[ \t]*current_version[ \t]*=[^\n]*$", body, re.MULTILINE)
+    new_line = 'current_version = "' + new_ver + '"'
+    if key:
+        body = body[: key.start()] + new_line + body[key.end() :]
+        print("Updated pyproject.toml current_version -> " + new_ver)
+    else:
+        body = new_line + "\n" + body
+        print("Inserted pyproject.toml current_version = " + new_ver)
+    pyproject.write_text(head + body + tail)
 """
 
     return TaskStep(
@@ -182,17 +195,35 @@ fi
 git -C {shlex.quote(repo_id)} config user.email {shlex.quote(git_email)}
 git -C {shlex.quote(repo_id)} config user.name {shlex.quote(git_user)}
 cd {shlex.quote(repo_id)}
-if [ -z "$SINCE_SEMVER" ] && [ -f pyproject.toml ]; then
-    PYPROJECT_VER=$(echo 'import tomllib as t
-bv=t.load(open("pyproject.toml","rb")).get("tool",{{}}).get("bumpversion",{{}})
-print(bv.get("current_version",""))
+PYPROJECT_TABLE=""
+PYPROJECT_VER=""
+if [ -f pyproject.toml ]; then
+    PYPROJECT_PROBE=$(echo 'import tomllib as t
+bv=t.load(open("pyproject.toml","rb")).get("tool",{{}}).get("bumpversion")
+print("table" if bv is not None else "")
+print((bv or {{}}).get("current_version",""))
 ' | python3 2>/dev/null || true)
+    PYPROJECT_TABLE=$(echo "$PYPROJECT_PROBE" | sed -n 1p)
+    PYPROJECT_VER=$(echo "$PYPROJECT_PROBE" | sed -n 2p)
+fi
+if [ -z "$SINCE_SEMVER" ]; then
     PYPROJECT_STRIPPED="${{PYPROJECT_VER#v}}"
     if echo "$PYPROJECT_STRIPPED" | grep -qE '^[0-9]{{1,3}}\.[0-9]+\.[0-9]+$'; then
         SINCE_SEMVER="$PYPROJECT_STRIPPED"
     fi
 fi
-if [ -n "$SINCE_SEMVER" ]; then
+# bump-my-version cannot run at all without [tool.bumpversion].current_version,
+# so a repo missing that key goes through the transition script even when there
+# is no semver baseline: it finds the in-file version by regex and seeds the
+# key, and every release after this one takes the bump-my-version path.
+# A missing *table* is a different thing -- there is nothing to seed and no
+# files to rewrite, so it stays on the bump-my-version path, which fails the
+# task rather than cutting a release with no version bump in it.
+NEEDS_SEED=0
+if [ -n "$PYPROJECT_TABLE" ] && [ -z "$PYPROJECT_VER" ]; then
+    NEEDS_SEED=1
+fi
+if [ -n "$SINCE_SEMVER" ] || [ "$NEEDS_SEED" = 1 ]; then
     python3 -c {shlex.quote(_transition_script)} "$SINCE_SEMVER" "$VERSION"
 else
     bump-my-version bump --new-version "$VERSION" --no-commit --allow-dirty --verbose
