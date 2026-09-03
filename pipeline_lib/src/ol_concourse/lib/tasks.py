@@ -195,12 +195,16 @@ fi
 git -C {shlex.quote(repo_id)} config user.email {shlex.quote(git_email)}
 git -C {shlex.quote(repo_id)} config user.name {shlex.quote(git_user)}
 cd {shlex.quote(repo_id)}
+PYPROJECT_TABLE=""
 PYPROJECT_VER=""
 if [ -f pyproject.toml ]; then
-    PYPROJECT_VER=$(echo 'import tomllib as t
-bv=t.load(open("pyproject.toml","rb")).get("tool",{{}}).get("bumpversion",{{}})
-print(bv.get("current_version",""))
+    PYPROJECT_PROBE=$(echo 'import tomllib as t
+bv=t.load(open("pyproject.toml","rb")).get("tool",{{}}).get("bumpversion")
+print("table" if bv is not None else "")
+print((bv or {{}}).get("current_version",""))
 ' | python3 2>/dev/null || true)
+    PYPROJECT_TABLE=$(echo "$PYPROJECT_PROBE" | sed -n 1p)
+    PYPROJECT_VER=$(echo "$PYPROJECT_PROBE" | sed -n 2p)
 fi
 if [ -z "$SINCE_SEMVER" ]; then
     PYPROJECT_STRIPPED="${{PYPROJECT_VER#v}}"
@@ -212,8 +216,11 @@ fi
 # so a repo missing that key goes through the transition script even when there
 # is no semver baseline: it finds the in-file version by regex and seeds the
 # key, and every release after this one takes the bump-my-version path.
+# A missing *table* is a different thing -- there is nothing to seed and no
+# files to rewrite, so it stays on the bump-my-version path, which fails the
+# task rather than cutting a release with no version bump in it.
 NEEDS_SEED=0
-if [ -f pyproject.toml ] && [ -z "$PYPROJECT_VER" ]; then
+if [ -n "$PYPROJECT_TABLE" ] && [ -z "$PYPROJECT_VER" ]; then
     NEEDS_SEED=1
 fi
 if [ -n "$SINCE_SEMVER" ] || [ "$NEEDS_SEED" = 1 ]; then

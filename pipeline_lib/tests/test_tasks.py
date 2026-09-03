@@ -148,7 +148,19 @@ class TestBumpVersionTask:
         """
         step = bump_version_task(version_file="release/version", repository="src")
         script = step.config.run.args[1]
-        assert '[ -f pyproject.toml ] && [ -z "$PYPROJECT_VER" ]' in script
+        assert '[ -n "$PYPROJECT_TABLE" ] && [ -z "$PYPROJECT_VER" ]' in script
+
+    def test_shell_script_keeps_missing_bumpversion_table_on_bump_my_version(self):
+        """A missing [tool.bumpversion] table has nothing to seed and no files
+        to rewrite, so routing it to the transition script would turn a failed
+        task into a release carrying no version bump.  It is a distinct
+        condition from a missing current_version key, not the same empty
+        string.
+        """
+        step = bump_version_task(version_file="release/version", repository="src")
+        script = step.config.run.args[1]
+        assert 'print("table" if bv is not None else "")' in script
+        assert 'PYPROJECT_TABLE=$(echo "$PYPROJECT_PROBE" | sed -n 1p)' in script
 
 
 def _transition_script() -> str:
