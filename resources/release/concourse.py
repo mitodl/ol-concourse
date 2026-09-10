@@ -47,6 +47,11 @@ from github import Auth, Github, GithubIntegration
 VERSION_PATTERN = re.compile(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})\.(\d+)$")
 SEMVER_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
+# A hotfix is requested by pushing a ``hotfix/<full sha>`` tag, which
+# ``action=create`` deletes when it cuts that hotfix.
+HOTFIX_TAG_PREFIX = "hotfix/"
+HOTFIX_REQUEST_PATTERN = re.compile(r"^hotfix/([0-9a-f]{40})$")
+
 # Commits this resource itself creates during a release: the version-bump /
 # changelog commit written by ``action=create`` and the no-ff merge commit
 # written by ``action=finish``.  Because the tag is planted on the *pre-bump*
@@ -103,6 +108,10 @@ class ReleaseVersion(TypedVersion):
     superseding the in-flight release is the explicit job of ``action=create``.
     Defaults to empty so version dicts recorded before this field existed
     still deserialize.
+
+    ``hotfix`` is set while a hotfix request is pending: the version is then
+    production plus that one commit, not the tracked branch, and ``head_sha``
+    is the requested commit.  Empty by default for the same reason.
     """
 
     version: str  # YYYY.M.D.N (no leading zeros — PEP 440 compliant)
@@ -111,6 +120,7 @@ class ReleaseVersion(TypedVersion):
     commit_count: str  # number of commits since last release tag
     authors: str  # comma-separated sorted author email list
     in_flight: str = ""  # cut-but-unfinished release version, or empty string
+    hotfix: str = ""  # commit to cherry-pick onto production, or empty string
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +271,23 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         # Superseding an in-flight release is `action=create`'s job.
         in_flight = _get_in_flight_release_version(repo_path, env=env) or ""
 
+        # A pending hotfix request wins over the tracked branch.  It is how the
+        # release bot tells the build job which commit to cherry-pick, since
+        # triggering a Concourse job carries no parameters.
+        if hotfix := _pending_hotfix_request(repo_path, env=env):
+            count, authors = _commit_info(repo_path, f"{hotfix}^!", env=env)
+            return [
+                ReleaseVersion(
+                    version=_compute_next_version(tags),
+                    head_sha=hotfix,
+                    since=latest_tag or "",
+                    commit_count=str(count),
+                    authors=authors,
+                    in_flight=in_flight,
+                    hotfix=hotfix,
+                )
+            ]
+
         if latest_tag:
             count, authors = _commit_info_range(
                 repo_path, latest_tag, head_sha, env=env
@@ -351,6 +378,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         (destination_dir / "version").write_text(version.version)
         (destination_dir / "since").write_text(version.since)
         (destination_dir / "in_flight").write_text(version.in_flight)
+        (destination_dir / "hotfix").write_text(version.hotfix)
         (destination_dir / "commits.json").write_text(json.dumps(commits, indent=2))
         (destination_dir / "checklist.md").write_text(
             _build_checklist(version.version, commits)
@@ -372,13 +400,21 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         }
         if version.in_flight:
             metadata["in_flight"] = version.in_flight
+        if version.hotfix:
+            metadata["hotfix"] = version.hotfix
         return version, metadata
 
     def _collect_commits(
         self, repo_path: Path, version: ReleaseVersion, env: dict[str, str]
     ) -> list[dict[str, Any]]:
-        """Return enriched commit list between the previous tag and head_sha."""
-        if version.since:
+        """Return enriched commit list between the previous tag and head_sha.
+
+        A hotfix contains exactly its one commit, whatever sits between the
+        previous release and that commit on the tracked branch.
+        """
+        if version.hotfix:
+            range_spec = f"{version.hotfix}^!"
+        elif version.since:
             range_spec = f"{version.since}..{version.head_sha}"
         else:
             range_spec = version.head_sha
@@ -410,10 +446,12 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         action=create:
           1. Record the pre-bumpver HEAD SHA (this becomes the release tag).
           2. Create release/YYYY.MM.DD.N branch.
-          3. Optionally cherry-pick commit_hash (hotfix) first.
-          4. Stage + commit dirty files (version bump from bump_version_task)
+          3. Stage + commit dirty files (version bump from bump_version_task)
              and the changelog update in a single "Release YYYY.MM.DD.N" commit.
-          5. Push branch and tag.
+          4. Push branch and tag.
+
+        action=create with commit_hash cuts a hotfix instead: production plus
+        that one commit, not the tracked branch.  See :meth:`_create_hotfix`.
 
         action=finish:
           1. Fetch the configured branch and the release branch.
@@ -440,6 +478,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
         superseded = ""
         superseded_tag_kept = False
+        hotfix = ""
         with _git_ssh_env(self.private_key) as env:
             _configure_git_identity(
                 repo_path, self.git_user_name, self.git_user_email, env=env
@@ -447,13 +486,17 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             if token := self.github_token:
                 _configure_https_auth(repo_path, token, env=env)
 
-            if action == "create":
+            if action == "create" and commit_hash:
+                head_sha, since, hotfix = self._create_hotfix(
+                    repo_path, version_str, commit_hash, env=env
+                )
+            elif action == "create":
                 (
                     head_sha,
                     since,
                     superseded,
                     superseded_tag_kept,
-                ) = self._create_release(repo_path, version_str, commit_hash, env=env)
+                ) = self._create_release(repo_path, version_str, env=env)
             elif action == "finish":
                 head_sha = self._finish_release(repo_path, version_str, env=env)
                 since = ""
@@ -462,6 +505,8 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 since = ""
 
         metadata = {"version": version_str, "action": action}
+        if hotfix:
+            metadata["hotfix"] = hotfix
         if superseded:
             metadata["superseded"] = superseded
             metadata["superseded_tag"] = "kept" if superseded_tag_kept else "deleted"
@@ -475,6 +520,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 # A freshly created release is, by definition, the one now in
                 # flight; finishing or abandoning clears it.
                 in_flight=version_str if action == "create" else "",
+                hotfix=hotfix,
             ),
             metadata,
         )
@@ -483,7 +529,6 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         self,
         repo_path: Path,
         version: str,
-        commit_hash: str | None,
         env: dict[str, str],
     ) -> tuple[str, str, str, bool]:
         """Create the release branch and version tag.
@@ -496,12 +541,9 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         empty), and *superseded_tag_kept* records whether that release's tag
         was left in place because it had already reached production.
 
-        Commit ordering:
-          1. Cherry-pick hotfix (if any) onto the branch first so it is
-             included in the release notes range.
-          2. Stage version-bump file changes (from bump_version_task) and
-             the changelog update in a single "Release {version}" commit so
-             that the entire release is one atomic unit.
+        Version-bump file changes (from bump_version_task) and the changelog
+        update go in a single "Release {version}" commit so that the entire
+        release is one atomic unit.
         """
         branch_name = f"releases/{version}"
 
@@ -558,13 +600,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             env=env,
         )
 
-        # Cherry-pick hotfix commit first so it is included in the release
-        # note range and committed before the release metadata files.
-        if commit_hash:
-            _run(["git", "cherry-pick", commit_hash], cwd=repo_path, env=env)
-
-        # Collect commits for changelog (between last tag and pre-bump HEAD,
-        # plus the hotfix commit if present).
+        # Collect commits for changelog (between last tag and pre-bump HEAD).
         prior_tags = _get_release_tags(repo_path, env=env)
 
         if version in prior_tags:
@@ -605,13 +641,29 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             since_ref = semver_tags[-1] if semver_tags else ""
         else:
             since_ref = ""
-        until_ref = (
-            _run(["git", "rev-parse", "HEAD"], cwd=repo_path, env=env).strip()
-            if commit_hash
-            else pre_bump_sha
+        commits = self._collect_commits_range(
+            repo_path, since_ref, pre_bump_sha, env=env
         )
-        commits = self._collect_commits_range(repo_path, since_ref, until_ref, env=env)
+        self._commit_and_push_cut(
+            repo_path, version, branch_name, pre_bump_sha, commits, env=env
+        )
+        return pre_bump_sha, since_ref, superseded, superseded_tag_kept
 
+    def _commit_and_push_cut(  # noqa: PLR0913
+        self,
+        repo_path: Path,
+        version: str,
+        branch_name: str,
+        tag_sha: str,
+        commits: list[dict[str, Any]],
+        *,
+        env: dict[str, str],
+    ) -> None:
+        """Commit the version bump and changelog, then push the branch and tag.
+
+        The tag goes on *tag_sha*, the source that was cut, not on the
+        ``Release`` commit added on top of it.
+        """
         # Stage only already-tracked modified files (from bump_version_task).
         # Using `git add -u` instead of `git add -A` avoids accidentally
         # staging untracked build artefacts or temporary files.
@@ -633,7 +685,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
         _run(["git", "push", "origin", branch_name], cwd=repo_path, env=env)
         _run(
-            ["git", "tag", "-a", version, "-m", f"Release {version}", pre_bump_sha],
+            ["git", "tag", "-a", version, "-m", f"Release {version}", tag_sha],
             cwd=repo_path,
             env=env,
         )
@@ -642,7 +694,163 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             cwd=repo_path,
             env=env,
         )
-        return pre_bump_sha, since_ref, superseded, superseded_tag_kept
+
+    def _create_hotfix(
+        self,
+        repo_path: Path,
+        version: str,
+        commit_hash: str,
+        *,
+        env: dict[str, str],
+    ) -> tuple[str, str, str]:
+        """Cut *version* as production plus *commit_hash*.
+
+        Returns ``(tag_sha, since_ref, commit_sha)``: the cherry-picked commit
+        that was tagged, the production release it was cut from, and the full
+        SHA of the commit that was picked.
+
+        A hotfix cannot be cut from the tracked branch the way a normal release
+        is.  That branch almost always holds unreleased work, and the fix is
+        usually already merged into it, so cherry-picking onto its HEAD either
+        ships everything unreleased alongside the fix or fails outright on an
+        empty cherry-pick.
+
+        An in-flight release is refused rather than superseded: it is usually
+        the release being worked around, and discarding it is not what someone
+        asking for a hotfix means.
+
+        :raises RuntimeError: If another release is in flight, there is no
+            release to hotfix, production cannot be confirmed to be running the
+            latest release, *commit_hash* is already in production, or the
+            cherry-pick or version bump does not apply.
+        """
+        branch_name = f"releases/{version}"
+        _run(["git", "fetch", "origin", self.branch, "--tags"], cwd=repo_path, env=env)
+
+        commit_sha = _resolve_commit(repo_path, commit_hash, env=env)
+        _consume_hotfix_request(repo_path, commit_sha, env=env)
+
+        in_flight = _get_in_flight_release_version(repo_path, env=env)
+        if in_flight and in_flight != version:
+            msg = (
+                f"Release {in_flight} is in flight. Finish or abandon it before "
+                f"cutting hotfix {version}."
+            )
+            raise RuntimeError(msg)
+
+        tags = _get_release_tags(repo_path, env=env)
+        prior_tags = [tag for tag in tags if tag != version]
+        if not prior_tags:
+            msg = f"There is no release to hotfix: {self.branch} has no release tags."
+            raise RuntimeError(msg)
+        base_tag = prior_tags[-1]
+
+        if version in tags:
+            # A retrigger of a cut that completed.  Re-cherry-picking would
+            # mint a new SHA, so identify the tagged commit by the trailer
+            # `cherry-pick -x` wrote instead.
+            tag_sha = _run(
+                ["git", "rev-list", "-n1", version], cwd=repo_path, env=env
+            ).strip()
+            message = _run(
+                ["git", "log", "-1", "--format=%B", tag_sha], cwd=repo_path, env=env
+            )
+            if f"(cherry picked from commit {commit_sha})" not in message:
+                msg = (
+                    f"Tag {version!r} already exists at {tag_sha}, which is not a "
+                    f"hotfix of {commit_sha}. Refusing to overwrite it."
+                )
+                raise RuntimeError(msg)
+            return tag_sha, base_tag, commit_sha
+        if in_flight == version:
+            self._clear_partial_cut(repo_path, version, env=env)
+
+        if self._production_state(base_tag) is not True:
+            msg = (
+                f"Cannot confirm that production is running {base_tag}, the latest "
+                f"release: GitHub reports no successful {self.production_environment}"
+                " deployment of it, or could not be asked. A hotfix is cut from "
+                "what production runs, so this will not guess."
+            )
+            raise RuntimeError(msg)
+        base_sha = self._production_commit(repo_path, base_tag, env=env)
+
+        if _is_ancestor(repo_path, commit_sha, base_sha, env=env):
+            msg = (
+                f"{commit_sha} is already in production ({base_tag}); there is "
+                "nothing to hotfix."
+            )
+            raise RuntimeError(msg)
+
+        # Set the bump_version_task changes aside so the tree is clean for the
+        # checkout and cherry-pick, then put them back on top.
+        had_stash = bool(
+            _run(["git", "status", "--porcelain"], cwd=repo_path, env=env).strip()
+        )
+        if had_stash:
+            _run(
+                [
+                    "git",
+                    "stash",
+                    "push",
+                    "--include-untracked",
+                    "-m",
+                    "bump_version_task changes",
+                ],
+                cwd=repo_path,
+                env=env,
+            )
+        _run(["git", "checkout", "-b", branch_name, base_sha], cwd=repo_path, env=env)
+
+        tag_sha = _cherry_pick(repo_path, commit_sha, onto=base_tag, env=env)
+
+        if had_stash:
+            try:
+                _run(["git", "stash", "pop"], cwd=repo_path, env=env)
+            except subprocess.CalledProcessError as exc:
+                msg = (
+                    f"The version bump from bump_version_task does not apply to "
+                    f"{base_tag}: the version files on {self.branch} have diverged "
+                    "from production's."
+                )
+                raise RuntimeError(msg) from exc
+
+        commits = self._collect_commits_range(repo_path, base_tag, tag_sha, env=env)
+        self._commit_and_push_cut(
+            repo_path, version, branch_name, tag_sha, commits, env=env
+        )
+        return tag_sha, base_tag, commit_sha
+
+    def _production_commit(
+        self, repo_path: Path, release_tag: str, *, env: dict[str, str]
+    ) -> str:
+        """Return the commit production was built from for *release_tag*.
+
+        That is the release's ``Release <version>`` commit (the tag plus its
+        version bump) rather than the tag, which marks the source before the
+        bump.  Falls back to the tag when that commit is not on the tracked
+        branch, e.g. a release that shipped but never finished.
+        """
+        tag_sha = _run(
+            ["git", "rev-list", "-n1", release_tag], cwd=repo_path, env=env
+        ).strip()
+        log = _run(
+            [
+                "git",
+                "log",
+                "--ancestry-path",
+                "--format=%H %P%x09%s",
+                f"{tag_sha}..origin/{self.branch}",
+            ],
+            cwd=repo_path,
+            env=env,
+        )
+        for line in log.splitlines():
+            shas, _, subject = line.partition("\t")
+            sha, *parents = shas.split()
+            if parents[:1] == [tag_sha] and subject == f"Release {release_tag}":
+                return sha
+        return tag_sha
 
     def _supersede_in_flight_release(
         self, repo_path: Path, version: str, *, env: dict[str, str]
@@ -863,9 +1071,18 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         turns out to be unnecessary is recoverable; deleting the only
         reference to what production is running is not.
         """
+        return self._production_state(version) is not False
+
+    def _production_state(self, version: str) -> bool | None:
+        """Return whether *version* has a successful production deployment.
+
+        ``None`` when the answer cannot be established: no GitHub credentials
+        or ``repository`` configured, or the API call failed.  Callers choose
+        which way to err -- superseding keeps the tag, a hotfix refuses.
+        """
         token = self.github_token
         if not (token and self.repository):
-            return True
+            return None
         try:
             deployments = (
                 Github(auth=Auth.Token(token))
@@ -880,10 +1097,10 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         except Exception:
             print(  # noqa: T201
                 f"[release] could not confirm whether {version} reached "
-                f"{self.production_environment}; keeping its tag",
+                f"{self.production_environment}",
                 file=sys.stderr,
             )
-            return True
+            return None
 
     def _collect_commits_range(
         self, repo_path: Path, since_ref: str, until_ref: str, env: dict[str, str]
@@ -1085,6 +1302,60 @@ def _get_in_flight_release_version(
     return sorted(versions, key=_parse_version_tuple)[-1]
 
 
+def _pending_hotfix_request(repo_path: Path, *, env: dict[str, str]) -> str | None:
+    """Return the commit SHA of the newest pending hotfix request, or None.
+
+    Tags under ``hotfix/`` whose name is not a full SHA are ignored:
+    ``action=create`` deletes a request by that name, so it could never
+    consume one of those and check would offer it forever.
+    """
+    output = _run(
+        [
+            "git",
+            "for-each-ref",
+            "--sort=-creatordate",
+            "--format=%(refname:strip=2)",
+            f"refs/tags/{HOTFIX_TAG_PREFIX}",
+        ],
+        cwd=repo_path,
+        env=env,
+    )
+    for name in output.splitlines():
+        match = HOTFIX_REQUEST_PATTERN.match(name.strip())
+        if match:
+            return match.group(1)
+    return None
+
+
+def _consume_hotfix_request(
+    repo_path: Path, commit_sha: str, *, env: dict[str, str]
+) -> None:
+    """Delete the ``hotfix/<commit_sha>`` request tag from the remote.
+
+    The request is spent whether or not the cut then succeeds.  Left behind,
+    a refused or failed request would make every later check offer this hotfix
+    again instead of a normal release.  The delete itself is best-effort,
+    because there may be no request at all (a pipeline passing ``commit_hash``
+    directly), so the remote is re-read afterwards: a request that survives,
+    e.g. behind a protected-tag rule, stops the cut here.
+
+    :raises RuntimeError: If the request tag is still on the remote.
+    """
+    ref = f"refs/tags/{HOTFIX_TAG_PREFIX}{commit_sha}"
+    with suppress(subprocess.CalledProcessError):
+        _run(["git", "push", "origin", "--delete", ref], cwd=repo_path, env=env)
+    survivor = _run(
+        ["git", "ls-remote", "--tags", "origin", ref], cwd=repo_path, env=env
+    )
+    if survivor.strip():
+        msg = (
+            f"Could not delete the hotfix request {ref} from the remote. Refusing "
+            "to continue: left in place, every later check would offer this "
+            "hotfix again."
+        )
+        raise RuntimeError(msg)
+
+
 def _remote_branch_exists(
     repo_path: Path, branch_name: str, *, env: dict[str, str]
 ) -> bool:
@@ -1095,6 +1366,73 @@ def _remote_branch_exists(
         env=env,
     )
     return bool(output.strip())
+
+
+def _resolve_commit(repo_path: Path, commit_hash: str, *, env: dict[str, str]) -> str:
+    """Return the full SHA of *commit_hash*, fetching it if the checkout lacks it.
+
+    An ``out`` step's checkout comes from the ``git`` resource and carries only
+    the tracked branch, so a fix that lives on any other branch has to be
+    fetched by SHA.
+    """
+    spec = f"{commit_hash}^{{commit}}"
+    try:
+        return _run(
+            ["git", "rev-parse", "--verify", "--quiet", spec], cwd=repo_path, env=env
+        ).strip()
+    except subprocess.CalledProcessError:
+        _run(["git", "fetch", "origin", commit_hash], cwd=repo_path, env=env)
+        return _run(
+            ["git", "rev-parse", "--verify", spec], cwd=repo_path, env=env
+        ).strip()
+
+
+def _is_ancestor(
+    repo_path: Path, ancestor: str, descendant: str, *, env: dict[str, str]
+) -> bool:
+    """Return True if *ancestor* is reachable from *descendant*."""
+    try:
+        _run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=repo_path,
+            env=env,
+        )
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode == 1:
+            return False
+        raise
+    return True
+
+
+def _cherry_pick(
+    repo_path: Path, commit_sha: str, *, onto: str, env: dict[str, str]
+) -> str:
+    """Cherry-pick *commit_sha* onto HEAD with ``-x`` and return the new HEAD.
+
+    A merge commit is picked against its first parent: the diff the merge
+    brought into the branch it landed on.
+
+    :raises RuntimeError: If the pick does not apply to *onto*.
+    """
+    parents = _run(
+        ["git", "rev-list", "--parents", "-n1", commit_sha], cwd=repo_path, env=env
+    ).split()
+    mainline = ["-m", "1"] if len(parents) > 2 else []  # noqa: PLR2004
+    try:
+        _run(
+            ["git", "cherry-pick", "-x", *mainline, commit_sha],
+            cwd=repo_path,
+            env=env,
+        )
+    except subprocess.CalledProcessError as exc:
+        with suppress(subprocess.CalledProcessError):
+            _run(["git", "cherry-pick", "--abort"], cwd=repo_path, env=env)
+        msg = (
+            f"Cherry-picking {commit_sha} onto {onto} failed. It does not apply "
+            "to what production runs; release it normally instead."
+        )
+        raise RuntimeError(msg) from exc
+    return _run(["git", "rev-parse", "HEAD"], cwd=repo_path, env=env).strip()
 
 
 def _assert_refs_deleted(

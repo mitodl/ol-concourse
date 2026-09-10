@@ -132,6 +132,7 @@ Clones the repository and generates release artefacts from `version.since..versi
 |------|-------------|
 | `version` | Plain version string, e.g. `2026.4.14.1` |
 | `in_flight` | Version of a release cut but not yet finished, or empty (may already be in production — see below) |
+| `hotfix` | Commit SHA of a pending hotfix request, or empty (see [hotfix](#action-create-with-commit_hash-hotfix)) |
 | `commits.json` | Structured list of `{sha, author, author_name, pr_number, pr_title, message}` -- `author` is the commit email (matched against `auto_check_authors` by the `github-issues` resource), `author_name` is the git-configured display name |
 | `checklist.md` | GitHub Issue body with a markdown task list grouped by author (`### <author_name>` headings, newest contributor first); use as `body_file` in `github-issues` resource |
 | `changelog_entry.md` | Single [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) entry for this version |
@@ -161,11 +162,10 @@ already updated by `bump_version_task`.
    established (no credentials, no `repository`, or an API failure) the tag is
    **kept**: an unnecessary tag is recoverable, a deleted one is not.
 2. Records the pre-bumpver HEAD SHA (this becomes the release tag, marking the code cut for RC).
-3. Optionally cherry-picks `commit_hash` (hotfix) before the release commit.
-4. Creates `releases/YYYY.MM.DD.N` branch.
-5. Stages version-bump changes and optional changelog update in a single `"Release YYYY.MM.DD.N"` commit.
-6. Pushes the branch.
-7. Creates and pushes the `YYYY.MM.DD.N` tag on the pre-bumpver HEAD.
+3. Creates `releases/YYYY.MM.DD.N` branch.
+4. Stages version-bump changes and optional changelog update in a single `"Release YYYY.MM.DD.N"` commit.
+5. Pushes the branch.
+6. Creates and pushes the `YYYY.MM.DD.N` tag on the pre-bumpver HEAD.
 
 Only an **older** release is ever superseded. `create` binds the version
 Concourse resolved when the build was scheduled, so a delayed or concurrent
@@ -186,6 +186,63 @@ carries the previous attempt's release commit, so the next push is rejected as
 a non-fast-forward and every retry fails identically. That branch is deleted
 before re-cutting. A cut with **both** branch and tag present is a true
 retrigger and is left completely alone.
+
+### `action: create` with `commit_hash` (hotfix)
+
+A hotfix is requested by pushing a `hotfix/<full commit SHA>` tag to the
+repository; the release bot's `/doof hotfix` does this. While one is pending,
+`check` emits the next version with `hotfix` and `head_sha` set to that SHA and
+`since` set to the latest release. `in` writes the SHA to a `hotfix` file
+(empty otherwise) and lists only that commit in `commits.json`,
+`checklist.md` and `changelog_entry.md`. A pipeline turns this into a hotfix
+cut by passing the file's content as `commit_hash`, which is empty, and so a
+normal release, when no request is pending:
+
+```yaml
+- load_var: hotfix
+  file: app-release/hotfix
+- put: app-release
+  params:
+    action: create
+    repo_dir: app-source
+    version_file: app-release/version
+    commit_hash: ((.:hotfix))
+```
+
+`create` deletes the request tag before anything else, whether or not the cut
+then succeeds, so a refused or failed request cannot turn later releases into
+hotfixes. Tags under `hotfix/` whose name is not a full SHA are ignored.
+
+A hotfix is **production plus one commit**, not the tracked branch plus one
+commit. The tracked branch almost always holds unreleased work, and the fix is
+usually already merged there, so cherry-picking onto its HEAD would either ship
+everything unreleased or fail on an empty cherry-pick.
+
+1. **Refuses if any other release is in flight.** Finish or abandon it first.
+   A normal `create` supersedes an in-flight release; a hotfix does not, because
+   the in-flight release is usually the one being worked around.
+2. Takes the latest release tag as the base and **refuses unless GitHub
+   confirms** a successful `production_environment` deployment of it. Unlike
+   supersede, an unanswerable check is a refusal, not a guess.
+3. Branches `releases/YYYY.MM.DD.N` from that release's `Release <version>`
+   commit (the tag plus its version bump, which is what the production image
+   was built from), falling back to the tag itself when that commit is not on
+   the tracked branch.
+4. Refuses if `commit_hash` is already contained in production.
+5. Cherry-picks `commit_hash` with `-x`, using `-m 1` for a merge commit.
+6. Tags the cherry-picked commit, applies the `bump_version_task` changes on top
+   as the `Release YYYY.MM.DD.N` commit, and pushes branch and tag.
+
+`since` is the production release, so the release notes list only the hotfix.
+`finish` merges the branch back as usual. The put metadata carries `hotfix`.
+
+A retriggered hotfix whose tag already exists is left alone if the tagged
+commit records the same `commit_hash` in its `cherry picked from` trailer, and
+fails otherwise.
+
+The version bump is computed against the tracked branch's files and applied to
+production's. That is clean whenever the version files are only changed by
+releases; if they diverged, `create` fails instead of guessing.
 
 ### `action: finish`
 

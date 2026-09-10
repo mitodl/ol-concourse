@@ -4,7 +4,7 @@ name: Tests
 on:
   push:
     branches:
-      - main
+    - main
   pull_request:
 
 jobs:
@@ -14,38 +14,40 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.13", "3.14"]
+        python-version: ['3.13', '3.14']
         package:
-          - name: ol-concourse
-            test_path: pipeline_lib/tests/
-          - name: ol-concourse-github-issues
-            test_path: resources/github-issues/tests/
-          - name: ol-concourse-npm
-            test_path: resources/npm/tests/
-          - name: ol-concourse-packer
-            test_path: resources/packer/tests/
-          - name: ol-concourse-pulumi
-            test_path: resources/pulumi/tests/
-          - name: ol-concourse-pypi
-            test_path: resources/pypi/tests/
-          - name: ol-concourse-github-deployments
-            test_path: resources/github-deployments/tests/
+        - name: ol-concourse
+          test_path: pipeline_lib/tests/
+        - name: ol-concourse-github-issues
+          test_path: resources/github-issues/tests/
+        - name: ol-concourse-npm
+          test_path: resources/npm/tests/
+        - name: ol-concourse-packer
+          test_path: resources/packer/tests/
+        - name: ol-concourse-pulumi
+          test_path: resources/pulumi/tests/
+        - name: ol-concourse-pypi
+          test_path: resources/pypi/tests/
+        - name: ol-concourse-github-deployments
+          test_path: resources/github-deployments/tests/
+        - name: ol-concourse-release
+          test_path: resources/release/tests/
 
     permissions:
       contents: read
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      with:
+        persist-credentials: false
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          python-version: ${{ matrix.python-version }}
-          enable-cache: true
+    - name: Install uv
+      uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d   # v10.0.1
+      with:
+        python-version: ${{ matrix.python-version }}
+        enable-cache: true
 
-      - name: Run tests
-        run: >-
-          uv run --package ${{ matrix.package.name }}
-          pytest ${{ matrix.package.test_path }} -v
+    - name: Run tests
+      run: >-
+        uv run --package ${{ matrix.package.name }}
+        pytest ${{ matrix.package.test_path }} -v

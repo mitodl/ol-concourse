@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -445,6 +447,7 @@ def test_fetch_new_versions_semver_fallback_used_when_no_date_tags(
         "v1.2.3\nv1.3.0\nbad-tag",  # git tag --list (no date-format tags)
         head_sha,  # git rev-parse origin/main
         "",  # git branch -r (no in-flight)
+        "",  # for-each-ref refs/tags/hotfix/ (no pending hotfix)
         # semver fallback branch: git tag --list again for _get_semver_tags
         "v1.2.3\nv1.3.0\nbad-tag",
         # _commit_info_range for v1.3.0..head_sha
@@ -488,6 +491,7 @@ def test_fetch_new_versions_semver_fallback_ignored_when_date_tags_exist(
         "v1.3.0\n2026.4.14.1",  # both semver and date-format present
         head_sha,
         "",  # git branch -r (no in-flight)
+        "",  # for-each-ref refs/tags/hotfix/ (no pending hotfix)
         tag_sha,  # rev-list -n1 2026.4.14.1
         "dev@example.com",
     ]
@@ -524,6 +528,7 @@ def test_fetch_new_versions_semver_fallback_disabled(mock_tmpdir, mock_run, tmp_
         "v1.2.3\nv1.3.0",  # only semver tags
         head_sha,
         "",  # git branch -r (no in-flight)
+        "",  # for-each-ref refs/tags/hotfix/ (no pending hotfix)
         "dev@example.com\nalice@example.com",  # _commit_info_all
     ]
     idx = 0
@@ -682,8 +687,9 @@ def test_fetch_new_versions_no_tags(mock_tmpdir, mock_run, tmp_path):
 
     call_index = 0
     # 0: clone, 1: fetch --tags, 2: tag --list (empty), 3: rev-parse,
-    # 4: branch -r (no in-flight), 5: commit_info_all
-    outputs = ["", "", "", head_sha, "", "dev@example.com"]
+    # 4: branch -r (no in-flight), 5: for-each-ref (no pending hotfix),
+    # 6: commit_info_all
+    outputs = ["", "", "", head_sha, "", "", "dev@example.com"]
 
     def run_side_effect(cmd, **kwargs):
         nonlocal call_index
@@ -1115,51 +1121,384 @@ def test_publish_new_version_create_stashes_dirty_files(mock_run, tmp_path):
 
 
 @patch("concourse._run")
-def test_publish_new_version_create_with_hotfix(mock_run, tmp_path):
-    """Hotfix commit is cherry-picked before the release commit."""
-    version_str = "2026.4.14.1"
-    hotfix_sha = "hotfix12" * 5
-
+def test_create_without_commit_hash_never_cherry_picks(mock_run, tmp_path):
+    """Only a hotfix cherry-picks; a normal cut is the tracked branch as-is."""
     version_file = tmp_path / "release" / "version"
     version_file.parent.mkdir()
-    version_file.write_text(version_str)
+    version_file.write_text("2026.4.14.1")
     (tmp_path / "app-source").mkdir()
 
-    pre_bump_sha = "prebump1" * 5
-    post_cherry_sha = "postchry" * 5
-    call_order = []
-
-    def track_run(cmd, **kw):
-        call_order.append(cmd[1] if len(cmd) > 1 else cmd[0])
-        if "rev-parse" in cmd and "HEAD" in cmd:
-            # Return pre_bump_sha on first call (before cherry-pick), post after
-            return post_cherry_sha if "cherry-pick" in call_order else pre_bump_sha
-        if "status" in cmd:
-            return ""
-        if "tag" in cmd and "--list" in cmd:
-            return ""
-        if "log" in cmd:
-            return ""
-        return pre_bump_sha  # default fallback for any other rev-parse
-
-    mock_run.side_effect = track_run
-
-    resource = make_resource()
-    resource.publish_new_version(
+    mock_run.side_effect = _FakeRemote()
+    make_resource().publish_new_version(
         tmp_path,
         MagicMock(),
         action="create",
         repo_dir="app-source",
         version_file="release/version",
-        commit_hash=hotfix_sha,
     )
 
-    cherry_idx = next(i for i, c in enumerate(call_order) if c == "cherry-pick")
-    # The first rev-parse HEAD (pre_bump_sha) comes before cherry-pick
-    rev_parse_indices = [i for i, c in enumerate(call_order) if c == "rev-parse"]
-    assert rev_parse_indices[0] < cherry_idx, (
-        "pre_bump_sha rev-parse must precede cherry-pick"
+    all_cmds = [" ".join(c.args[0]) for c in mock_run.call_args_list]
+    assert not any("cherry-pick" in c for c in all_cmds)
+
+
+# ---------------------------------------------------------------------------
+# publish_new_version — hotfix, against real repositories
+# ---------------------------------------------------------------------------
+#
+# These run real git instead of stubbing _run: what a hotfix contains is a
+# property of the commit graph, which a stub can only restate.
+
+PROD = "2026.9.1.1"
+HOTFIX = "2026.9.10.1"
+
+
+def _git(cwd: Path, *args: str) -> str:
+    return subprocess.run(  # noqa: S603
+        ["git", *args],  # noqa: S607
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _commit(repo: Path, message: str, **files: str) -> str:
+    for name, content in files.items():
+        (repo / name).write_text(content)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", message)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+@dataclass
+class _World:
+    origin: Path
+    dev: Path
+    fix_sha: str
+    prod_sha: str  # the `Release PROD` commit the production image was built from
+
+
+@pytest.fixture
+def git_isolated(tmp_path, monkeypatch):
+    """Keep the developer's git config (signing, hooks, identity) out of it."""
+    config = tmp_path / "gitconfig"
+    config.write_text(
+        "[user]\n\tname = Test\n\temail = test@example.com\n"
+        "[init]\n\tdefaultBranch = main\n"
     )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
+@pytest.fixture
+def world(tmp_path, git_isolated) -> _World:
+    """Build an origin with PROD released and finished, then unreleased work and a fix.
+
+    Mirrors what the resource leaves behind: the PROD tag on the pre-bump
+    commit, its `Release` and `Merge releases/` commits on main after it.
+    """
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", str(origin))
+    dev = tmp_path / "dev"
+    _git(tmp_path, "clone", "-q", str(origin), str(dev))
+
+    cut = _commit(dev, "Initial", **{"app.txt": "broken\n", "version.txt": "0\n"})
+    _git(dev, "checkout", "-q", "-b", f"releases/{PROD}")
+    prod_sha = _commit(dev, f"Release {PROD}", **{"version.txt": f"{PROD}\n"})
+    _git(dev, "checkout", "-q", "main")
+    _git(
+        dev,
+        "merge",
+        "-q",
+        "--no-ff",
+        f"releases/{PROD}",
+        "-m",
+        f"Merge releases/{PROD}",
+    )
+    _git(dev, "tag", "-a", PROD, "-m", f"Release {PROD}", cut)
+    _git(dev, "branch", "-q", "-D", f"releases/{PROD}")
+
+    _commit(dev, "Unreleased feature", **{"feature.txt": "unreleased\n"})
+    fix_sha = _commit(dev, "Fix the bug", **{"app.txt": "fixed\n"})
+    _commit(dev, "More unreleased work", **{"other.txt": "unreleased\n"})
+    _git(dev, "push", "-q", "origin", "main", "--tags")
+    return _World(origin=origin, dev=dev, fix_sha=fix_sha, prod_sha=prod_sha)
+
+
+@pytest.fixture
+def in_production(mocker):
+    return mocker.patch.object(ReleaseResource, "_production_state", return_value=True)
+
+
+def _workspace(tmp_path: Path, origin: Path, version: str = HOTFIX) -> Path:
+    """Build a put's inputs: a single-branch checkout, bumped, and the version file."""
+    sources = Path(tempfile.mkdtemp(dir=tmp_path))
+    checkout = sources / "app-source"
+    _git(tmp_path, "clone", "-q", "--single-branch", str(origin), str(checkout))
+    (checkout / "version.txt").write_text(f"{version}\n")  # bump_version_task
+    (sources / "release").mkdir()
+    (sources / "release" / "version").write_text(version)
+    return sources
+
+
+def _put(
+    sources: Path,
+    action: Literal["create", "finish", "abandon"] = "create",
+    **params: Any,
+):
+    return make_resource().publish_new_version(
+        sources,
+        MagicMock(),
+        action=action,
+        repo_dir="app-source",
+        version_file="release/version",
+        **params,
+    )
+
+
+def _tree(repo: Path, rev: str) -> list[str]:
+    return _git(repo, "ls-tree", "--name-only", rev).split()
+
+
+def test_hotfix_is_production_plus_the_fix(tmp_path, world, in_production):
+    version, metadata = _put(
+        _workspace(tmp_path, world.origin), commit_hash=world.fix_sha
+    )
+
+    tag_sha = _git(world.origin, "rev-list", "-n1", HOTFIX)
+    assert version.head_sha == tag_sha
+    assert version.since == PROD, "release notes must cover only the hotfix"
+    assert version.in_flight == HOTFIX
+    assert metadata["hotfix"] == world.fix_sha
+    in_production.assert_called_once_with(PROD)
+
+    assert _git(world.origin, "rev-parse", f"{tag_sha}^") == world.prod_sha
+    assert _git(world.origin, "show", f"{tag_sha}:app.txt") == "fixed"
+    assert "feature.txt" not in _tree(world.origin, tag_sha), (
+        "unreleased work on main must not ride along with a hotfix"
+    )
+    assert "other.txt" not in _tree(world.origin, tag_sha)
+    assert f"(cherry picked from commit {world.fix_sha})" in _git(
+        world.origin, "log", "-1", "--format=%B", tag_sha
+    )
+
+    branch = f"releases/{HOTFIX}"
+    assert _git(world.origin, "log", "-1", "--format=%s", branch) == f"Release {HOTFIX}"
+    assert _git(world.origin, "rev-parse", f"{branch}^") == tag_sha
+    assert _git(world.origin, "show", f"{branch}:version.txt") == HOTFIX
+
+
+def test_hotfix_finishes_back_into_the_tracked_branch(tmp_path, world, in_production):
+    _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+    _put(_workspace(tmp_path, world.origin), action="finish")
+
+    assert _git(world.origin, "show", "main:version.txt") == HOTFIX
+    assert _git(world.origin, "show", "main:app.txt") == "fixed"
+    assert _git(world.origin, "show", "main:feature.txt") == "unreleased"
+    assert not _git(world.origin, "branch", "--list", f"releases/{HOTFIX}")
+
+
+def test_hotfix_refuses_while_another_release_is_in_flight(
+    tmp_path, world, in_production
+):
+    """Doof refused too. The in-flight release is usually the one being fixed."""
+    in_flight = "2026.9.9.1"
+    _git(world.dev, "push", "-q", "origin", f"main:refs/heads/releases/{in_flight}")
+
+    with pytest.raises(RuntimeError, match=f"Release {in_flight} is in flight"):
+        _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+
+    assert _git(world.origin, "branch", "--list", f"releases/{in_flight}"), (
+        "a hotfix must not supersede the in-flight release"
+    )
+    assert not _git(world.origin, "tag", "--list", HOTFIX)
+    assert not _git(world.origin, "branch", "--list", f"releases/{HOTFIX}")
+
+
+@pytest.mark.parametrize("state", [False, None])
+def test_hotfix_refuses_unless_production_is_confirmed(tmp_path, world, mocker, state):
+    """Unlike supersede, not knowing is a refusal: the base would be a guess."""
+    mocker.patch.object(ReleaseResource, "_production_state", return_value=state)
+
+    with pytest.raises(RuntimeError, match="Cannot confirm that production"):
+        _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+
+    assert not _git(world.origin, "tag", "--list", HOTFIX)
+
+
+def test_hotfix_refuses_a_commit_already_in_production(tmp_path, world, in_production):
+    shipped = _git(world.dev, "rev-list", "--max-parents=0", "HEAD")
+
+    with pytest.raises(RuntimeError, match="already in production"):
+        _put(_workspace(tmp_path, world.origin), commit_hash=shipped)
+
+
+def test_hotfix_refuses_without_a_release(tmp_path, git_isolated, in_production):
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", str(origin))
+    dev = tmp_path / "dev"
+    _git(tmp_path, "clone", "-q", str(origin), str(dev))
+    fix = _commit(dev, "Fix", **{"version.txt": "0\n"})
+    _git(dev, "push", "-q", "origin", "main")
+
+    with pytest.raises(RuntimeError, match="no release to hotfix"):
+        _put(_workspace(tmp_path, origin), commit_hash=fix)
+
+
+def test_hotfix_retrigger_is_a_noop(tmp_path, world, in_production):
+    first, _ = _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+    second, _ = _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+
+    assert second.head_sha == first.head_sha
+    assert _git(world.origin, "rev-list", "-n1", HOTFIX) == first.head_sha
+
+
+def test_hotfix_retrigger_for_a_different_commit_fails(tmp_path, world, in_production):
+    _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+    other = _commit(world.dev, "Another fix", **{"late.txt": "fix\n"})
+    _git(world.dev, "push", "-q", "origin", "main")
+
+    with pytest.raises(RuntimeError, match="is not a hotfix of"):
+        _put(_workspace(tmp_path, world.origin), commit_hash=other)
+
+
+def test_hotfix_of_a_merge_commit_takes_its_mainline_diff(
+    tmp_path, world, in_production
+):
+    _git(world.dev, "checkout", "-q", "-b", "fix-branch")
+    _commit(world.dev, "Fix on a branch", **{"hotfix.txt": "fix\n"})
+    _git(world.dev, "checkout", "-q", "main")
+    _git(world.dev, "merge", "-q", "--no-ff", "fix-branch", "-m", "Merge fix-branch")
+    merge_sha = _git(world.dev, "rev-parse", "HEAD")
+    _git(world.dev, "push", "-q", "origin", "main")
+
+    version, _ = _put(_workspace(tmp_path, world.origin), commit_hash=merge_sha)
+
+    tree = _tree(world.origin, version.head_sha)
+    assert "hotfix.txt" in tree
+    assert "feature.txt" not in tree
+
+
+def test_hotfix_fetches_a_commit_the_checkout_does_not_have(
+    tmp_path, world, in_production
+):
+    """The git resource checkout carries only the tracked branch."""
+    _git(world.dev, "checkout", "-q", "-b", "hotfix-only", world.prod_sha)
+    fix = _commit(world.dev, "Fix off main", **{"hotfix.txt": "fix\n"})
+    _git(world.dev, "push", "-q", "origin", "hotfix-only")
+
+    version, _ = _put(_workspace(tmp_path, world.origin), commit_hash=fix)
+
+    assert "hotfix.txt" in _tree(world.origin, version.head_sha)
+
+
+# ---------------------------------------------------------------------------
+# Hotfix requests: check / in / out
+# ---------------------------------------------------------------------------
+
+
+def _request_hotfix(world: _World, name: str, sha: str) -> None:
+    _git(world.dev, "tag", f"hotfix/{name}", sha)
+    _git(world.dev, "push", "-q", "origin", f"hotfix/{name}")
+
+
+def _remote_tags(origin: Path) -> list[str]:
+    return _git(origin, "tag", "--list").split()
+
+
+def _check(world: _World) -> ReleaseVersion:
+    [version] = make_resource(uri=f"file://{world.origin}").fetch_new_versions(None)
+    return version
+
+
+def test_check_offers_a_pending_hotfix(world):
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+
+    version = _check(world)
+
+    assert version.hotfix == world.fix_sha
+    assert version.head_sha == world.fix_sha
+    assert version.since == PROD
+    assert version.commit_count == "1"
+    assert version.version == _compute_next_version([PROD])
+
+
+def test_check_ignores_a_hotfix_tag_that_is_not_a_full_sha(world):
+    """Create deletes a request by its full-SHA name, so it could never consume this."""
+    _request_hotfix(world, world.fix_sha[:7], world.fix_sha)
+
+    version = _check(world)
+
+    assert version.hotfix == ""
+    assert version.head_sha == _git(world.origin, "rev-parse", "main")
+
+
+def test_in_lists_only_the_hotfix_commit(tmp_path, world):
+    """Unreleased work between production and the fix is not in the hotfix."""
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+    version = _check(world)
+    dest = tmp_path / "get"
+
+    make_resource(uri=f"file://{world.origin}").download_version(
+        version, dest, MagicMock()
+    )
+
+    assert (dest / "hotfix").read_text() == world.fix_sha
+    commits = json.loads((dest / "commits.json").read_text())
+    assert [c["sha"] for c in commits] == [world.fix_sha]
+
+
+def test_in_writes_an_empty_hotfix_file_for_a_normal_release(tmp_path, world):
+    """The pipeline load_vars this file on every release, so it must exist."""
+    version = _check(world)
+    dest = tmp_path / "get"
+
+    make_resource(uri=f"file://{world.origin}").download_version(
+        version, dest, MagicMock()
+    )
+
+    assert (dest / "hotfix").read_text() == ""
+
+
+def test_hotfix_consumes_its_request(tmp_path, world, in_production):
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+
+    version, _ = _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+
+    assert f"hotfix/{world.fix_sha}" not in _remote_tags(world.origin)
+    assert version.hotfix == world.fix_sha
+
+
+def test_a_refused_hotfix_still_consumes_its_request(tmp_path, world, in_production):
+    """Otherwise every later check would offer the refused hotfix again."""
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+    _git(world.dev, "push", "-q", "origin", "main:refs/heads/releases/2026.9.9.1")
+
+    with pytest.raises(RuntimeError, match="is in flight"):
+        _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+
+    assert f"hotfix/{world.fix_sha}" not in _remote_tags(world.origin)
+
+
+def test_hotfix_stops_when_its_request_cannot_be_deleted(
+    tmp_path, world, in_production
+):
+    """A request that survives would be offered again by every later check."""
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+    hook = world.origin / "hooks" / "pre-receive"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "while read -r _old _new ref; do\n"
+        '  case "$ref" in refs/tags/hotfix/*) echo protected >&2; exit 1;; esac\n'
+        "done\n"
+    )
+    hook.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="Could not delete the hotfix request"):
+        _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+
+    assert f"hotfix/{world.fix_sha}" in _remote_tags(world.origin)
+    assert not _git(world.origin, "branch", "--list", f"releases/{HOTFIX}")
 
 
 @patch("concourse._run")
