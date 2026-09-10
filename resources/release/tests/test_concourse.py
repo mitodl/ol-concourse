@@ -1480,6 +1480,27 @@ def test_a_refused_hotfix_still_consumes_its_request(tmp_path, world, in_product
     assert f"hotfix/{world.fix_sha}" not in _remote_tags(world.origin)
 
 
+def test_hotfix_stops_when_its_request_cannot_be_deleted(
+    tmp_path, world, in_production
+):
+    """A request that survives would be offered again by every later check."""
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+    hook = world.origin / "hooks" / "pre-receive"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "while read -r _old _new ref; do\n"
+        '  case "$ref" in refs/tags/hotfix/*) echo protected >&2; exit 1;; esac\n'
+        "done\n"
+    )
+    hook.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="Could not delete the hotfix request"):
+        _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+
+    assert f"hotfix/{world.fix_sha}" in _remote_tags(world.origin)
+    assert not _git(world.origin, "branch", "--list", f"releases/{HOTFIX}")
+
+
 @patch("concourse._run")
 def test_publish_new_version_finish(mock_run, tmp_path):
     """Finish action: merges release branch into the configured branch."""

@@ -728,21 +728,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         _run(["git", "fetch", "origin", self.branch, "--tags"], cwd=repo_path, env=env)
 
         commit_sha = _resolve_commit(repo_path, commit_hash, env=env)
-        # The request is spent whether or not this cut succeeds.  Left behind,
-        # a refused or failed request would make every later check offer this
-        # hotfix again instead of a normal release.
-        with suppress(subprocess.CalledProcessError):
-            _run(
-                [
-                    "git",
-                    "push",
-                    "origin",
-                    "--delete",
-                    f"refs/tags/{HOTFIX_TAG_PREFIX}{commit_sha}",
-                ],
-                cwd=repo_path,
-                env=env,
-            )
+        _consume_hotfix_request(repo_path, commit_sha, env=env)
 
         in_flight = _get_in_flight_release_version(repo_path, env=env)
         if in_flight and in_flight != version:
@@ -1339,6 +1325,35 @@ def _pending_hotfix_request(repo_path: Path, *, env: dict[str, str]) -> str | No
         if match:
             return match.group(1)
     return None
+
+
+def _consume_hotfix_request(
+    repo_path: Path, commit_sha: str, *, env: dict[str, str]
+) -> None:
+    """Delete the ``hotfix/<commit_sha>`` request tag from the remote.
+
+    The request is spent whether or not the cut then succeeds.  Left behind,
+    a refused or failed request would make every later check offer this hotfix
+    again instead of a normal release.  The delete itself is best-effort,
+    because there may be no request at all (a pipeline passing ``commit_hash``
+    directly), so the remote is re-read afterwards: a request that survives,
+    e.g. behind a protected-tag rule, stops the cut here.
+
+    :raises RuntimeError: If the request tag is still on the remote.
+    """
+    ref = f"refs/tags/{HOTFIX_TAG_PREFIX}{commit_sha}"
+    with suppress(subprocess.CalledProcessError):
+        _run(["git", "push", "origin", "--delete", ref], cwd=repo_path, env=env)
+    survivor = _run(
+        ["git", "ls-remote", "--tags", "origin", ref], cwd=repo_path, env=env
+    )
+    if survivor.strip():
+        msg = (
+            f"Could not delete the hotfix request {ref} from the remote. Refusing "
+            "to continue: left in place, every later check would offer this "
+            "hotfix again."
+        )
+        raise RuntimeError(msg)
 
 
 def _remote_branch_exists(
