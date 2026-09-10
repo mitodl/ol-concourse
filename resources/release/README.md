@@ -132,6 +132,7 @@ Clones the repository and generates release artefacts from `version.since..versi
 |------|-------------|
 | `version` | Plain version string, e.g. `2026.4.14.1` |
 | `in_flight` | Version of a release cut but not yet finished, or empty (may already be in production — see below) |
+| `hotfix` | Commit SHA of a pending hotfix request, or empty (see [hotfix](#action-create-with-commit_hash-hotfix)) |
 | `commits.json` | Structured list of `{sha, author, author_name, pr_number, pr_title, message}` -- `author` is the commit email (matched against `auto_check_authors` by the `github-issues` resource), `author_name` is the git-configured display name |
 | `checklist.md` | GitHub Issue body with a markdown task list grouped by author (`### <author_name>` headings, newest contributor first); use as `body_file` in `github-issues` resource |
 | `changelog_entry.md` | Single [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) entry for this version |
@@ -187,6 +188,30 @@ before re-cutting. A cut with **both** branch and tag present is a true
 retrigger and is left completely alone.
 
 ### `action: create` with `commit_hash` (hotfix)
+
+A hotfix is requested by pushing a `hotfix/<full commit SHA>` tag to the
+repository; the release bot's `/doof hotfix` does this. While one is pending,
+`check` emits the next version with `hotfix` and `head_sha` set to that SHA and
+`since` set to the latest release. `in` writes the SHA to a `hotfix` file
+(empty otherwise) and lists only that commit in `commits.json`,
+`checklist.md` and `changelog_entry.md`. A pipeline turns this into a hotfix
+cut by passing the file's content as `commit_hash`, which is empty, and so a
+normal release, when no request is pending:
+
+```yaml
+- load_var: hotfix
+  file: app-release/hotfix
+- put: app-release
+  params:
+    action: create
+    repo_dir: app-source
+    version_file: app-release/version
+    commit_hash: ((.:hotfix))
+```
+
+`create` deletes the request tag before anything else, whether or not the cut
+then succeeds, so a refused or failed request cannot turn later releases into
+hotfixes. Tags under `hotfix/` whose name is not a full SHA are ignored.
 
 A hotfix is **production plus one commit**, not the tracked branch plus one
 commit. The tracked branch almost always holds unreleased work, and the fix is

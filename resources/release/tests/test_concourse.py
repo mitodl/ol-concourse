@@ -447,6 +447,7 @@ def test_fetch_new_versions_semver_fallback_used_when_no_date_tags(
         "v1.2.3\nv1.3.0\nbad-tag",  # git tag --list (no date-format tags)
         head_sha,  # git rev-parse origin/main
         "",  # git branch -r (no in-flight)
+        "",  # for-each-ref refs/tags/hotfix/ (no pending hotfix)
         # semver fallback branch: git tag --list again for _get_semver_tags
         "v1.2.3\nv1.3.0\nbad-tag",
         # _commit_info_range for v1.3.0..head_sha
@@ -490,6 +491,7 @@ def test_fetch_new_versions_semver_fallback_ignored_when_date_tags_exist(
         "v1.3.0\n2026.4.14.1",  # both semver and date-format present
         head_sha,
         "",  # git branch -r (no in-flight)
+        "",  # for-each-ref refs/tags/hotfix/ (no pending hotfix)
         tag_sha,  # rev-list -n1 2026.4.14.1
         "dev@example.com",
     ]
@@ -526,6 +528,7 @@ def test_fetch_new_versions_semver_fallback_disabled(mock_tmpdir, mock_run, tmp_
         "v1.2.3\nv1.3.0",  # only semver tags
         head_sha,
         "",  # git branch -r (no in-flight)
+        "",  # for-each-ref refs/tags/hotfix/ (no pending hotfix)
         "dev@example.com\nalice@example.com",  # _commit_info_all
     ]
     idx = 0
@@ -684,8 +687,9 @@ def test_fetch_new_versions_no_tags(mock_tmpdir, mock_run, tmp_path):
 
     call_index = 0
     # 0: clone, 1: fetch --tags, 2: tag --list (empty), 3: rev-parse,
-    # 4: branch -r (no in-flight), 5: commit_info_all
-    outputs = ["", "", "", head_sha, "", "dev@example.com"]
+    # 4: branch -r (no in-flight), 5: for-each-ref (no pending hotfix),
+    # 6: commit_info_all
+    outputs = ["", "", "", head_sha, "", "", "dev@example.com"]
 
     def run_side_effect(cmd, **kwargs):
         nonlocal call_index
@@ -1386,6 +1390,94 @@ def test_hotfix_fetches_a_commit_the_checkout_does_not_have(
     version, _ = _put(_workspace(tmp_path, world.origin), commit_hash=fix)
 
     assert "hotfix.txt" in _tree(world.origin, version.head_sha)
+
+
+# ---------------------------------------------------------------------------
+# Hotfix requests: check / in / out
+# ---------------------------------------------------------------------------
+
+
+def _request_hotfix(world: _World, name: str, sha: str) -> None:
+    _git(world.dev, "tag", f"hotfix/{name}", sha)
+    _git(world.dev, "push", "-q", "origin", f"hotfix/{name}")
+
+
+def _remote_tags(origin: Path) -> list[str]:
+    return _git(origin, "tag", "--list").split()
+
+
+def _check(world: _World) -> ReleaseVersion:
+    [version] = make_resource(uri=f"file://{world.origin}").fetch_new_versions(None)
+    return version
+
+
+def test_check_offers_a_pending_hotfix(world):
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+
+    version = _check(world)
+
+    assert version.hotfix == world.fix_sha
+    assert version.head_sha == world.fix_sha
+    assert version.since == PROD
+    assert version.commit_count == "1"
+    assert version.version == _compute_next_version([PROD])
+
+
+def test_check_ignores_a_hotfix_tag_that_is_not_a_full_sha(world):
+    """Create deletes a request by its full-SHA name, so it could never consume this."""
+    _request_hotfix(world, world.fix_sha[:7], world.fix_sha)
+
+    version = _check(world)
+
+    assert version.hotfix == ""
+    assert version.head_sha == _git(world.origin, "rev-parse", "main")
+
+
+def test_in_lists_only_the_hotfix_commit(tmp_path, world):
+    """Unreleased work between production and the fix is not in the hotfix."""
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+    version = _check(world)
+    dest = tmp_path / "get"
+
+    make_resource(uri=f"file://{world.origin}").download_version(
+        version, dest, MagicMock()
+    )
+
+    assert (dest / "hotfix").read_text() == world.fix_sha
+    commits = json.loads((dest / "commits.json").read_text())
+    assert [c["sha"] for c in commits] == [world.fix_sha]
+
+
+def test_in_writes_an_empty_hotfix_file_for_a_normal_release(tmp_path, world):
+    """The pipeline load_vars this file on every release, so it must exist."""
+    version = _check(world)
+    dest = tmp_path / "get"
+
+    make_resource(uri=f"file://{world.origin}").download_version(
+        version, dest, MagicMock()
+    )
+
+    assert (dest / "hotfix").read_text() == ""
+
+
+def test_hotfix_consumes_its_request(tmp_path, world, in_production):
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+
+    version, _ = _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+
+    assert f"hotfix/{world.fix_sha}" not in _remote_tags(world.origin)
+    assert version.hotfix == world.fix_sha
+
+
+def test_a_refused_hotfix_still_consumes_its_request(tmp_path, world, in_production):
+    """Otherwise every later check would offer the refused hotfix again."""
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+    _git(world.dev, "push", "-q", "origin", "main:refs/heads/releases/2026.9.9.1")
+
+    with pytest.raises(RuntimeError, match="is in flight"):
+        _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+
+    assert f"hotfix/{world.fix_sha}" not in _remote_tags(world.origin)
 
 
 @patch("concourse._run")

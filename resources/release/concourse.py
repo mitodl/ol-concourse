@@ -47,6 +47,11 @@ from github import Auth, Github, GithubIntegration
 VERSION_PATTERN = re.compile(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})\.(\d+)$")
 SEMVER_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
+# A hotfix is requested by pushing a ``hotfix/<full sha>`` tag, which
+# ``action=create`` deletes when it cuts that hotfix.
+HOTFIX_TAG_PREFIX = "hotfix/"
+HOTFIX_REQUEST_PATTERN = re.compile(r"^hotfix/([0-9a-f]{40})$")
+
 # Commits this resource itself creates during a release: the version-bump /
 # changelog commit written by ``action=create`` and the no-ff merge commit
 # written by ``action=finish``.  Because the tag is planted on the *pre-bump*
@@ -103,6 +108,10 @@ class ReleaseVersion(TypedVersion):
     superseding the in-flight release is the explicit job of ``action=create``.
     Defaults to empty so version dicts recorded before this field existed
     still deserialize.
+
+    ``hotfix`` is set while a hotfix request is pending: the version is then
+    production plus that one commit, not the tracked branch, and ``head_sha``
+    is the requested commit.  Empty by default for the same reason.
     """
 
     version: str  # YYYY.M.D.N (no leading zeros — PEP 440 compliant)
@@ -111,6 +120,7 @@ class ReleaseVersion(TypedVersion):
     commit_count: str  # number of commits since last release tag
     authors: str  # comma-separated sorted author email list
     in_flight: str = ""  # cut-but-unfinished release version, or empty string
+    hotfix: str = ""  # commit to cherry-pick onto production, or empty string
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +271,23 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         # Superseding an in-flight release is `action=create`'s job.
         in_flight = _get_in_flight_release_version(repo_path, env=env) or ""
 
+        # A pending hotfix request wins over the tracked branch.  It is how the
+        # release bot tells the build job which commit to cherry-pick, since
+        # triggering a Concourse job carries no parameters.
+        if hotfix := _pending_hotfix_request(repo_path, env=env):
+            count, authors = _commit_info(repo_path, f"{hotfix}^!", env=env)
+            return [
+                ReleaseVersion(
+                    version=_compute_next_version(tags),
+                    head_sha=hotfix,
+                    since=latest_tag or "",
+                    commit_count=str(count),
+                    authors=authors,
+                    in_flight=in_flight,
+                    hotfix=hotfix,
+                )
+            ]
+
         if latest_tag:
             count, authors = _commit_info_range(
                 repo_path, latest_tag, head_sha, env=env
@@ -351,6 +378,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         (destination_dir / "version").write_text(version.version)
         (destination_dir / "since").write_text(version.since)
         (destination_dir / "in_flight").write_text(version.in_flight)
+        (destination_dir / "hotfix").write_text(version.hotfix)
         (destination_dir / "commits.json").write_text(json.dumps(commits, indent=2))
         (destination_dir / "checklist.md").write_text(
             _build_checklist(version.version, commits)
@@ -372,13 +400,21 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         }
         if version.in_flight:
             metadata["in_flight"] = version.in_flight
+        if version.hotfix:
+            metadata["hotfix"] = version.hotfix
         return version, metadata
 
     def _collect_commits(
         self, repo_path: Path, version: ReleaseVersion, env: dict[str, str]
     ) -> list[dict[str, Any]]:
-        """Return enriched commit list between the previous tag and head_sha."""
-        if version.since:
+        """Return enriched commit list between the previous tag and head_sha.
+
+        A hotfix contains exactly its one commit, whatever sits between the
+        previous release and that commit on the tracked branch.
+        """
+        if version.hotfix:
+            range_spec = f"{version.hotfix}^!"
+        elif version.since:
             range_spec = f"{version.since}..{version.head_sha}"
         else:
             range_spec = version.head_sha
@@ -442,6 +478,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
         superseded = ""
         superseded_tag_kept = False
+        hotfix = ""
         with _git_ssh_env(self.private_key) as env:
             _configure_git_identity(
                 repo_path, self.git_user_name, self.git_user_email, env=env
@@ -450,7 +487,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 _configure_https_auth(repo_path, token, env=env)
 
             if action == "create" and commit_hash:
-                head_sha, since = self._create_hotfix(
+                head_sha, since, hotfix = self._create_hotfix(
                     repo_path, version_str, commit_hash, env=env
                 )
             elif action == "create":
@@ -468,8 +505,8 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 since = ""
 
         metadata = {"version": version_str, "action": action}
-        if action == "create" and commit_hash:
-            metadata["hotfix"] = commit_hash
+        if hotfix:
+            metadata["hotfix"] = hotfix
         if superseded:
             metadata["superseded"] = superseded
             metadata["superseded_tag"] = "kept" if superseded_tag_kept else "deleted"
@@ -483,6 +520,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 # A freshly created release is, by definition, the one now in
                 # flight; finishing or abandoning clears it.
                 in_flight=version_str if action == "create" else "",
+                hotfix=hotfix,
             ),
             metadata,
         )
@@ -664,11 +702,12 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         commit_hash: str,
         *,
         env: dict[str, str],
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, str]:
         """Cut *version* as production plus *commit_hash*.
 
-        Returns ``(tag_sha, since_ref)``: the cherry-picked commit that was
-        tagged, and the production release it was cut from.
+        Returns ``(tag_sha, since_ref, commit_sha)``: the cherry-picked commit
+        that was tagged, the production release it was cut from, and the full
+        SHA of the commit that was picked.
 
         A hotfix cannot be cut from the tracked branch the way a normal release
         is.  That branch almost always holds unreleased work, and the fix is
@@ -688,6 +727,23 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         branch_name = f"releases/{version}"
         _run(["git", "fetch", "origin", self.branch, "--tags"], cwd=repo_path, env=env)
 
+        commit_sha = _resolve_commit(repo_path, commit_hash, env=env)
+        # The request is spent whether or not this cut succeeds.  Left behind,
+        # a refused or failed request would make every later check offer this
+        # hotfix again instead of a normal release.
+        with suppress(subprocess.CalledProcessError):
+            _run(
+                [
+                    "git",
+                    "push",
+                    "origin",
+                    "--delete",
+                    f"refs/tags/{HOTFIX_TAG_PREFIX}{commit_sha}",
+                ],
+                cwd=repo_path,
+                env=env,
+            )
+
         in_flight = _get_in_flight_release_version(repo_path, env=env)
         if in_flight and in_flight != version:
             msg = (
@@ -696,7 +752,6 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             )
             raise RuntimeError(msg)
 
-        commit_sha = _resolve_commit(repo_path, commit_hash, env=env)
         tags = _get_release_tags(repo_path, env=env)
         prior_tags = [tag for tag in tags if tag != version]
         if not prior_tags:
@@ -720,7 +775,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                     f"hotfix of {commit_sha}. Refusing to overwrite it."
                 )
                 raise RuntimeError(msg)
-            return tag_sha, base_tag
+            return tag_sha, base_tag, commit_sha
         if in_flight == version:
             self._clear_partial_cut(repo_path, version, env=env)
 
@@ -778,7 +833,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         self._commit_and_push_cut(
             repo_path, version, branch_name, tag_sha, commits, env=env
         )
-        return tag_sha, base_tag
+        return tag_sha, base_tag, commit_sha
 
     def _production_commit(
         self, repo_path: Path, release_tag: str, *, env: dict[str, str]
@@ -1259,6 +1314,31 @@ def _get_in_flight_release_version(
     if not versions:
         return None
     return sorted(versions, key=_parse_version_tuple)[-1]
+
+
+def _pending_hotfix_request(repo_path: Path, *, env: dict[str, str]) -> str | None:
+    """Return the commit SHA of the newest pending hotfix request, or None.
+
+    Tags under ``hotfix/`` whose name is not a full SHA are ignored:
+    ``action=create`` deletes a request by that name, so it could never
+    consume one of those and check would offer it forever.
+    """
+    output = _run(
+        [
+            "git",
+            "for-each-ref",
+            "--sort=-creatordate",
+            "--format=%(refname:strip=2)",
+            f"refs/tags/{HOTFIX_TAG_PREFIX}",
+        ],
+        cwd=repo_path,
+        env=env,
+    )
+    for name in output.splitlines():
+        match = HOTFIX_REQUEST_PATTERN.match(name.strip())
+        if match:
+            return match.group(1)
+    return None
 
 
 def _remote_branch_exists(
