@@ -1,7 +1,7 @@
 FROM python:3.14-slim
 
 # Bring in the uv binary from the official uv image
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:latest@sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6 /uv /uvx /usr/local/bin/
 
 # Install curl and the Pulumi CLI
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
