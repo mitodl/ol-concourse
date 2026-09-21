@@ -1966,21 +1966,40 @@ def test_publish_new_version_abandon_refuses_a_finished_release(mock_run, tmp_pa
     )
 
 
-def _abandon_run_stub(version_str: str, calls: list[list[str]], *, in_flight: bool):
+def _abandon_run_stub(
+    version_str: str,
+    calls: list[list[str]],
+    *,
+    in_flight: bool,
+    tag_delete_fails: bool = False,
+):
     """Build an `_run` side effect for an abandon of *version_str*.
 
-    *in_flight* controls whether `releases/<version>` is reported on the
-    remote.  The tag is always reported, since that is the state both guards
-    turn on.
+    Models the remote: `in_flight` controls whether `releases/<version>` is
+    listed to begin with, the tag always is, and a ref stops being listed once
+    its deletion has been pushed.  That last part is what lets the ordering
+    and half-done cases be told apart at all.
+
+    With *tag_delete_fails* the tag's deletion push raises and the tag stays
+    on the remote, which is the case that must not go on to delete the branch.
     """
     branch_line = f"brnchsha01{'0' * 30}\trefs/heads/releases/{version_str}\n"
+    tag_line = f"tagsha0011{'0' * 30}\trefs/tags/{version_str}\n"
+    deleted: set[str] = set()
 
     def track_run(cmd, **kw):
         calls.append(list(cmd))
+        if "push" in cmd and "--delete" in cmd:
+            ref = cmd[-1]
+            if tag_delete_fails and ref.startswith("refs/tags/"):
+                raise subprocess.CalledProcessError(1, cmd, "", "remote rejected")
+            deleted.add(ref)
+            return ""
         if "ls-remote" in cmd and "--heads" in cmd:
-            return branch_line if in_flight else ""
+            gone = f"releases/{version_str}" in deleted
+            return "" if (not in_flight or gone) else branch_line
         if "ls-remote" in cmd and "--tags" in cmd:
-            return f"tagsha0011{'0' * 30}\trefs/tags/{version_str}\n"
+            return "" if f"refs/tags/{version_str}" in deleted else tag_line
         if "rev-parse" in cmd:
             return "mainshaa1" * 5
         return ""
@@ -2065,6 +2084,32 @@ def test_publish_new_version_abandon_deletes_the_tag_before_the_branch(
     deletes = [" ".join(c) for c in calls if "push" in c and "--delete" in c]
     assert f"refs/tags/{version_str}" in deletes[0]
     assert f"releases/{version_str}" in deletes[1]
+
+
+@patch("concourse.ReleaseResource._reached_production", return_value=False)
+@patch("concourse._run")
+def test_publish_new_version_abandon_keeps_the_branch_when_the_tag_survives(
+    mock_run, _mock_reached, tmp_path
+):
+    """A tag deletion that fails must not be followed by a branch deletion.
+
+    Deleting a ref is best-effort so an already-absent one is not an error,
+    which on its own would let the branch go while the tag stayed -- the one
+    state `abandon` refuses, and one no retry could clear.
+    """
+    version_str = "2026.4.14.1"
+    calls: list[list[str]] = []
+    mock_run.side_effect = _abandon_run_stub(
+        version_str, calls, in_flight=True, tag_delete_fails=True
+    )
+
+    with pytest.raises(RuntimeError, match="left in place"):
+        _abandon_a_release(make_resource(), tmp_path, version_str)
+
+    deletes = [" ".join(c) for c in calls if "push" in c and "--delete" in c]
+    assert not any(f"releases/{version_str}" in d for d in deletes), (
+        "The branch must survive a tag deletion that did not take"
+    )
 
 
 @patch("concourse._run")

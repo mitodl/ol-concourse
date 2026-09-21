@@ -1011,30 +1011,39 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         reached production — its tag is the only marker of what is running
         there, so it must outlive the branch.
 
-        Deletions are best-effort: a ``CalledProcessError`` from either push is
-        silenced so the operation is idempotent — abandoning an already-abandoned
-        release (or one where the branch/tag was already deleted) is safe.
+        Deleting a ref is best-effort: a ``CalledProcessError`` from the push
+        is silenced so the operation is idempotent — abandoning an
+        already-abandoned release (or one where the branch/tag was already
+        deleted) is safe.
 
         This is the primitive.  An abandon an operator asked for goes through
         :meth:`_abandon_requested_release`, which decides what may be deleted.
+
+        :raises RuntimeError: If the tag was meant to go and is still on the
+            remote afterwards.  The branch is then left alone, because the
+            alternative state cannot be retried out of.
         """
         branch_name = f"releases/{version}"
         _run(["git", "fetch", "origin", "--tags"], cwd=repo_path, env=env)
-        # Tag before branch.  Both pushes are best-effort, so either can be the
-        # one that fails, and a half-done abandon has to stay retryable.
-        # Branch gone with the tag still present is the one state
-        # _abandon_requested_release refuses, so the branch is the survivor to
-        # leave behind: a retry then sees a release still in flight and
-        # finishes the job.
-        refs = [f"refs/tags/{version}"] if delete_tag else []
-        refs.append(branch_name)
-        for ref in refs:
-            with suppress(subprocess.CalledProcessError):
-                _run(
-                    ["git", "push", "origin", "--delete", ref],
-                    cwd=repo_path,
-                    env=env,
+        # Tag first, and the branch only once the tag is confirmed gone.
+        # Deleting a ref is best-effort so that an already-absent one is not an
+        # error, which on its own would let a *failed* tag deletion be followed
+        # by a successful branch deletion -- leaving exactly the
+        # branch-gone-with-tag-present state _abandon_requested_release
+        # refuses, which no retry could ever clear.  Stopping here instead
+        # leaves both refs in place, so the release is still in flight and the
+        # abandon can simply be run again.
+        if delete_tag:
+            _delete_remote_ref(repo_path, f"refs/tags/{version}", env=env)
+            if _remote_tag_exists(repo_path, version, env=env):
+                msg = (
+                    f"Could not delete the {version} tag from the remote, so "
+                    f"{branch_name} has been left in place. With the branch "
+                    "gone and the tag still there, every retry of this abandon "
+                    "would be refused."
                 )
+                raise RuntimeError(msg)
+        _delete_remote_ref(repo_path, branch_name, env=env)
         return _run(
             ["git", "rev-parse", f"origin/{self.branch}"],
             cwd=repo_path,
@@ -1424,6 +1433,16 @@ def _remote_branch_exists(
         env=env,
     )
     return bool(output.strip())
+
+
+def _delete_remote_ref(repo_path: Path, ref: str, *, env: dict[str, str]) -> None:
+    """Delete *ref* from ``origin``, tolerating one that is already gone."""
+    with suppress(subprocess.CalledProcessError):
+        _run(
+            ["git", "push", "origin", "--delete", ref],
+            cwd=repo_path,
+            env=env,
+        )
 
 
 def _remote_tag_exists(repo_path: Path, tag: str, *, env: dict[str, str]) -> bool:

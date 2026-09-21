@@ -282,9 +282,13 @@ whose `action: finish` then failed is still in flight, so it is the branch-and-
 tag-present row, and it keeps its tag. The put metadata reports `abandoned_tag`
 as `kept` or `deleted`.
 
-The tag is deleted before the branch. Both deletions are best-effort, so either
-can be the one that fails, and branch-gone-with-tag-present is the state that is
-refused: leaving the branch as the survivor keeps a half-done abandon retryable.
+The tag is deleted before the branch, and the branch only once the tag is
+confirmed gone. Deleting a ref tolerates one that is already absent, so that
+abandoning an already-abandoned release stays a no-op; on its own that would
+also let a *failed* tag deletion be followed by a successful branch deletion,
+leaving the refused row above with no way to retry out of it. A tag still on
+the remote after its deletion fails the put instead, with both refs in place,
+so the abandon can simply be run again.
 
 ### Parameters
 
