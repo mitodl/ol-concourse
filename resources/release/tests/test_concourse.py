@@ -1923,6 +1923,196 @@ def test_publish_new_version_abandon_idempotent(mock_run, tmp_path):
 
 
 @patch("concourse._run")
+def test_publish_new_version_abandon_refuses_a_finished_release(mock_run, tmp_path):
+    """Abandon refuses a version whose branch is gone but whose tag remains.
+
+    An abandon job binds whatever version of the resource is latest, and after
+    `action=finish` publishes one that is a release live in production.
+    Deleting its tag would strand what production runs, and the best-effort
+    deletes would report success while doing it.
+    """
+    version_str = "2026.4.14.1"
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir()
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir()
+
+    calls: list[list[str]] = []
+
+    def track_run(cmd, **kw):
+        calls.append(list(cmd))
+        if "ls-remote" in cmd and "--heads" in cmd:
+            return ""  # releases/<version> deleted by action=finish
+        if "ls-remote" in cmd and "--tags" in cmd:
+            return f"tagsha0011{'0' * 30}\trefs/tags/{version_str}\n"
+        if "rev-parse" in cmd:
+            return "mainshaa1" * 5
+        return ""
+
+    mock_run.side_effect = track_run
+
+    resource = make_resource()
+    with pytest.raises(RuntimeError, match="not in flight"):
+        resource.publish_new_version(
+            tmp_path,
+            MagicMock(),
+            action="abandon",
+            repo_dir="app-source",
+            version_file="release/version",
+        )
+
+    assert not [c for c in calls if "push" in c and "--delete" in c], (
+        "Nothing may be deleted once the refusal fires"
+    )
+
+
+def _abandon_run_stub(
+    version_str: str,
+    calls: list[list[str]],
+    *,
+    in_flight: bool,
+    tag_delete_fails: bool = False,
+):
+    """Build an `_run` side effect for an abandon of *version_str*.
+
+    Models the remote: `in_flight` controls whether `releases/<version>` is
+    listed to begin with, the tag always is, and a ref stops being listed once
+    its deletion has been pushed.  That last part is what lets the ordering
+    and half-done cases be told apart at all.
+
+    With *tag_delete_fails* the tag's deletion push raises and the tag stays
+    on the remote, which is the case that must not go on to delete the branch.
+    """
+    branch_line = f"brnchsha01{'0' * 30}\trefs/heads/releases/{version_str}\n"
+    tag_line = f"tagsha0011{'0' * 30}\trefs/tags/{version_str}\n"
+    deleted: set[str] = set()
+
+    def track_run(cmd, **kw):
+        calls.append(list(cmd))
+        if "push" in cmd and "--delete" in cmd:
+            ref = cmd[-1]
+            if tag_delete_fails and ref.startswith("refs/tags/"):
+                raise subprocess.CalledProcessError(1, cmd, "", "remote rejected")
+            deleted.add(ref)
+            return ""
+        if "ls-remote" in cmd and "--heads" in cmd:
+            gone = f"releases/{version_str}" in deleted
+            return "" if (not in_flight or gone) else branch_line
+        if "ls-remote" in cmd and "--tags" in cmd:
+            return "" if f"refs/tags/{version_str}" in deleted else tag_line
+        if "rev-parse" in cmd:
+            return "mainshaa1" * 5
+        return ""
+
+    return track_run
+
+
+def _abandon_a_release(resource, tmp_path, version_str):
+    version_file = tmp_path / "release" / "version"
+    version_file.parent.mkdir(exist_ok=True)
+    version_file.write_text(version_str)
+    (tmp_path / "app-source").mkdir(exist_ok=True)
+    return resource.publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="abandon",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+
+@patch("concourse.ReleaseResource._reached_production", return_value=False)
+@patch("concourse._run")
+def test_publish_new_version_abandon_deletes_both_refs_when_not_shipped(
+    mock_run, _mock_reached, tmp_path
+):
+    """An in-flight release that never shipped loses its branch and its tag."""
+    version_str = "2026.4.14.1"
+    calls: list[list[str]] = []
+    mock_run.side_effect = _abandon_run_stub(version_str, calls, in_flight=True)
+
+    _version, metadata = _abandon_a_release(make_resource(), tmp_path, version_str)
+
+    deleted_refs = {" ".join(c) for c in calls if "push" in c and "--delete" in c}
+    assert any(f"releases/{version_str}" in r for r in deleted_refs)
+    assert any(f"refs/tags/{version_str}" in r for r in deleted_refs)
+    assert metadata["abandoned_tag"] == "deleted"
+
+
+@patch("concourse.ReleaseResource._reached_production", return_value=True)
+@patch("concourse._run")
+def test_publish_new_version_abandon_keeps_the_tag_of_a_shipped_release(
+    mock_run, _mock_reached, tmp_path
+):
+    """A release that shipped but never finished keeps its tag.
+
+    Its production deploy succeeded and only `action: finish` failed, so it is
+    still in flight and the branch goes, but the tag is what production runs
+    from -- exactly how `_supersede_in_flight_release` treats the same state.
+    """
+    version_str = "2026.4.14.1"
+    calls: list[list[str]] = []
+    mock_run.side_effect = _abandon_run_stub(version_str, calls, in_flight=True)
+
+    _version, metadata = _abandon_a_release(make_resource(), tmp_path, version_str)
+
+    deleted_refs = {" ".join(c) for c in calls if "push" in c and "--delete" in c}
+    assert any(f"releases/{version_str}" in r for r in deleted_refs)
+    assert not any(f"refs/tags/{version_str}" in r for r in deleted_refs), (
+        "The tag of a release that reached production must survive the abandon"
+    )
+    assert metadata["abandoned_tag"] == "kept"
+
+
+@patch("concourse.ReleaseResource._reached_production", return_value=False)
+@patch("concourse._run")
+def test_publish_new_version_abandon_deletes_the_tag_before_the_branch(
+    mock_run, _mock_reached, tmp_path
+):
+    """Tag first, so a half-done abandon leaves the retryable state behind.
+
+    Both pushes are best-effort, so either can be the one that fails.  If the
+    branch went first and the tag delete failed, the leftover state would be
+    the one the guard refuses, and the abandon could never be retried.
+    """
+    version_str = "2026.4.14.1"
+    calls: list[list[str]] = []
+    mock_run.side_effect = _abandon_run_stub(version_str, calls, in_flight=True)
+
+    _abandon_a_release(make_resource(), tmp_path, version_str)
+
+    deletes = [" ".join(c) for c in calls if "push" in c and "--delete" in c]
+    assert f"refs/tags/{version_str}" in deletes[0]
+    assert f"releases/{version_str}" in deletes[1]
+
+
+@patch("concourse.ReleaseResource._reached_production", return_value=False)
+@patch("concourse._run")
+def test_publish_new_version_abandon_keeps_the_branch_when_the_tag_survives(
+    mock_run, _mock_reached, tmp_path
+):
+    """A tag deletion that fails must not be followed by a branch deletion.
+
+    Deleting a ref is best-effort so an already-absent one is not an error,
+    which on its own would let the branch go while the tag stayed -- the one
+    state `abandon` refuses, and one no retry could clear.
+    """
+    version_str = "2026.4.14.1"
+    calls: list[list[str]] = []
+    mock_run.side_effect = _abandon_run_stub(
+        version_str, calls, in_flight=True, tag_delete_fails=True
+    )
+
+    with pytest.raises(RuntimeError, match="left in place"):
+        _abandon_a_release(make_resource(), tmp_path, version_str)
+
+    deletes = [" ".join(c) for c in calls if "push" in c and "--delete" in c]
+    assert not any(f"releases/{version_str}" in d for d in deletes), (
+        "The branch must survive a tag deletion that did not take"
+    )
+
+
+@patch("concourse._run")
 def test_publish_new_version_invalid_action_includes_abandon(mock_run, tmp_path):
     """Error message for invalid action mentions all three valid actions."""
     version_file = tmp_path / "release" / "version"

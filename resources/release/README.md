@@ -23,8 +23,9 @@ resource_types:
 resources:
   - name: app-release
     type: release
-    check_every: never          # triggered via webhook from the release bot
-    webhook_token: ((release.webhook_token))
+    check_every: never          # checked on demand, not polled
+    webhook_token: ((release.webhook_token))   # optional; the release bot
+                                               # checks over the API instead
     source:
       uri: git@github.com:mitodl/my-app.git
       branch: main              # default: main
@@ -255,22 +256,83 @@ finished (or abandoned), so this returns the current tip of the tracked branch
 instead of failing. Callers should therefore **not** wrap this put in a `try` —
 an error raised here means a real, unfinished release.
 
+### `action: abandon`
+
+Cancels a release that was cut but never finished: deletes the
+`releases/YYYY.MM.DD.N` branch and the version tag from the remote, so the next
+`check` sees nothing in flight and recomputes the next version normally.
+
+An abandon job cannot bind only a release that is in flight. A `put` publishes
+a version of this resource, and a job that gets it with no `passed` takes
+whichever version is latest, so what this action is handed may not be the
+release the operator has in mind. Two guards follow, both of them about the
+tag, which is the only thing tying what production runs back to a commit:
+
+| `releases/<version>` | `<version>` tag | What that is | Result |
+|---|---|---|---|
+| present | present | in flight | branch deleted; tag deleted only if the release never reached production |
+| present | absent | a partially-created cut (the branch is pushed before the tag) | branch deleted |
+| absent | present | nothing to cancel, most likely a release that was finished | **refused** |
+| absent | absent | already abandoned | no-op |
+
+"Reached production" is the same `production_environment` deployment lookup
+`create` uses when superseding, and errs the same way: an answer that cannot be
+established keeps the tag. A release whose production deploy succeeded and
+whose `action: finish` then failed is still in flight, so it is the branch-and-
+tag-present row, and it keeps its tag. The put metadata reports `abandoned_tag`
+as `kept` or `deleted`.
+
+The tag is deleted before the branch, and the branch only once the tag is
+confirmed gone. Deleting a ref tolerates one that is already absent, so that
+abandoning an already-abandoned release stays a no-op; on its own that would
+also let a *failed* tag deletion be followed by a successful branch deletion,
+leaving the refused row above with no way to retry out of it. A tag still on
+the remote after its deletion fails the put instead, with both refs in place,
+so the abandon can simply be run again.
+
 ### Parameters
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `action` | Yes | `"create"` or `"finish"` |
+| `action` | Yes | `"create"`, `"finish"`, or `"abandon"` |
 | `repo_dir` | Yes | Name of the workspace directory containing the checked-out repo |
 | `version_file` | Yes | Path to the `version` file (relative to workspace root), e.g. `release/version` |
 | `commit_hash` | No | Commit SHA to cherry-pick (`create` only; hotfix support) |
 
+### The create job must not trigger on this resource
+
+A `put` publishes a version of the resource, and Concourse schedules on a
+version it has not seen before whether that version came from a check or from a
+put. A create job that also carries `get: app-release` with `trigger: true` is
+therefore re-triggered by its own `action: create` put, by the production job's
+`action: finish` put, and by `action: abandon`, each time carrying the version
+that was just released:
+
+- `create`: the cut no-ops, since the tag already points at the commit being
+  released, but the job still rebuilds and re-pushes the image. A digest that
+  differs from the first build carries the release back through the deploy
+  chain.
+- `finish`: fails, because the release branch has been merged back and the
+  commit a re-cut would tag is now the merge commit (`Tag X already exists at
+  <sha>, which does not match the commit being released`).
+- `abandon`: deletes the branch and the tag, so the re-cut finds no tag,
+  succeeds, and resurrects the release that was just abandoned.
+
+Start the create job by triggering the job itself (the Slack release bot checks
+the resource over the API and then posts to the job's `builds` endpoint) and
+leave the `get` untriggered, as below. If a release has to start from a version
+appearing instead, the watched resource needs a real `check_every` or a webhook,
+and the puts have to go elsewhere: a second resource whose `source` differs from
+the watched one, so a cluster running with global resources enabled does not
+give the two a shared version stream.
+
 ### Example pipeline
 
 ```yaml
-# create-release job (triggered via check webhook by the Slack release bot)
+# create-release job (triggered by the Slack release bot after it checks
+# app-release; see the section above for why the get is not a trigger)
 plan:
   - get: app-release          # in: writes version, checklist.md, changelog_entry.md
-    trigger: true
   - get: app-source
   - task: bump-version        # bump_version_task() from pipeline_lib
   - put: app-release
