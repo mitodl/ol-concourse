@@ -256,11 +256,41 @@ finished (or abandoned), so this returns the current tip of the tracked branch
 instead of failing. Callers should therefore **not** wrap this put in a `try` —
 an error raised here means a real, unfinished release.
 
+### `action: abandon`
+
+Cancels a release that was cut but never finished: deletes the
+`releases/YYYY.MM.DD.N` branch and the version tag from the remote, so the next
+`check` sees nothing in flight and recomputes the next version normally.
+
+An abandon job cannot bind only a release that is in flight. A `put` publishes
+a version of this resource, and a job that gets it with no `passed` takes
+whichever version is latest, so what this action is handed may not be the
+release the operator has in mind. Two guards follow, both of them about the
+tag, which is the only thing tying what production runs back to a commit:
+
+| `releases/<version>` | `<version>` tag | What that is | Result |
+|---|---|---|---|
+| present | present | in flight | branch deleted; tag deleted only if the release never reached production |
+| present | absent | a partially-created cut (the branch is pushed before the tag) | branch deleted |
+| absent | present | nothing to cancel, most likely a release that was finished | **refused** |
+| absent | absent | already abandoned | no-op |
+
+"Reached production" is the same `production_environment` deployment lookup
+`create` uses when superseding, and errs the same way: an answer that cannot be
+established keeps the tag. A release whose production deploy succeeded and
+whose `action: finish` then failed is still in flight, so it is the branch-and-
+tag-present row, and it keeps its tag. The put metadata reports `abandoned_tag`
+as `kept` or `deleted`.
+
+The tag is deleted before the branch. Both deletions are best-effort, so either
+can be the one that fails, and branch-gone-with-tag-present is the state that is
+refused: leaving the branch as the survivor keeps a half-done abandon retryable.
+
 ### Parameters
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `action` | Yes | `"create"` or `"finish"` |
+| `action` | Yes | `"create"`, `"finish"`, or `"abandon"` |
 | `repo_dir` | Yes | Name of the workspace directory containing the checked-out repo |
 | `version_file` | Yes | Path to the `version` file (relative to workspace root), e.g. `release/version` |
 | `commit_hash` | No | Commit SHA to cherry-pick (`create` only; hotfix support) |

@@ -459,8 +459,11 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
           3. Push, then delete the release branch from the remote.
 
         action=abandon:
-          1. Delete the release branch and version tag from the remote.
-          2. Subsequent check calls will recompute the next version normally.
+          1. Refuse if nothing is in flight for the version but its tag is
+             still on the remote.
+          2. Delete the release branch, and the version tag unless the release
+             already reached production.
+          3. Subsequent check calls will recompute the next version normally.
 
         ``repo_dir`` is the path within the Concourse workspace to the
         checked-out git repository (i.e. the ``get`` output directory name).
@@ -478,6 +481,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
         superseded = ""
         superseded_tag_kept = False
+        abandoned_tag_kept = False
         hotfix = ""
         with _git_ssh_env(self.private_key) as env:
             _configure_git_identity(
@@ -501,10 +505,14 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 head_sha = self._finish_release(repo_path, version_str, env=env)
                 since = ""
             else:  # abandon
-                head_sha = self._abandon_release(repo_path, version_str, env=env)
+                head_sha, abandoned_tag_kept = self._abandon_requested_release(
+                    repo_path, version_str, env=env
+                )
                 since = ""
 
         metadata = {"version": version_str, "action": action}
+        if action == "abandon":
+            metadata["abandoned_tag"] = "kept" if abandoned_tag_kept else "deleted"
         if hotfix:
             metadata["hotfix"] = hotfix
         if superseded:
@@ -1006,12 +1014,20 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         Deletions are best-effort: a ``CalledProcessError`` from either push is
         silenced so the operation is idempotent — abandoning an already-abandoned
         release (or one where the branch/tag was already deleted) is safe.
+
+        This is the primitive.  An abandon an operator asked for goes through
+        :meth:`_abandon_requested_release`, which decides what may be deleted.
         """
         branch_name = f"releases/{version}"
         _run(["git", "fetch", "origin", "--tags"], cwd=repo_path, env=env)
-        refs = [branch_name]
-        if delete_tag:
-            refs.append(f"refs/tags/{version}")
+        # Tag before branch.  Both pushes are best-effort, so either can be the
+        # one that fails, and a half-done abandon has to stay retryable.
+        # Branch gone with the tag still present is the one state
+        # _abandon_requested_release refuses, so the branch is the survivor to
+        # leave behind: a retry then sees a release still in flight and
+        # finishes the job.
+        refs = [f"refs/tags/{version}"] if delete_tag else []
+        refs.append(branch_name)
         for ref in refs:
             with suppress(subprocess.CalledProcessError):
                 _run(
@@ -1024,6 +1040,48 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             cwd=repo_path,
             env=env,
         ).strip()
+
+    def _abandon_requested_release(
+        self, repo_path: Path, version: str, *, env: dict[str, str]
+    ) -> tuple[str, bool]:
+        """Abandon *version* on request, guarding what that is allowed to delete.
+
+        Returns ``(tracked_branch_sha, tag_kept)``.
+
+        An abandon job cannot bind only a release that is in flight.
+        ol-infrastructure's ``abandon-<app>-release`` gets this resource with
+        no ``passed``, so it takes whichever version is latest, and every
+        ``put`` publishes one.  The version handed to this action may therefore
+        not be the release the operator has in mind, and the tag is the only
+        thing tying what production runs back to a commit.
+
+        So the tag is only ever deleted for a release that is in flight and
+        that never shipped, which is the same distinction
+        :meth:`_supersede_in_flight_release` draws before it deletes anything.
+        A release whose production deploy succeeded and whose ``action=finish``
+        then failed is still in flight, and keeps its tag.
+
+        :raises RuntimeError: If nothing is in flight for *version* while its
+            tag is still on the remote.  There is no release to cancel, so the
+            request was made against the wrong version.
+        """
+        _run(["git", "fetch", "origin", "--tags"], cwd=repo_path, env=env)
+        branch_name = f"releases/{version}"
+        in_flight = _remote_branch_exists(repo_path, branch_name, env=env)
+        if not in_flight and _remote_tag_exists(repo_path, version, env=env):
+            msg = (
+                f"Refusing to abandon {version!r}: it is not in flight. "
+                f"{branch_name} is gone from the remote while the {version} "
+                "tag is still there, so there is no release to cancel -- most "
+                "likely this release was finished, and its tag is the only "
+                "thing tying what production runs back to a commit."
+            )
+            raise RuntimeError(msg)
+        tag_kept = in_flight and self._reached_production(version)
+        head_sha = self._abandon_release(
+            repo_path, version, env=env, delete_tag=not tag_kept
+        )
+        return head_sha, tag_kept
 
     def _clear_partial_cut(
         self, repo_path: Path, version: str, *, env: dict[str, str]
@@ -1362,6 +1420,21 @@ def _remote_branch_exists(
     """Return True if *branch_name* exists on the ``origin`` remote."""
     output = _run(
         ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch_name}"],
+        cwd=repo_path,
+        env=env,
+    )
+    return bool(output.strip())
+
+
+def _remote_tag_exists(repo_path: Path, tag: str, *, env: dict[str, str]) -> bool:
+    """Return True if *tag* exists on the ``origin`` remote.
+
+    Asks the remote rather than the local tag list, which ``git fetch --tags``
+    adds to but never prunes: a tag deleted on the remote lingers in the
+    workspace checkout indefinitely.
+    """
+    output = _run(
+        ["git", "ls-remote", "--tags", "origin", f"refs/tags/{tag}"],
         cwd=repo_path,
         env=env,
     )
