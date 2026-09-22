@@ -32,7 +32,11 @@ def git_repo(  # noqa: PLR0913
         resource's default), ``tags`` or ``branches``. Pass ``tags`` to version
         on tags rather than commits; ``tag_regex`` on its own does not do that,
         and under ``tags`` both ``branch`` and ``paths`` stop being consulted.
-        See :class:`~ol_concourse.lib.models.resource.Git`.
+        Only ``commits`` supports a put: the resource exits 1 on ``out`` for
+        ``tags`` and ``branches``, so a resource something pushes to has to stay
+        on the default, and a ``branches`` get yields a ``branches.json``
+        listing rather than a checkout. Those failures land at run time, not at
+        set-pipeline. See :class:`~ol_concourse.lib.models.resource.Git`.
     :returns: A configured Concourse git resource.
     """
     return Resource(

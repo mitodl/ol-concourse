@@ -16,6 +16,14 @@ class Git(BaseModel):
     both ignored, so a matching tag anywhere in the repo produces a version
     whether or not those paths changed. Setting ``tag_regex`` alone does not
     switch it -- the resource's ``check`` dispatches on ``version_type``.
+
+    The three values are not interchangeable beyond that, and the differences
+    only surface at run time. ``out`` exits 1 for both ``tags`` and
+    ``branches``, so a resource that anything ``put``s to has to stay on
+    ``commits``; switching a bidirectional resource over breaks the put step,
+    not the set-pipeline. A ``branches`` ``get`` also writes only a
+    ``branches.json`` listing into the destination, never a checkout, so steps
+    downstream of it have no working tree to read.
     """
 
     uri: str
