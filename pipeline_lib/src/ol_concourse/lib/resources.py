@@ -15,6 +15,7 @@ def git_repo(  # noqa: PLR0913
     depth: int | None = None,
     fetch_tags: bool = False,
     tag_regex: str | None = None,
+    version_type: Literal["commits", "tags", "branches"] | None = None,
     **kwargs,
 ) -> Resource:
     """Generate a git resource for the given repository.
@@ -27,6 +28,11 @@ def git_repo(  # noqa: PLR0913
     :param depth: Shallow clone depth.
     :param fetch_tags: Whether to fetch git tags.
     :param tag_regex: Filter tags by regex when ``fetch_tags`` is true.
+    :param version_type: What to emit versions for -- ``commits`` (the
+        resource's default), ``tags`` or ``branches``. Pass ``tags`` to version
+        on tags rather than commits; ``tag_regex`` on its own does not do that,
+        and under ``tags`` both ``branch`` and ``paths`` stop being consulted.
+        See :class:`~ol_concourse.lib.models.resource.Git`.
     :returns: A configured Concourse git resource.
     """
     return Resource(
@@ -37,6 +43,7 @@ def git_repo(  # noqa: PLR0913
         source=Git(
             uri=uri,
             branch=branch,
+            version_type=version_type,
             paths=paths,
             version_depth=depth,
             fetch_tags=fetch_tags,
