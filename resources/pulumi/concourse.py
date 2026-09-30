@@ -473,9 +473,11 @@ def _render_summary(
         lines.extend(
             [
                 "",
-                f":rotating_light: **This update did not complete cleanly "
-                f"(`result={summary.get('result')}`, errored={errored}).** "
-                "Do not promote it.",
+                (
+                    f":rotating_light: **This update did not complete cleanly "
+                    f"(`result={summary.get('result')}`, errored={errored}).** "
+                    "Do not promote it."
+                ),
             ]
         )
 
@@ -532,12 +534,16 @@ def _render_preview(
         "",
         f"## Promoting this will apply to{target}",
         "",
-        f"A `pulumi preview` run against the next environment at the time of "
-        f"[this build]({taken}).",
+        (
+            f"A `pulumi preview` run against the next environment at the time of "
+            f"[this build]({taken})."
+        ),
         "",
-        ":hourglass: **This is a prediction, not a guarantee.** It was taken when "
-        "this issue was opened; if the gate sits open, drift or other merges can "
-        "change what actually applies.",
+        (
+            ":hourglass: **This is a prediction, not a guarantee.** It was taken "
+            "when this issue was opened; if the gate sits open, drift or other "
+            "merges can change what actually applies."
+        ),
         "",
         # ★ Closing an issue is an untyped signal: Concourse emits a version of
         # the ISSUE resource, not of git, so a gate cannot bind to the revision
@@ -556,17 +562,21 @@ def _render_preview(
             # while this gate is open, closing it deploys the newer one. Naming
             # the revision is the cheapest honest defence -- a reviewer can
             # compare it against the branch head before closing.
-            f"Previewed from {revisions}. **If that is not the current head, "
-            "close this gate only after checking the newer preview** -- "
-            "approval is not bound to a revision.",
+            (
+                f"Previewed from {revisions}. **If that is not the current head, "
+                "close this gate only after checking the newer preview** -- "
+                "approval is not bound to a revision."
+            ),
             "",
         ]
 
     if not _preview_has_material_changes(summary):
         lines.extend(
             [
-                ":white_check_mark: No changes -- the next environment is already "
-                "in the state this deploy produced.",
+                (
+                    ":white_check_mark: No changes -- the next environment is "
+                    "already in the state this deploy produced."
+                ),
                 "",
             ]
         )
@@ -655,7 +665,9 @@ def _render_changes(events: list[dict[str, Any]], total: int = 0) -> list[str]:
     lines = ["", "### What changed", ""]
     # Ordered so the destructive ops a reviewer most needs to see come first,
     # then anything Pulumi reports that this list does not anticipate.
-    ordered = [op for op in ("delete", "replace", "create", "update") if op in by_op]
+    ordered: list[str] = [
+        op for op in ("delete", "replace", "create", "update") if op in by_op
+    ]
     ordered += sorted(set(by_op) - set(ordered))
 
     for op in ordered:
