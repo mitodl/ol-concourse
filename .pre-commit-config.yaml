@@ -25,7 +25,7 @@ repos:
     args: [-f, parsable, -d, relaxed]
 
 - repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: v0.15.12
+  rev: v0.16.7
   hooks:
   - id: ruff-format
   - id: ruff
