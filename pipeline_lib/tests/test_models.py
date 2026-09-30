@@ -40,6 +40,7 @@ from ol_concourse.lib.resource_types import (
     release_resource_type,
 )
 from ol_concourse.lib.resources import (
+    git_repo,
     github_deployment,
     github_issues,
     release_resource,
@@ -343,6 +344,32 @@ class TestGitModel:
             paths=["src/"],
         )
         assert git.branch == "develop"
+
+    def test_version_type_is_unset_by_default(self):
+        """The resource defaults to ``commits`` itself, so emitting nothing
+        keeps an existing pipeline's source dict byte-identical.
+        """
+        git = Git(uri="https://github.com/org/repo")
+        assert git.version_type is None
+        assert "version_type" not in git.model_dump(exclude_none=True)
+
+    def test_version_type_rejects_an_unknown_value(self):
+        """The resource's ``check`` hard-fails on an unknown source key or
+        value, so a typo has to fail here rather than at pipeline runtime.
+        """
+        with pytest.raises(ValidationError):
+            Git(uri="https://github.com/org/repo", version_type="tag")
+
+    def test_version_type_tags_is_carried_into_the_source(self):
+        resource = git_repo(
+            name=Identifier("some-repo"),
+            uri="https://github.com/org/repo",
+            version_type="tags",
+            fetch_tags=True,
+            tag_regex=r"^\d+\.\d+\.\d+$",
+        )
+        assert resource.source["version_type"] == "tags"
+        assert resource.source["tag_regex"] == r"^\d+\.\d+\.\d+$"
 
 
 class TestPipelineSerialization:
