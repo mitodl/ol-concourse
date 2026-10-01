@@ -177,8 +177,7 @@ class NPMResource(ConcourseResource):
         registry_host = self.registry.removeprefix("https:").removeprefix("http:")
         npmrc_path = pkg_path / ".npmrc"
         npmrc_content = (
-            f"registry={self.registry}/\n"
-            f"{registry_host}/:_authToken={self.token}\n"
+            f"registry={self.registry}/\n{registry_host}/:_authToken={self.token}\n"
         )
         npmrc_path.write_text(npmrc_content)
 

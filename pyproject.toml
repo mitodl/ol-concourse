@@ -5,9 +5,10 @@ package = false
 members = ["pipeline_lib", "resources/*"]
 
 [dependency-groups]
+prek = ["prek==0.5.3"]
 dev = [
     "concoursetools>=0.8.0,<0.9",
-    "pre-commit>=4.0.0,<5",
+    { include-group = "prek" },
     "ruff>=0.14.0",
     "mypy>=1.0",
     "pytest>=9.0.3,<10",

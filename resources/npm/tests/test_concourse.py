@@ -239,6 +239,7 @@ def test_publish_new_version_npmrc_content(resource, tmp_path):
         if npmrc.exists():
             captured_npmrc.append(npmrc.read_text())
         from unittest.mock import MagicMock
+
         m = MagicMock()
         m.stdout = ""
         return m
@@ -272,7 +273,7 @@ def test_fetch_new_versions_numeric_prerelease_is_not_newer_than_final(resource)
         "name": PACKAGE_NAME,
         "versions": {
             "1.0.0": {},
-            "1.0.0-0": {},   # canary / pre-release published by semantic-release
+            "1.0.0-0": {},  # canary / pre-release published by semantic-release
         },
     }
     resp_lib.add(resp_lib.GET, f"{REGISTRY}/{PACKAGE_NAME}", json=metadata)
