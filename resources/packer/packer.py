@@ -24,6 +24,14 @@ def _log_pretty(value: Any) -> None:
 # =============================================================================
 
 
+def _redact_packer_args(args: list[str]) -> list[str]:
+    """Mask variable values for logging without changing the executed arguments."""
+    return [
+        f"-var={arg.split('=', 2)[1]}=***" if arg.startswith("-var=") else arg
+        for arg in args
+    ]
+
+
 # =============================================================================
 # _parse_packer_machine_readable_output_line
 # =============================================================================
@@ -257,7 +265,7 @@ def validate(  # noqa: PLR0913
     # dump args on debug
     if debug:
         _log("validate args:")
-        _log_pretty(packer_command_args)
+        _log_pretty(_redact_packer_args(packer_command_args))
     # execute validate command
     _packer(
         "validate",
@@ -307,7 +315,7 @@ def build(  # noqa: PLR0913
     # dump args on debug
     if debug:
         _log("build args:")
-        _log_pretty(packer_command_args)
+        _log_pretty(_redact_packer_args(packer_command_args))
     # execute build command
     packer_command_result = _packer(
         "build", *packer_command_args, template_file_path, working_dir=working_dir_path
