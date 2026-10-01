@@ -5,7 +5,7 @@ package = false
 members = ["pipeline_lib", "resources/*"]
 
 [dependency-groups]
-prek = ["prek==0.5.4"]
+prek = ["prek==0.5.3"]
 dev = [
     "concoursetools>=0.8.0,<0.9",
     { include-group = "prek" },
