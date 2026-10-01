@@ -9,12 +9,13 @@ from io_utils import read_value_from_file
 
 
 def _log(message: str, **kwargs: Any) -> None:
-    print(message, file=sys.stderr, **kwargs)
+    print(message, file=sys.stderr, **kwargs)  # noqa: T201 -- the resource logs to stderr
 
 
 def _log_pretty(value: Any) -> None:
     pp = PrettyPrinter(stream=sys.stderr)
     pp.pprint(value)
+
 
 # =============================================================================
 #
@@ -172,7 +173,7 @@ def _packer(*args: str, working_dir=None) -> list[dict]:
                 # determine log level
                 log_level = "warning" if "fmt" in args else "info"
                 # directly log the output
-                b_log(f"global | ui | {log_level} | {line.rstrip()}")
+                _log(f"global | ui | {log_level} | {line.rstrip()}")
             else:
                 # parse the machine readable output as it arrives
                 parsed_line = _parse_packer_machine_readable_output_line(line)
@@ -255,8 +256,8 @@ def validate(  # noqa: PLR0913
         packer_command_args.append("-syntax-only")
     # dump args on debug
     if debug:
-        b_log("validate args:")
-        b_log_pretty(packer_command_args)
+        _log("validate args:")
+        _log_pretty(packer_command_args)
     # execute validate command
     _packer(
         "validate",
@@ -305,8 +306,8 @@ def build(  # noqa: PLR0913
         packer_command_args.append("-force")
     # dump args on debug
     if debug:
-        b_log("build args:")
-        b_log_pretty(packer_command_args)
+        _log("build args:")
+        _log_pretty(packer_command_args)
     # execute build command
     packer_command_result = _packer(
         "build", *packer_command_args, template_file_path, working_dir=working_dir_path

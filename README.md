@@ -32,8 +32,9 @@ This monorepo uses [uv](https://docs.astral.sh/uv/) for dependency and workspace
 # Install all workspace dependencies
 uv sync
 
-# Run pre-commit hooks
-uv run pre-commit run --all-files
+# Run prek hooks
+uv run prek install -f  # replaces an existing pre-commit git hook
+uv run prek run --all-files
 
 # Run tests for a specific package
 uv run --package ol-concourse-github-issues pytest resources/github-issues/tests/

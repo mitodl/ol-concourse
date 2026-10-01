@@ -25,8 +25,9 @@ uv run ruff check --fix .
 uv run ruff format .
 uv run mypy .
 
-# All pre-commit hooks (includes yamlfmt, yamllint, ruff, mypy, actionlint, shellcheck)
-uv run pre-commit run --all-files
+# All prek hooks (includes yamlfmt, yamllint, ruff, mypy, actionlint, shellcheck)
+uv run prek install -f  # replaces an existing pre-commit git hook
+uv run prek run --all-files
 ```
 
 ## Architecture
@@ -67,4 +68,4 @@ Each resource under `resources/` follows the [concoursetools](https://concourset
 - Resource source configs map directly to `__init__` parameters of the `ConcourseResource` subclass.
 - Tests in `**/tests/` may use `S101` (assert) and `S105` (hardcoded passwords) without ruff warnings — those rules are ignored there.
 - Each resource package builds with `hatchling`; the wheel includes only the specific source files listed in `[tool.hatch.build.targets.wheel]`.
-- YAML files are auto-formatted by `yamlfmt` (2-space mapping/sequence, 80-char width) — let pre-commit handle formatting rather than editing by hand.
+- YAML files are auto-formatted by `yamlfmt` (2-space mapping/sequence, 80-char width) — let prek handle formatting rather than editing by hand.

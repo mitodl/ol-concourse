@@ -35,6 +35,10 @@ repos:
   rev: v2.3.1
   hooks:
   - id: mypy
+    # Narrowed to pipeline_lib: the resource packages each ship a top-level
+    # concourse.py and tests/test_concourse.py, so mypy over the whole repo
+    # aborts on duplicate module names and checks nothing.
+    files: ^pipeline_lib/
     additional_dependencies: [pydantic>=2, types-requests]
 
 - repo: https://github.com/rhysd/actionlint
