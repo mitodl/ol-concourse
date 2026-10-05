@@ -681,8 +681,13 @@ def _stack_serial_group(project_name: str, stack_name: str) -> str:
     the `max_in_flight=1` that protected the single combined job, and lock
     recovery will NOT save us: `_is_recoverable_lock` only cancels locks older
     than 15 minutes, so a live preview's lock blocks a real deploy outright.
+
+    A Concourse identifier must start with a lowercase letter, so a name that
+    would not (a project named ``3d-app``) gets a ``stack-`` prefix. Every name
+    that was already valid is unchanged.
     """
-    return f"{project_name}-{stack_name}".lower().replace(".", "-")
+    group = f"{project_name}-{stack_name}".lower().replace(".", "-")
+    return group if group[:1].isalpha() and group[:1].isascii() else f"stack-{group}"
 
 
 def _dispatch_preview_gated(

@@ -1031,6 +1031,26 @@ class TestDeployChainedSerialGroups:
                 stack_serial_group(self.PROJECT, "Production")
             ]
 
+    @pytest.mark.parametrize(
+        ("project", "stack", "expected"),
+        [
+            # Already valid: unchanged, so existing groups keep their names.
+            ("ol-application-my-app", "Production", "ol-application-my-app-production"),
+            (
+                "ol-infrastructure-vpc",
+                "applications.QA",
+                "ol-infrastructure-vpc-applications-qa",
+            ),
+            # Would not start with a letter: prefixed into a valid identifier.
+            ("3d-app", "QA", "stack-3d-app-qa"),
+            ("_private", "QA", "stack-_private-qa"),
+        ],
+    )
+    def test_group_names_are_valid_identifiers(self, project, stack, expected):
+        group = stack_serial_group(project, stack)
+        assert group == expected
+        assert str(Identifier(group)) == expected
+
     def test_rejects_an_index_with_no_stage(self):
         with pytest.raises(ValueError, match=r"\[2\]"):
             self._chain(serial_groups={2: ["anything"]})
