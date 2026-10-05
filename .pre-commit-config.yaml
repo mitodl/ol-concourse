@@ -32,7 +32,7 @@ repos:
     args: [--fix, --ignore, D1]
 
 - repo: https://github.com/pre-commit/mirrors-mypy
-  rev: v2.3.1
+  rev: v2.4.0
   hooks:
   - id: mypy
     # Narrowed to pipeline_lib: the resource packages each ship a top-level
