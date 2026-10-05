@@ -183,6 +183,7 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
     topology: Literal["deploy-chained", "preview-gated"] = "deploy-chained",
     auto_deploy_stages: list[str] | None = None,
     record_deployments: bool = True,
+    serial_groups: dict[int, list[str]] | None = None,
 ) -> PipelineFragment:
     """Create a chained sequence of jobs for running Pulumi tasks.
 
@@ -211,6 +212,15 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
         gate issue is what actually authorised the deploy -- so it is a record,
         not a gate. Set ``False`` to drop it once the gate issue is doing the
         useful work and the record is just noise.
+    :param serial_groups: Only used with ``topology="deploy-chained"``. A dict
+        of stage indices and the Concourse serial groups that stage's job joins.
+        Use it when a stage touches another stack's lock, e.g. a QA job that also
+        previews Production: ``{0: [stack_serial_group(p, "QA"),
+        stack_serial_group(p, "Production")], 1: [stack_serial_group(p,
+        "Production")]}``. A preview takes the stack lock, and lock recovery
+        only cancels locks older than 15 minutes, so without a shared group a
+        live preview would fail a real Production deploy outright. See
+        :func:`stack_serial_group`. ``preview-gated`` manages its own groups.
     :param env_vars_from_files: The list of environment variables that should be set
         during the build and the files to load for populating the values (e.g. the
         `version` file from a GitHub resource)
@@ -239,6 +249,12 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
         raise ValueError(msg)
 
     if topology == "preview-gated":
+        if serial_groups is not None:
+            msg = (
+                "serial_groups only applies to topology='deploy-chained': "
+                "preview-gated already serializes each stack's preview and deploy"
+            )
+            raise ValueError(msg)
         return _dispatch_preview_gated(
             pulumi_code=pulumi_code,
             stack_names=stack_names,
@@ -265,6 +281,9 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
         raise ValueError(msg)
     if not record_deployments:
         msg = "record_deployments=False only applies to topology='preview-gated'"
+        raise ValueError(msg)
+    if unknown := set(serial_groups or {}) - set(range(len(stack_names))):
+        msg = f"serial_groups names stages that do not exist: {sorted(unknown)}"
         raise ValueError(msg)
 
     chain_fragment = PipelineFragment(resource_types=[github_issues_resource()])
@@ -354,6 +373,7 @@ def pulumi_jobs_chain(  # noqa: PLR0913, PLR0912, PLR0915
             refresh_stack=refresh_stack,
             pulumi_put_attempts=pulumi_put_attempts,
             max_carried_changes=max_carried_changes,
+            serial_groups=(serial_groups or {}).get(index),
         )
 
         default_github_issue_labels = [
@@ -421,6 +441,7 @@ def pulumi_job(  # noqa: PLR0913
     refresh_stack: bool = True,
     pulumi_put_attempts: int | None = None,
     max_carried_changes: int | str | None = None,
+    serial_groups: list[str] | None = None,
 ) -> PipelineFragment:
     """Create a job definition for running a Pulumi task.
 
@@ -476,6 +497,10 @@ def pulumi_job(  # noqa: PLR0913
         edit to the resource image followed by a release and a dependency bump.
         A pipeline can equally point it at a Concourse var.
 
+    :param serial_groups: Concourse serial groups for the job, so it never runs
+        concurrently with another job in the same group. See
+        :func:`stack_serial_group`.
+
     :returns: A `PipelineFragment` object that can be composed with other fragments to
               build a full pipeline.
     """
@@ -490,6 +515,9 @@ def pulumi_job(  # noqa: PLR0913
     pulumi_job_object = Job(
         name=Identifier(f"deploy-{project_name}-{stack_name.lower()}"),
         max_in_flight=1,  # Only allow 1 Pulumi task at a time since they lock anyway.
+        serial_groups=(
+            [Identifier(group) for group in serial_groups] if serial_groups else None
+        ),
         plan=(dependencies or [])
         + [
             GetStep(
@@ -633,6 +661,16 @@ def _split_stage_steps(
     inputs = [step for step in steps if isinstance(step, GetStep)]
     effects = [step for step in steps if not isinstance(step, GetStep)]
     return inputs, effects
+
+
+def stack_serial_group(project_name: str, stack_name: str) -> str:
+    """Return the serial group for jobs that take *stack_name*'s Pulumi lock.
+
+    ``preview-gated`` puts each stack's preview and deploy jobs in it, and a
+    ``deploy-chained`` caller passes it through ``serial_groups`` for any job
+    that previews or deploys that stack.
+    """
+    return _stack_serial_group(project_name, stack_name)
 
 
 def _stack_serial_group(project_name: str, stack_name: str) -> str:
