@@ -68,6 +68,11 @@ RELEASE_MACHINERY_PATTERN = re.compile(
 # back — a full clone (``clone_depth: 0``) is the safest option for busy repos.
 _DEFAULT_CLONE_DEPTH = 200
 
+# How many of the newest production deployments `in` looks through for one
+# that succeeded.  Bounds the API calls when failed deploys pile up on top of
+# the last good one; past it, production's version is reported as unknown.
+_PRODUCTION_SCAN_LIMIT = 20
+
 CHANGELOG_HEADER = """\
 # Changelog
 
@@ -359,6 +364,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         - commits.json       structured commit list
         - checklist.md       GitHub Issue body (for use as body_file)
         - changelog_entry.md single Keep a Changelog entry for this version
+        - production_version the release production is running, or empty
         """
         with (
             _git_ssh_env(self.private_key) as env,
@@ -373,12 +379,14 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 access_token=self.github_token,
             )
             commits = self._collect_commits(repo_path, version, env=env)
+        production_version = self._production_version()
 
         destination_dir.mkdir(parents=True, exist_ok=True)
         (destination_dir / "version").write_text(version.version)
         (destination_dir / "since").write_text(version.since)
         (destination_dir / "in_flight").write_text(version.in_flight)
         (destination_dir / "hotfix").write_text(version.hotfix)
+        (destination_dir / "production_version").write_text(production_version)
         (destination_dir / "commits.json").write_text(json.dumps(commits, indent=2))
         (destination_dir / "checklist.md").write_text(
             _build_checklist(version.version, commits)
@@ -402,6 +410,8 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             metadata["in_flight"] = version.in_flight
         if version.hotfix:
             metadata["hotfix"] = version.hotfix
+        if production_version:
+            metadata["production_version"] = production_version
         return version, metadata
 
     def _collect_commits(
@@ -1168,6 +1178,68 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 file=sys.stderr,
             )
             return None
+
+    def _production_version(self) -> str:
+        """Return the release production is running, or ``""`` when unknown.
+
+        That is the ref of the ``production_environment`` deployment whose
+        success was reported most recently, among the newest
+        ``_PRODUCTION_SCAN_LIMIT`` deployments.  Ordered by when the deploy
+        succeeded, not by version or by when it started: re-running an older
+        production build rolls production back, and two overlapping deploys
+        leave production on whichever finished last.  A deployment that never
+        succeeded (a failed or still-running deploy) changed nothing.
+
+        Like :meth:`_production_state`, this will not guess.  It gives ``""``
+        when there are no credentials or ``repository``, the API call fails,
+        nothing in the window succeeded, the latest success has since been
+        superseded by a non-success status on the same deployment, two
+        different refs share the latest success timestamp, or the latest
+        success's ref is not a release version (something other than a
+        release deployed production).
+
+        The window is by creation order, so a deploy that started before the
+        newest ``_PRODUCTION_SCAN_LIMIT`` and finished after all of them is
+        missed.  That takes that many Production deploys starting while one
+        runs; Production deploys are not meant to overlap at all.
+        """
+        token = self.github_token
+        if not (token and self.repository):
+            return ""
+        # (success time, ref, latest status of that deployment) per success.
+        successes: list[tuple[datetime, str, str]] = []
+        try:
+            deployments = (
+                Github(auth=Auth.Token(token))
+                .get_repo(self.repository)
+                .get_deployments(environment=self.production_environment)
+            )
+            # Newest first, so the window is the most recent deploys.
+            for index, deployment in enumerate(deployments):
+                if index == _PRODUCTION_SCAN_LIMIT:
+                    break
+                statuses = list(deployment.get_statuses())
+                succeeded = [s.created_at for s in statuses if s.state == "success"]
+                if succeeded:
+                    current = max(statuses, key=lambda s: s.created_at).state
+                    successes.append((max(succeeded), deployment.ref, current))
+        except Exception:
+            print(  # noqa: T201
+                f"[release] could not determine what {self.production_environment}"
+                " is running",
+                file=sys.stderr,
+            )
+            return ""
+        if not successes:
+            return ""
+        latest = max(when for when, _, _ in successes)
+        winners = {(ref, current) for when, ref, current in successes if when == latest}
+        if len(winners) != 1:
+            return ""
+        ((ref, current),) = winners
+        if current != "success" or not VERSION_PATTERN.match(ref):
+            return ""
+        return ref
 
     def _collect_commits_range(
         self, repo_path: Path, since_ref: str, until_ref: str, env: dict[str, str]

@@ -16,6 +16,7 @@ import pytest
 from concourse import (
     ReleaseResource,
     ReleaseVersion,
+    _PRODUCTION_SCAN_LIMIT,
     SEMVER_PATTERN,
     _authed_uri,
     _build_changelog_entry,
@@ -772,11 +773,12 @@ def test_fetch_new_versions_new_commits(mock_tmpdir, mock_run, tmp_path, monkeyp
 # ---------------------------------------------------------------------------
 
 
+@patch.object(ReleaseResource, "_production_version", return_value="2026.4.10.1")
 @patch("concourse._enrich_with_github")
 @patch("concourse._run")
 @patch("concourse.tempfile.TemporaryDirectory")
 def test_download_version_writes_all_outputs(
-    mock_tmpdir, mock_run, mock_enrich, tmp_path
+    mock_tmpdir, mock_run, mock_enrich, _mock_production, tmp_path
 ):
     mock_tmpdir.return_value.__enter__.return_value = str(tmp_path)
     head_sha = "abc" * 13 + "a"
@@ -810,6 +812,7 @@ def test_download_version_writes_all_outputs(
     assert len(commits) == 2
     assert (dest / "checklist.md").exists()
     assert (dest / "changelog_entry.md").exists()
+    assert (dest / "production_version").read_text() == "2026.4.10.1"
 
 
 @patch("concourse._run")
@@ -1458,6 +1461,18 @@ def test_in_writes_an_empty_hotfix_file_for_a_normal_release(tmp_path, world):
     )
 
     assert (dest / "hotfix").read_text() == ""
+
+
+def test_in_writes_an_empty_production_version_when_unknown(tmp_path, world):
+    """The file always exists, so a load_var of it never fails on absence."""
+    version = _check(world)
+    dest = tmp_path / "get"
+
+    make_resource(uri=f"file://{world.origin}").download_version(
+        version, dest, MagicMock()
+    )
+
+    assert (dest / "production_version").read_text() == ""
 
 
 def test_hotfix_consumes_its_request(tmp_path, world, in_production):
@@ -2678,6 +2693,170 @@ def test_reached_production_is_true_when_the_api_fails(_mock_github):
     """An API failure must not be read as "never shipped" and delete the tag."""
     resource = make_resource(access_token="tok", repository="mitodl/my-app")
     assert resource._reached_production("2026.4.14.1") is True
+
+
+# ---------------------------------------------------------------------------
+# _production_version -- what is production running?
+# ---------------------------------------------------------------------------
+
+
+def _deployment(ref: str, *states: str, succeeded_at: int = 0) -> MagicMock:
+    """Build one fake deployment of *ref* with the given status states.
+
+    Statuses are stamped one minute apart in the order given, starting at
+    *succeeded_at* hours into a fixed day, so a later state is a later status.
+    """
+    deployment = MagicMock(ref=ref)
+    deployment.get_statuses.return_value = [
+        MagicMock(
+            state=state,
+            created_at=datetime(2026, 4, 20, succeeded_at, minute, tzinfo=UTC),
+        )
+        for minute, state in enumerate(states)
+    ]
+    return deployment
+
+
+def _production_version_given(mock_github: MagicMock, *deployments: MagicMock) -> str:
+    """Run _production_version over *deployments*, listed newest-created first."""
+    get_repo = mock_github.return_value.get_repo
+    get_repo.return_value.get_deployments.return_value = list(deployments)
+    resource = make_resource(access_token="tok", repository="mitodl/my-app")
+    return resource._production_version()
+
+
+def test_production_version_is_unknown_without_credentials():
+    resource = make_resource(access_token=None, repository=None)
+    assert resource._production_version() == ""
+
+
+@patch("concourse.Github")
+def test_production_version_skips_deploys_that_never_succeeded(mock_github):
+    """A failed or running deploy leaves production on the one before it."""
+    assert (
+        _production_version_given(
+            mock_github,
+            _deployment("2026.4.20.1", "in_progress"),
+            _deployment("2026.4.18.1", "in_progress", "failure"),
+            _deployment("2026.4.14.1", "in_progress", "success", succeeded_at=2),
+            _deployment("2026.4.10.1", "in_progress", "success", succeeded_at=1),
+        )
+        == "2026.4.14.1"
+    )
+
+
+@patch("concourse.Github")
+def test_production_version_follows_a_rollback(mock_github):
+    """Not by version: re-running an older build rolls production back."""
+    assert (
+        _production_version_given(
+            mock_github,
+            _deployment("2026.4.10.1", "in_progress", "success", succeeded_at=2),
+            _deployment("2026.4.14.1", "in_progress", "success", succeeded_at=1),
+        )
+        == "2026.4.10.1"
+    )
+
+
+@patch("concourse.Github")
+def test_production_version_is_whichever_deploy_finished_last(mock_github):
+    """Two overlapping deploys leave production on the later finisher."""
+    assert (
+        _production_version_given(
+            mock_github,
+            # Started second, finished first.
+            _deployment("2026.4.14.1", "in_progress", "success", succeeded_at=2),
+            # Started first, finished last.
+            _deployment("2026.4.10.1", "in_progress", "success", succeeded_at=3),
+        )
+        == "2026.4.10.1"
+    )
+
+
+@patch("concourse.Github")
+def test_production_version_is_unknown_after_a_non_release_deploy(mock_github):
+    """Production deployed from something that is not a release runs no release."""
+    assert (
+        _production_version_given(
+            mock_github,
+            _deployment("main", "success", succeeded_at=2),
+            _deployment("2026.4.14.1", "success", succeeded_at=1),
+        )
+        == ""
+    )
+
+
+@patch("concourse.Github")
+def test_production_version_outlives_an_older_non_release_deploy(mock_github):
+    assert (
+        _production_version_given(
+            mock_github,
+            _deployment("2026.4.14.1", "success", succeeded_at=2),
+            _deployment("main", "success", succeeded_at=1),
+        )
+        == "2026.4.14.1"
+    )
+
+
+@patch("concourse.Github")
+def test_production_version_is_unknown_once_the_success_is_withdrawn(mock_github):
+    """A later inactive/failure/error status means it is no longer running."""
+    for later in ("inactive", "failure", "error"):
+        assert (
+            _production_version_given(
+                mock_github,
+                _deployment("2026.4.14.1", "in_progress", "success", later),
+                _deployment("2026.4.10.1", "success", succeeded_at=0),
+            )
+            == ""
+        ), later
+
+
+@patch("concourse.Github")
+def test_production_version_is_unknown_on_a_tied_success(mock_github):
+    """Two releases succeeding in the same second cannot be ordered."""
+    assert (
+        _production_version_given(
+            mock_github,
+            _deployment("2026.4.14.1", "success", succeeded_at=2),
+            _deployment("2026.4.10.1", "success", succeeded_at=2),
+        )
+        == ""
+    )
+
+
+@patch("concourse.Github")
+def test_production_version_is_unknown_when_nothing_succeeded(mock_github):
+    assert _production_version_given(mock_github, _deployment("2026.4.14.1")) == ""
+
+
+@patch("concourse.Github")
+def test_production_version_gives_up_past_the_scan_limit(mock_github):
+    """A success buried under a long run of failures is reported as unknown."""
+    failures = [
+        _deployment(f"2026.4.{day}.1", "failure")
+        for day in range(1, 1 + _PRODUCTION_SCAN_LIMIT)
+    ]
+    buried = _deployment("2026.3.1.1", "success")
+    assert _production_version_given(mock_github, *failures, buried) == ""
+    buried.get_statuses.assert_not_called()
+
+
+@patch("concourse.Github")
+def test_production_version_queries_the_configured_environment(mock_github):
+    get_deployments = mock_github.return_value.get_repo.return_value.get_deployments
+    get_deployments.return_value = []
+    resource = make_resource(
+        access_token="tok", repository="mitodl/my-app", production_environment="prod"
+    )
+    resource._production_version()
+    get_deployments.assert_called_once_with(environment="prod")
+
+
+@patch("concourse.Github", side_effect=RuntimeError("GitHub is down"))
+def test_production_version_is_unknown_when_the_api_fails(_mock_github):
+    resource = make_resource(access_token="tok", repository="mitodl/my-app")
+    assert resource._production_version() == ""
 
 
 # ---------------------------------------------------------------------------

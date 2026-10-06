@@ -134,9 +134,30 @@ Clones the repository and generates release artefacts from `version.since..versi
 | `version` | Plain version string, e.g. `2026.4.14.1` |
 | `in_flight` | Version of a release cut but not yet finished, or empty (may already be in production — see below) |
 | `hotfix` | Commit SHA of a pending hotfix request, or empty (see [hotfix](#action-create-with-commit_hash-hotfix)) |
+| `production_version` | The release production is running, or empty when unknown (see below) |
 | `commits.json` | Structured list of `{sha, author, author_name, pr_number, pr_title, message}` -- `author` is the commit email (matched against `auto_check_authors` by the `github-issues` resource), `author_name` is the git-configured display name |
 | `checklist.md` | GitHub Issue body with a markdown task list grouped by author (`### <author_name>` headings, newest contributor first); use as `body_file` in `github-issues` resource |
 | `changelog_entry.md` | Single [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) entry for this version |
+
+`production_version` is the release most recently deployed to production: the
+ref of the `production_environment` GitHub Deployment whose `success` status is
+latest, among the newest 20 deployments. Ordering by when a deploy succeeded,
+rather than by version or by when it started, makes a rollback read as the
+older release and leaves overlapping deploys on whichever finished last. A
+deployment that never succeeded changed nothing and is skipped.
+
+It is empty, rather than a guess, when the resource has no credentials or
+`repository`, the API call fails, nothing in the window succeeded, the winning
+deployment has a later non-success status (`inactive`, `failure`, `error`), two
+different refs share the latest success timestamp, or the latest success is not
+a release version (something other than a release deployed production).
+
+The window is by creation order, so a deploy that started before the newest 20
+and finished after all of them is missed. That needs 20 Production deploys to
+start while one is still running.
+
+Compare it with `version` to tell an unpromoted release (they differ) from a
+re-run of what is already live (they match).
 
 ## `out` — Create or finish a release
 
