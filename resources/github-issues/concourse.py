@@ -4,13 +4,18 @@ from pathlib import Path
 import re
 import textwrap
 import json
+from collections.abc import Iterable
 from datetime import datetime, timedelta
-from typing import Literal
+from itertools import islice
+from typing import TYPE_CHECKING, Literal
 from concoursetools import BuildMetadata, ConcourseResource
 from concoursetools.version import Version, SortableVersionMixin
 from github import Github, Auth, Consts
 from github.GithubObject import NotSet
 from github.Issue import Issue
+
+if TYPE_CHECKING:
+    from github.Issue import IssueSearchResult
 
 ISO_8601_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
@@ -20,6 +25,9 @@ ISO_8601_FORMAT = "%Y-%m-%dT%H:%M:%S"
 # body_files composition can produce one that does -- so this is the last
 # point that can actually guarantee the API call succeeds.
 GITHUB_BODY_MAX_CHARS = 65536
+# How many of the newest issues close_with_labels reads to cover the lag of GitHub's
+# search index. One page at ``per_page=100``.
+_RECENT_ISSUE_SCAN = 100
 _TRUNCATION_NOTICE = (
     "\n\n> :warning: **Body truncated** -- this content exceeded GitHub's "
     f"{GITHUB_BODY_MAX_CHARS}-character limit for issues and comments. See "
@@ -483,9 +491,19 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         query = f'repo:{self.repo.full_name} "{safe_title}" in:title is:issue'
         # Search matches on tokens, not on the whole title, so keep only exact
         # matches: closing a neighbour's issue is worse than closing none.
-        issues = [
-            issue for issue in self.gh.search_issues(query) if issue.title == title
-        ]
+        found: dict[int, Issue | IssueSearchResult] = {
+            issue.number: issue
+            for issue in self.gh.search_issues(query)
+            if issue.title == title
+        }
+        # The search index lags behind issue creation, and an abandon can land
+        # moments after the QA put that opened the gate issue. Finding nothing
+        # would leave that issue open and able to ship the release, so also
+        # read the newest issues from the issues API, which is consistent.
+        for issue in self._recent_issues():
+            if issue.title == title and not issue.pull_request:
+                found.setdefault(issue.number, issue)
+        issues = sorted(found.values(), key=lambda issue: issue.number)
         for issue in issues:
             print(f"about to label {issue=} with {labels=} and close it")  # noqa: T201
             issue.add_to_labels(*labels)
@@ -503,6 +521,20 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             "retired_issues": ", ".join(f"#{issue.number}" for issue in issues)
             or "none"
         }
+
+    def _recent_issues(self) -> Iterable[Issue]:
+        """Return the newest issues in either state, newest first.
+
+        One page (``per_page`` is 100). A gate issue the search index has not
+        caught up with was created minutes ago, so it is always in this page;
+        older ones are in the index. Not filtered by ``issue_labels``: this
+        resource's own filters describe the issues it polls for, and an issue
+        carrying a label a reviewer removed is exactly the one to retire.
+        """
+        return islice(
+            self.repo.get_issues(state="all", sort="created", direction="desc"),
+            _RECENT_ISSUE_SCAN,
+        )
 
     def _ensure_labels(self, issue_number: int, labels: list[str]) -> None:
         """Re-add any of *labels* a concurrent writer removed from an issue.

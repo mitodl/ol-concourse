@@ -70,6 +70,7 @@ def create_mock_issue(
             mock_label.name = label_name
             mock_labels.append(mock_label)
     mock.labels = mock_labels
+    mock.pull_request = None
     return mock
 
 
@@ -1271,12 +1272,63 @@ class TestCloseWithLabels:
         issue.edit.side_effect = edit
         return issue
 
-    def _found(self, mock_github, *issues):
+    def _found(self, mock_github, *issues, recent=(), searched=None):
+        """Make *issues* known to the search index and *recent* to the issues API.
+
+        *searched* overrides what the index returns, for an index that lags.
+        """
         mock_gh_instance, mock_repo = mock_github
-        mock_gh_instance.search_issues.return_value = list(issues)
+        searched = list(issues) if searched is None else searched
+        mock_gh_instance.search_issues.return_value = searched
+        mock_repo.get_issues.return_value = list(recent)
+        known = [*issues, *recent]
         mock_repo.get_issue.side_effect = lambda number: next(
-            issue for issue in issues if issue.number == number
+            issue for issue in known if issue.number == number
         )
+
+    def test_retires_an_issue_the_search_index_has_not_seen_yet(
+        self, mock_github, tmp_path
+    ):
+        _, mock_repo = mock_github
+        issue = self._issue(31)
+        # Search returns nothing: the gate issue was created moments ago.
+        self._found(mock_github, recent=[issue], searched=[])
+
+        version, metadata = self._publish(tmp_path)
+
+        issue.add_to_labels.assert_called_once_with("abandoned")
+        issue.edit.assert_any_call(state="closed")
+        assert metadata == {"retired_issues": "#31"}
+        assert version == SKIPPED_VERSION
+        mock_repo.get_issues.assert_called_once_with(
+            state="all", sort="created", direction="desc"
+        )
+
+    def test_an_issue_in_both_search_and_recent_is_retired_once(
+        self, mock_github, tmp_path
+    ):
+        issue = self._issue(31)
+        self._found(mock_github, issue, recent=[issue])
+
+        _, metadata = self._publish(tmp_path)
+
+        issue.add_to_labels.assert_called_once_with("abandoned")
+        issue.create_comment.assert_called_once()
+        assert metadata == {"retired_issues": "#31"}
+
+    def test_recent_scan_ignores_other_titles_and_pull_requests(
+        self, mock_github, tmp_path
+    ):
+        neighbour = self._issue(32, title=f"{self.TITLE} infrastructure")
+        pull_request = self._issue(33)
+        pull_request.pull_request = MagicMock()
+        self._found(mock_github, recent=[neighbour, pull_request], searched=[])
+
+        _, metadata = self._publish(tmp_path)
+
+        neighbour.add_to_labels.assert_not_called()
+        pull_request.add_to_labels.assert_not_called()
+        assert metadata == {"retired_issues": "none"}
 
     def test_labels_then_closes_the_exact_match(self, mock_github, tmp_path):
         _, mock_repo = mock_github
