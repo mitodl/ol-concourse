@@ -504,16 +504,31 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             if issue.title == title and not issue.pull_request:
                 found.setdefault(issue.number, issue)
         issues = sorted(found.values(), key=lambda issue: issue.number)
-        for issue in issues:
-            print(f"about to label {issue=} with {labels=} and close it")  # noqa: T201
-            issue.add_to_labels(*labels)
+        for found_issue in issues:
+            # Search results can be stale in either direction, so whether to
+            # close comes from the issues API.
+            issue = self.repo.get_issue(found_issue.number)
             if issue.state == "open":
+                print(f"about to label {issue=} with {labels=} and close it")  # noqa: T201
                 issue.create_comment(
                     f"Closed by [build {build_metadata.BUILD_NAME}]"
                     f"({build_metadata.build_url()}) and labelled "
                     f"{', '.join(f'`{label}`' for label in labels)}."
                 )
-                issue.edit(state="closed")
+                # One PATCH, so no reader sees either half on its own: closed
+                # but unlabelled would ship the release, and open but labelled
+                # would let update_in_place remove the label as stale.
+                current = [label.name for label in issue.labels]
+                issue.edit(
+                    state="closed",
+                    labels=[
+                        *current,
+                        *(name for name in labels if name not in current),
+                    ],
+                )
+            else:
+                print(f"about to label already-closed {issue=} with {labels=}")  # noqa: T201
+                issue.add_to_labels(*labels)
             self._ensure_labels(issue.number, labels)
         if not issues:
             print(f"no issue titled {title!r} -- nothing to close")  # noqa: T201
@@ -537,14 +552,13 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         )
 
     def _ensure_labels(self, issue_number: int, labels: list[str]) -> None:
-        """Re-add any of *labels* a concurrent writer removed from an issue.
+        """Re-add any of *labels* another writer removed from an issue.
 
-        ``update_in_place`` reconciles an issue's labels to exactly the put's
-        own list, so a QA put that read the issue before the label went on can
-        write it back off. Re-reading after the close is the only point at
-        which the label is known to have survived. A gate that polled in the
-        gap between close and re-add is the residual window, which is why the
-        label goes on first.
+        ``update_in_place`` leaves a closed issue's labels alone and removes
+        only labels it read, but a human or another tool can still replace
+        them. Re-reading after the close is the only point at which the label
+        is known to have survived. A gate that polled in the gap between that
+        write and the re-add is the residual window.
         """
         issue = self.repo.get_issue(issue_number)
         missing = [
@@ -555,6 +569,28 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         if missing:
             print(f"{missing=} were removed from #{issue_number} -- restoring")  # noqa: T201
             issue.add_to_labels(*missing)
+
+    def _reconcile_labels(self, issue_number: int, desired: list[str]) -> None:
+        """Make an open issue's labels exactly *desired*, one label at a time.
+
+        Reads the issue from the issues API, not search, whose index can still
+        call a retired issue open. A closed issue is left alone: it has been
+        approved or retired (``close_with_labels``), and either way its labels
+        are no longer this put's to correct. Labels are added and removed by
+        name rather than replaced as a list, so a label written after this read
+        -- ``close_with_labels``'s, say -- can never be removed by it.
+        """
+        issue = self.repo.get_issue(issue_number)
+        if issue.state != "open":
+            print(f"#{issue_number} is {issue.state} -- leaving its labels alone")  # noqa: T201
+            return
+        current = {label.name for label in issue.labels}
+        if missing := [name for name in desired if name not in current]:
+            print(f"about to add {missing=} to #{issue_number}")  # noqa: T201
+            issue.add_to_labels(*missing)
+        for stale in sorted(current.difference(desired)):
+            print(f"about to remove {stale=} from #{issue_number}")  # noqa: T201
+            issue.remove_from_labels(stale)
 
     def publish_new_version(  # noqa: PLR0913
         self,
@@ -576,13 +612,13 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         also gets a comment linking this build and is closed; one already
         closed but not yet consumed by the gate (a consumed one has been
         renamed) is only labelled. It never creates an issue, and finding none
-        is not an error. Labels go on before the close: a gate polling for
-        *closed* issues skips one by ``skip_if_labeled``, so it must never be
-        able to see the issue closed but unlabelled. They are checked again
-        afterwards, because a concurrent ``update_in_place`` put replaces an
-        issue's labels. Like *skip_if_file* it returns
-        :data:`SKIPPED_VERSION`, so the implicit get has nothing to tombstone.
-        *skip_if_file* wins when both are set.
+        is not an error. An open issue is labelled and closed in one edit: a
+        gate polling for *closed* issues skips one by ``skip_if_labeled``, so
+        it must never see the issue closed but unlabelled, and
+        ``update_in_place`` must never see it open but labelled. The labels are
+        checked again afterwards, in case another writer replaced them. Like
+        *skip_if_file* it returns :data:`SKIPPED_VERSION`, so the implicit get
+        has nothing to tombstone. *skip_if_file* wins when both are set.
 
         *skip_if_file* names a workspace-relative file whose presence means
         there is nothing to post: no issue is searched for, created, edited,
@@ -679,18 +715,17 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             # what routing and queries actually read. update_in_place already
             # means "this resource owns this issue", so reconcile them here.
             #
-            # This is a replace, unlike the body, which is merged to preserve a
-            # reviewer's ticked checkboxes. There is no equivalent of a ticked
-            # box for labels: nothing distinguishes one a human added from a
-            # stale one this resource wrote, and leaving a contradictory label
-            # in place is worse than dropping a hand-added one. Assignees are
-            # deliberately NOT reconciled -- someone assigning themselves to
-            # review a gate is a human workflow, and overwriting that would
-            # fight them.
+            # The result is exactly the put's list, unlike the body, which is
+            # merged to preserve a reviewer's ticked checkboxes. There is no
+            # equivalent of a ticked box for labels: nothing distinguishes one a
+            # human added from a stale one this resource wrote, and leaving a
+            # contradictory label in place is worse than dropping a hand-added
+            # one. Assignees are deliberately NOT reconciled -- someone
+            # assigning themselves to review a gate is a human workflow, and
+            # overwriting that would fight them.
             desired_labels = labels or []
             if set(desired_labels) != {label.name for label in working_issue.labels}:
-                print(f"about to relabel {working_issue=} with {desired_labels=}")  # noqa: T201
-                working_issue.edit(labels=desired_labels)
+                self._reconcile_labels(working_issue.number, desired_labels)
         else:
             working_issue = already_exists[0]
             print(f"about to comment on {working_issue=} with {issue_body=}")  # noqa: T201

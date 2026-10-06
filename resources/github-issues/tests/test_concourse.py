@@ -1246,14 +1246,15 @@ class TestCloseWithLabels:
             **kwargs,
         )
 
-    def _issue(self, number, title=None, state="open", calls=None):
-        """Build an issue whose add_to_labels really adds, so labels are observable."""
+    def _issue(self, number, title=None, state="open", calls=None, labels=None):
+        """Build an issue whose label writes really apply, so labels are observable."""
         issue = create_mock_issue(
             number=number,
             title=title or self.TITLE,
             state=state,
             created_at=NOW,
             closed_at=NOW if state == "closed" else None,
+            labels=labels,
         )
 
         def add_to_labels(*names):
@@ -1265,6 +1266,12 @@ class TestCloseWithLabels:
                 calls.append(("label", number))
 
         def edit(**kwargs):
+            if "labels" in kwargs:
+                issue.labels.clear()
+                for name in kwargs["labels"]:
+                    label = MagicMock()
+                    label.name = name
+                    issue.labels.append(label)
             if calls is not None:
                 calls.append(("edit", number, kwargs))
 
@@ -1296,8 +1303,7 @@ class TestCloseWithLabels:
 
         version, metadata = self._publish(tmp_path)
 
-        issue.add_to_labels.assert_called_once_with("abandoned")
-        issue.edit.assert_any_call(state="closed")
+        issue.edit.assert_called_once_with(state="closed", labels=["abandoned"])
         assert metadata == {"retired_issues": "#31"}
         assert version == SKIPPED_VERSION
         mock_repo.get_issues.assert_called_once_with(
@@ -1312,7 +1318,7 @@ class TestCloseWithLabels:
 
         _, metadata = self._publish(tmp_path)
 
-        issue.add_to_labels.assert_called_once_with("abandoned")
+        issue.edit.assert_called_once_with(state="closed", labels=["abandoned"])
         issue.create_comment.assert_called_once()
         assert metadata == {"retired_issues": "#31"}
 
@@ -1330,7 +1336,7 @@ class TestCloseWithLabels:
         pull_request.add_to_labels.assert_not_called()
         assert metadata == {"retired_issues": "none"}
 
-    def test_labels_then_closes_the_exact_match(self, mock_github, tmp_path):
+    def test_labels_and_closes_the_exact_match_in_one_edit(self, mock_github, tmp_path):
         _, mock_repo = mock_github
         calls = []
         issue = self._issue(31, calls=calls)
@@ -1338,12 +1344,15 @@ class TestCloseWithLabels:
 
         version, metadata = self._publish(tmp_path)
 
-        issue.add_to_labels.assert_called_once_with("abandoned")
         issue.create_comment.assert_called_once()
         assert "abandoned" in issue.create_comment.call_args.args[0]
-        # The gate polls for closed issues and skips by label, so the label
-        # has to be on before the close is.
-        assert calls == [("label", 31), ("edit", 31, {"state": "closed"})]
+        # One PATCH: the gate must never see the issue closed but unlabelled,
+        # and update_in_place must never see it open but labelled, or it
+        # would remove the label as stale.
+        assert calls == [
+            ("edit", 31, {"state": "closed", "labels": ["abandoned"]}),
+        ]
+        issue.add_to_labels.assert_not_called()
         assert version == SKIPPED_VERSION
         assert metadata == {"retired_issues": "#31"}
         mock_repo.create_issue.assert_not_called()
@@ -1360,8 +1369,34 @@ class TestCloseWithLabels:
         issue.create_comment.assert_not_called()
         assert metadata == {"retired_issues": "#34"}
 
+    def test_keeps_the_labels_already_on_the_issue(self, mock_github, tmp_path):
+        issue = self._issue(38, labels=["release"])
+        self._found(mock_github, issue)
+
+        self._publish(tmp_path)
+
+        issue.edit.assert_called_once_with(
+            state="closed", labels=["release", "abandoned"]
+        )
+
+    def test_acts_on_a_fresh_read_not_the_search_result(self, mock_github, tmp_path):
+        """The index can call an issue open after it closed, or the reverse."""
+        _, mock_repo = mock_github
+        stale = self._issue(39, state="closed")
+        fresh = self._issue(39, labels=["release"])
+        self._found(mock_github, searched=[stale])
+        mock_repo.get_issue.side_effect = lambda number: fresh
+
+        self._publish(tmp_path)
+
+        stale.add_to_labels.assert_not_called()
+        stale.edit.assert_not_called()
+        fresh.edit.assert_called_once_with(
+            state="closed", labels=["release", "abandoned"]
+        )
+
     def test_restores_a_label_a_concurrent_put_removed(self, mock_github, tmp_path):
-        """update_in_place relabels to its own list, which can drop ours."""
+        """Another writer can still replace the labels after the close."""
         calls = []
         issue = self._issue(35, calls=calls)
         plain_edit = issue.edit.side_effect
@@ -1376,8 +1411,7 @@ class TestCloseWithLabels:
         self._publish(tmp_path)
 
         assert calls == [
-            ("label", 35),
-            ("edit", 35, {"state": "closed"}),
+            ("edit", 35, {"state": "closed", "labels": ["abandoned"]}),
             ("label", 35),
         ]
         assert {label.name for label in issue.labels} == {"abandoned"}
@@ -1388,7 +1422,7 @@ class TestCloseWithLabels:
 
         self._publish(tmp_path)
 
-        issue.add_to_labels.assert_called_once_with("abandoned")
+        issue.add_to_labels.assert_not_called()
 
     def test_leaves_a_neighbouring_title_alone(self, mock_github, tmp_path):
         """Search is token based; only the exact title may be closed."""
@@ -1423,7 +1457,7 @@ class TestCloseWithLabels:
         _, metadata = self._publish(tmp_path)
 
         for issue in issues:
-            issue.edit.assert_called_once_with(state="closed")
+            issue.edit.assert_called_once_with(state="closed", labels=["abandoned"])
         assert metadata == {"retired_issues": "#40, #41"}
 
     def test_searches_both_states_in_this_repo_by_exact_title(
@@ -1582,8 +1616,15 @@ def _update_in_place_resource() -> ConcourseGithubIssuesResource:
     )
 
 
-def _publish_onto_existing(mock_github, existing_labels, desired_labels):
-    mock_gh_instance, _ = mock_github
+def _publish_onto_existing(
+    mock_github, existing_labels, desired_labels, fresh_state="open"
+):
+    """Publish onto an issue that search returns, and the issues API re-reads.
+
+    *fresh_state* is the state the issues API reports, for a search index that
+    still calls a since-closed issue open.
+    """
+    mock_gh_instance, mock_repo = mock_github
     issue = create_mock_issue(
         number=9,
         title="[bot] Pulumi proj QA ready to deploy.",
@@ -1594,6 +1635,15 @@ def _publish_onto_existing(mock_github, existing_labels, desired_labels):
     issue.body = ""
     issue.edit = MagicMock()
     mock_gh_instance.search_issues.return_value = [issue]
+    fresh = create_mock_issue(
+        number=9,
+        title=issue.title,
+        state=fresh_state,
+        created_at=T_MINUS_1,
+        labels=existing_labels,
+    )
+    issue.fresh = fresh
+    mock_repo.get_issue.side_effect = lambda number: fresh
     _update_in_place_resource().publish_new_version(
         sources_dir="dummy",
         build_metadata=mock_build_metadata(
@@ -1617,9 +1667,39 @@ def test_update_in_place_reconciles_stale_labels(mock_github):
         existing_labels=["DevOps", "promotion-to-production"],
         desired_labels=["DevOps", "promotion-to-qa"],
     )
-    relabels = [c for c in issue.edit.call_args_list if "labels" in c.kwargs]
-    assert relabels, "the stale label was never corrected"
-    assert relabels[0].kwargs["labels"] == ["DevOps", "promotion-to-qa"]
+    issue.fresh.add_to_labels.assert_called_once_with("promotion-to-qa")
+    issue.fresh.remove_from_labels.assert_called_once_with("promotion-to-production")
+
+
+def test_update_in_place_never_replaces_the_whole_label_list(mock_github):
+    """A replace would drop a label added after the read, e.g. `abandoned`.
+
+    Adding and removing by name only touches the labels this put read, so a
+    retirement label that lands in between survives.
+    """
+    issue = _publish_onto_existing(
+        mock_github,
+        existing_labels=["DevOps", "promotion-to-production"],
+        desired_labels=["DevOps", "promotion-to-qa"],
+    )
+    for written in (issue, issue.fresh):
+        assert not [c for c in written.edit.call_args_list if "labels" in c.kwargs]
+
+
+def test_update_in_place_leaves_a_closed_issues_labels_alone(mock_github):
+    """The index still calls it open; the issues API says it was retired.
+
+    Removing `abandoned` from it would let the gate ship an abandoned release.
+    """
+    issue = _publish_onto_existing(
+        mock_github,
+        existing_labels=["release", "abandoned"],
+        desired_labels=["release"],
+        fresh_state="closed",
+    )
+    issue.fresh.remove_from_labels.assert_not_called()
+    issue.fresh.add_to_labels.assert_not_called()
+    assert not [c for c in issue.edit.call_args_list if "labels" in c.kwargs]
 
 
 def test_update_in_place_does_not_rewrite_labels_that_already_match(mock_github):
@@ -1630,6 +1710,8 @@ def test_update_in_place_does_not_rewrite_labels_that_already_match(mock_github)
         desired_labels=["promotion-to-qa", "DevOps"],  # same set, different order
     )
     assert not [c for c in issue.edit.call_args_list if "labels" in c.kwargs]
+    issue.fresh.add_to_labels.assert_not_called()
+    issue.fresh.remove_from_labels.assert_not_called()
 
 
 def test_update_in_place_still_edits_the_body(mock_github):
