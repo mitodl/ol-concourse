@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from ol_concourse.lib.jobs.infrastructure import pulumi_jobs_chain
+from ol_concourse.lib.jobs.infrastructure import pulumi_jobs_chain, stack_serial_group
 from ol_concourse.lib.models.pipeline import (
     GetStep,
     Identifier,
@@ -965,3 +965,104 @@ class TestStageInputsAreCorrelatedWithThePreview:
         dep = next(s for s in deploy.plan if str(getattr(s, "get", "")) == "app-image")
         assert dep.passed == ["build-image"]
         assert dep.trigger is True
+
+
+class TestDeployChainedSerialGroups:
+    """A deploy-chained stage that touches another stack's lock can share its group.
+
+    A `pulumi preview` takes the stack lock and lock recovery only cancels
+    locks older than 15 minutes, so a QA job that also previews Production
+    would otherwise fail a concurrent real Production deploy outright.
+    """
+
+    PROJECT = "ol-application-my-app"
+
+    def _chain(self, **kwargs):
+        return pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["QA", "Production"],
+            project_name=self.PROJECT,
+            project_source_path=Path("src/ol_infrastructure/applications/my_app"),
+            enable_github_issue_resource=False,
+            **kwargs,
+        )
+
+    def _groups(self, fragment) -> dict[str, list[str] | None]:
+        return {
+            str(job.name): (
+                [str(group) for group in job.serial_groups]
+                if job.serial_groups
+                else None
+            )
+            for job in fragment.jobs
+        }
+
+    def test_off_by_default(self):
+        assert set(self._groups(self._chain()).values()) == {None}
+
+    def test_groups_land_on_the_indexed_jobs(self):
+        qa = stack_serial_group(self.PROJECT, "QA")
+        production = stack_serial_group(self.PROJECT, "Production")
+
+        groups = self._groups(
+            self._chain(serial_groups={0: [qa, production], 1: [production]})
+        )
+
+        assert groups == {
+            f"deploy-{self.PROJECT}-qa": [qa, production],
+            f"deploy-{self.PROJECT}-production": [production],
+        }
+
+    def test_matches_the_group_preview_gated_uses(self):
+        """One name per stack, whichever topology wrote the job."""
+        fragment = pulumi_jobs_chain(
+            _make_pulumi_code(),
+            stack_names=["QA", "Production"],
+            project_name=self.PROJECT,
+            project_source_path=Path("src/ol_infrastructure/applications/my_app"),
+            github_issue_repository="org/repo",
+            topology="preview-gated",
+        )
+        production_jobs = [j for j in fragment.jobs if "production" in str(j.name)]
+
+        assert production_jobs
+        for job in production_jobs:
+            assert [str(g) for g in job.serial_groups or []] == [
+                stack_serial_group(self.PROJECT, "Production")
+            ]
+
+    @pytest.mark.parametrize(
+        ("project", "stack", "expected"),
+        [
+            # Already valid: unchanged, so existing groups keep their names.
+            ("ol-application-my-app", "Production", "ol-application-my-app-production"),
+            (
+                "ol-infrastructure-vpc",
+                "applications.QA",
+                "ol-infrastructure-vpc-applications-qa",
+            ),
+            # Would not start with a letter: prefixed into a valid identifier.
+            ("3d-app", "QA", "stack-3d-app-qa"),
+            ("_private", "QA", "stack-_private-qa"),
+        ],
+    )
+    def test_group_names_are_valid_identifiers(self, project, stack, expected):
+        group = stack_serial_group(project, stack)
+        assert group == expected
+        assert str(Identifier(group)) == expected
+
+    def test_rejects_an_index_with_no_stage(self):
+        with pytest.raises(ValueError, match=r"\[2\]"):
+            self._chain(serial_groups={2: ["anything"]})
+
+    def test_rejected_under_preview_gated(self):
+        with pytest.raises(ValueError, match="deploy-chained"):
+            pulumi_jobs_chain(
+                _make_pulumi_code(),
+                stack_names=["QA", "Production"],
+                project_name=self.PROJECT,
+                project_source_path=Path("src/ol_infrastructure/applications/my_app"),
+                github_issue_repository="org/repo",
+                topology="preview-gated",
+                serial_groups={0: ["anything"]},
+            )
