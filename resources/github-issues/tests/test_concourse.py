@@ -4,11 +4,13 @@ from github.GithubObject import NotSet
 import pytest
 from unittest.mock import MagicMock, call, patch
 from datetime import datetime, timedelta
+import json
 
 from concourse import (
     ConcourseGithubIssuesResource,
     ConcourseGithubIssuesVersion,
     ISO_8601_FORMAT,
+    SKIPPED_VERSION,
     _merge_checklist_preserving_checked,
 )
 from concoursetools import BuildMetadata  # Import the actual class
@@ -1099,6 +1101,125 @@ class TestCloseIfFile:
 
         mock_repo.create_issue.assert_called_once()
         created.edit.assert_not_called()
+
+
+class TestSkipIfFile:
+    """Nothing to approve must mean no issue at all, not a pre-approved one.
+
+    For a release gate, closing the issue ships a release, so `close_if_file`'s
+    auto-close would ship one nobody approved. `skip_if_file` posts nothing.
+    """
+
+    TITLE = "Release my-app 2026.9.22.1"
+
+    def _resource(self) -> ConcourseGithubIssuesResource:
+        return ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_prefix="Release my-app",
+            issue_title_template=self.TITLE,
+            update_in_place=True,
+        )
+
+    def test_marker_present_touches_nothing_on_github(self, mock_github, tmp_path):
+        mock_gh_instance, mock_repo = mock_github
+        (tmp_path / "nothing-to-approve").touch()
+
+        version, metadata = self._resource().publish_new_version(
+            sources_dir=tmp_path,
+            build_metadata=mock_build_metadata(),
+            body_file="checklist.md",  # absent: a skipped put must not read it
+            skip_if_file="nothing-to-approve",
+        )
+
+        assert version == SKIPPED_VERSION
+        assert metadata == {"skipped_by": "nothing-to-approve"}
+        mock_gh_instance.search_issues.assert_not_called()
+        mock_repo.create_issue.assert_not_called()
+
+    def test_marker_wins_over_close_if_file(self, mock_github, tmp_path):
+        mock_gh_instance, mock_repo = mock_github
+        (tmp_path / "nothing-to-approve").touch()
+        (tmp_path / "preview.md.no-changes").touch()
+
+        version, _ = self._resource().publish_new_version(
+            sources_dir=tmp_path,
+            build_metadata=mock_build_metadata(),
+            close_if_file="preview.md.no-changes",
+            skip_if_file="nothing-to-approve",
+        )
+
+        assert version == SKIPPED_VERSION
+        mock_gh_instance.search_issues.assert_not_called()
+        mock_repo.create_issue.assert_not_called()
+
+    def test_marker_absent_posts_as_normal(self, mock_github, tmp_path):
+        mock_gh_instance, mock_repo = mock_github
+        mock_gh_instance.search_issues.return_value = []
+        mock_repo.create_issue.return_value = create_mock_issue(
+            number=12, title=self.TITLE, state="open", created_at=NOW
+        )
+
+        version, _ = self._resource().publish_new_version(
+            sources_dir=tmp_path,
+            build_metadata=mock_build_metadata(),
+            skip_if_file="nothing-to-approve",
+        )
+
+        mock_repo.create_issue.assert_called_once()
+        assert version.issue_number == 12
+
+    def test_skipped_version_is_constant(self, mock_github, tmp_path):
+        """Two skipped puts emit the same version, so the second is not new."""
+        (tmp_path / "nothing-to-approve").touch()
+        versions = [
+            self._resource()
+            .publish_new_version(
+                sources_dir=tmp_path,
+                build_metadata=mock_build_metadata(BUILD_NAME=str(build)),
+                skip_if_file="nothing-to-approve",
+            )[0]
+            .to_flat_dict()
+            for build in (1, 2)
+        ]
+        assert versions[0] == versions[1]
+
+    def test_check_handed_the_skipped_version_reseeds_from_the_latest(
+        self, mock_github
+    ):
+        """It must not become a 1970 `since` filter that replays all history."""
+        _, mock_repo = mock_github
+        mock_repo.get_issues.return_value = [
+            create_mock_issue(number=7, title=self.TITLE, state="open", created_at=NOW),
+            create_mock_issue(
+                number=3, title=self.TITLE, state="open", created_at=T_MINUS_1
+            ),
+        ]
+        # Concourse hands check the version JSON back, all strings.
+        previous = ConcourseGithubIssuesVersion(**SKIPPED_VERSION.to_flat_dict())
+
+        versions = SimpleTestResourceWrapper(self._resource()).fetch_new_versions(
+            previous
+        )
+
+        assert {v.issue_number for v in versions} == {7}
+        assert mock_repo.get_issues.call_args.kwargs["since"] is NotSet
+
+    def test_implicit_get_of_the_skipped_version_does_not_tombstone(
+        self, mock_github, tmp_path
+    ):
+        """The put's implicit get must not rename (consume) any real issue."""
+        _, mock_repo = mock_github
+        dest = tmp_path / "get"
+        dest.mkdir()
+
+        self._resource().download_version(
+            SKIPPED_VERSION, str(dest), mock_build_metadata()
+        )
+
+        mock_repo.get_issue.assert_not_called()
+        assert json.loads((dest / "gh_issue.json").read_text())["issue_number"] == "0"
 
 
 def _update_in_place_resource() -> ConcourseGithubIssuesResource:

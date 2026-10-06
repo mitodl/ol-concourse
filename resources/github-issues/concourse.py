@@ -138,6 +138,19 @@ class ConcourseGithubIssuesVersion(Version, SortableVersionMixin):
             return int(self.issue_number) < int(other.issue_number)
 
 
+#: What a put skipped by ``skip_if_file`` returns. It names no issue (number
+#: 0, empty title), is constant so Concourse records it once and never sees
+#: it as new again, and is ``open`` so the implicit get never tombstones.
+SKIPPED_VERSION = ConcourseGithubIssuesVersion(
+    issue_created_at="1970-01-01T00:00:00",
+    issue_closed_at=None,
+    issue_number=0,
+    issue_state="open",
+    issue_title="",
+    issue_url="",
+)
+
+
 class ConcourseGithubIssuesResource(ConcourseResource):
     """Concourse resource that uses GitHub Issues as pipeline gate signals."""
 
@@ -293,8 +306,12 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         current latest version to seed its state.  Scanning the full issue
         history is expensive, so we stop at the first (most-recent) match
         instead of exhausting the paginated API.
+
+        :data:`SKIPPED_VERSION` (issue 0) is treated the same way. A skipped put
+        saves it as this resource's latest version, so it can come back here,
+        and its epoch timestamp would otherwise mean "every issue since 1970".
         """
-        if previous_version is None:
+        if previous_version is None or int(previous_version.issue_number) == 0:
             latest = self._get_latest_matching_issue()
             if latest:
                 return {self._to_version(latest)}
@@ -433,8 +450,21 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         title_template: str | None = None,
         body_files: list[str] | None = None,
         close_if_file: str | None = None,
+        skip_if_file: str | None = None,
     ) -> tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
         """Create or comment on a GitHub Issue and return its version.
+
+        *skip_if_file* names a workspace-relative file whose presence means
+        there is nothing to post: no issue is searched for, created, edited,
+        commented on or closed. It is the opposite of
+        *close_if_file*, for a gate where a pre-approved issue would be wrong
+        -- e.g. a release issue, where closing ships a release, so "nothing to
+        approve" must mean no issue at all. A put still has to return a version,
+        so a skipped put returns :data:`SKIPPED_VERSION`, which is constant:
+        Concourse records it once and never sees it as new again, and it is
+        ``open``, so the implicit get never tombstones anything. Takes
+        precedence over *close_if_file*. A missing file is the same as not
+        passing this param at all.
 
         *close_if_file* names a workspace-relative file whose presence means
         there is nothing to review -- e.g. an empty Pulumi preview diff. The
@@ -446,6 +476,10 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         waiting for a human to close an issue that was never opened. A
         missing file is the same as not passing this param at all.
         """
+        if skip_if_file and _resolve_in_workspace(sources_dir, skip_if_file).exists():
+            print(f"{skip_if_file!r} says there is nothing to post -- skipping")  # noqa: T201
+            return SKIPPED_VERSION, {"skipped_by": skip_if_file}
+
         # Assume that: title is enough uniqueness to discern whether the issue
         # already exists
 
