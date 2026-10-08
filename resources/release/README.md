@@ -135,6 +135,7 @@ Clones the repository and generates release artefacts from `version.since..versi
 | `in_flight` | Version of a release cut but not yet finished, or empty (may already be in production — see below) |
 | `hotfix` | Commit SHA of a pending hotfix request, or empty (see [hotfix](#action-create-with-commit_hash-hotfix)) |
 | `production_version` | The release production is running, or empty when unknown (see below) |
+| `production_state` | Why `production_version` is empty, or `known`: `known`, `none` or `unknown` (see below) |
 | `commits.json` | Structured list of `{sha, author, author_name, pr_number, pr_title, message}` -- `author` is the commit email (matched against `auto_check_authors` by the `github-issues` resource), `author_name` is the git-configured display name |
 | `checklist.md` | GitHub Issue body with a markdown task list grouped by author (`### <author_name>` headings, newest contributor first); use as `body_file` in `github-issues` resource |
 | `changelog_entry.md` | Single [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) entry for this version |
@@ -158,6 +159,34 @@ start while one is still running.
 
 Compare it with `version` to tell an unpromoted release (they differ) from a
 re-run of what is already live (they match).
+
+`production_state` tells an empty `production_version` that means "never
+deployed" from one that means "could not tell":
+
+| Value | Meaning |
+|---|---|
+| `known` | `production_version` is the release production is running |
+| `none` | The whole deployment history was read and production has never had a successful deployment |
+| `unknown` | Not established: no credentials or `repository`, an API failure, a window truncated before any success, a tied or withdrawn latest success, or a non-release ref |
+
+A caller deciding what to deploy should treat `unknown` as a reason to stop and
+`none` as a first release.
+
+### Fetching production state that is current
+
+Concourse caches a `get`'s output by resource, version and params, and neither
+file depends on the version, so a repeated `get` of the same version returns
+the `production_version` it first wrote, even after production has moved. A
+`get` that needs it current passes `cache_bust` with a value that differs on
+every build; the resource ignores it, and it changes the cache key so `in` runs
+again:
+
+```yaml
+- get: app-release-fresh
+  resource: app-release
+  params:
+    cache_bust: ((.:cache_bust))
+```
 
 ## `out` — Create or finish a release
 

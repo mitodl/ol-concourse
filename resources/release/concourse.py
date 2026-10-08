@@ -356,8 +356,14 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         version: ReleaseVersion,
         destination_dir: Path,
         build_metadata: BuildMetadata,
+        cache_bust: str = "",
     ) -> tuple[ReleaseVersion, dict[str, str]]:
         """Write release metadata to destination_dir.
+
+        ``cache_bust`` is accepted and ignored.  Concourse caches a ``get``'s
+        output by resource, version and params, and production state is not
+        part of the version, so a get that needs it current passes a value
+        that differs on every build (a timestamp, say) to force a fresh ``in``.
 
         Outputs:
         - version            plain version string
@@ -365,6 +371,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         - checklist.md       GitHub Issue body (for use as body_file)
         - changelog_entry.md single Keep a Changelog entry for this version
         - production_version the release production is running, or empty
+        - production_state   ``known``, ``none`` or ``unknown``
         """
         with (
             _git_ssh_env(self.private_key) as env,
@@ -379,7 +386,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 access_token=self.github_token,
             )
             commits = self._collect_commits(repo_path, version, env=env)
-        production_version = self._production_version()
+        production_version, production_state = self._production_status()
 
         destination_dir.mkdir(parents=True, exist_ok=True)
         (destination_dir / "version").write_text(version.version)
@@ -387,6 +394,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         (destination_dir / "in_flight").write_text(version.in_flight)
         (destination_dir / "hotfix").write_text(version.hotfix)
         (destination_dir / "production_version").write_text(production_version)
+        (destination_dir / "production_state").write_text(production_state)
         (destination_dir / "commits.json").write_text(json.dumps(commits, indent=2))
         (destination_dir / "checklist.md").write_text(
             _build_checklist(version.version, commits)
@@ -1182,21 +1190,36 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
     def _production_version(self) -> str:
         """Return the release production is running, or ``""`` when unknown.
 
-        That is the ref of the ``production_environment`` deployment whose
-        success was reported most recently, among the newest
+        See :meth:`_production_status`, which this wraps.
+        """
+        return self._production_status()[0]
+
+    def _production_status(self) -> tuple[str, str]:
+        """Return ``(version, state)`` for what production is running.
+
+        ``state`` says why ``version`` is empty, which the version alone cannot:
+
+        - ``known``    ``version`` is the release production is running.
+        - ``none``     the deployment history was read in full and production
+                       has never had a successful deployment.
+        - ``unknown``  it could not be established.
+
+        The version is the ref of the ``production_environment`` deployment
+        whose success was reported most recently, among the newest
         ``_PRODUCTION_SCAN_LIMIT`` deployments.  Ordered by when the deploy
         succeeded, not by version or by when it started: re-running an older
         production build rolls production back, and two overlapping deploys
         leave production on whichever finished last.  A deployment that never
         succeeded (a failed or still-running deploy) changed nothing.
 
-        Like :meth:`_production_state`, this will not guess.  It gives ``""``
-        when there are no credentials or ``repository``, the API call fails,
-        nothing in the window succeeded, the latest success has since been
-        superseded by a non-success status on the same deployment, two
-        different refs share the latest success timestamp, or the latest
-        success's ref is not a release version (something other than a
-        release deployed production).
+        This will not guess.  The state is
+        ``unknown`` when there are no credentials or ``repository``, the API
+        call fails, nothing in a *truncated* window succeeded, the latest
+        success has since been superseded by a non-success status on the same
+        deployment, two different refs share the latest success timestamp, or
+        the latest success's ref is not a release version (something other than
+        a release deployed production).  It is ``none`` only when the whole
+        history fits in the window and holds no success.
 
         The window is by creation order, so a deploy that started before the
         newest ``_PRODUCTION_SCAN_LIMIT`` and finished after all of them is
@@ -1205,9 +1228,10 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         """
         token = self.github_token
         if not (token and self.repository):
-            return ""
+            return "", "unknown"
         # (success time, ref, latest status of that deployment) per success.
         successes: list[tuple[datetime, str, str]] = []
+        truncated = False
         try:
             deployments = (
                 Github(auth=Auth.Token(token))
@@ -1217,6 +1241,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             # Newest first, so the window is the most recent deploys.
             for index, deployment in enumerate(deployments):
                 if index == _PRODUCTION_SCAN_LIMIT:
+                    truncated = True
                     break
                 statuses = list(deployment.get_statuses())
                 succeeded = [s.created_at for s in statuses if s.state == "success"]
@@ -1229,17 +1254,17 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 " is running",
                 file=sys.stderr,
             )
-            return ""
+            return "", "unknown"
         if not successes:
-            return ""
+            return "", "unknown" if truncated else "none"
         latest = max(when for when, _, _ in successes)
         winners = {(ref, current) for when, ref, current in successes if when == latest}
         if len(winners) != 1:
-            return ""
+            return "", "unknown"
         ((ref, current),) = winners
         if current != "success" or not VERSION_PATTERN.match(ref):
-            return ""
-        return ref
+            return "", "unknown"
+        return ref, "known"
 
     def _collect_commits_range(
         self, repo_path: Path, since_ref: str, until_ref: str, env: dict[str, str]
