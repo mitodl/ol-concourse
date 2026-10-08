@@ -15,6 +15,7 @@ from concourse import (
 )
 from concoursetools import BuildMetadata  # Import the actual class
 from concoursetools.testing import SimpleTestResourceWrapper
+from github import GithubException, UnknownObjectException
 from github.Issue import Issue
 
 
@@ -1512,6 +1513,144 @@ class TestCloseWithLabels:
         self._resource().download_version(version, str(dest), mock_build_metadata())
 
         mock_repo.get_issue.assert_not_called()
+
+
+class TestSkipIfBranchMissing:
+    """A re-run after the release is over must not open a gate issue for it.
+
+    The QA deploy re-runs on any infrastructure merge. After an abandon (or a
+    finish) its release-issue put searches for an *open* issue, finds none, and
+    would otherwise open one for a release whose branch is gone -- one that
+    ships it when closed.
+    """
+
+    VERSION = "2026.9.22.1"
+    TITLE = f"Release my-app {VERSION}"
+    BRANCH = f"releases/{VERSION}"
+
+    def _resource(self) -> ConcourseGithubIssuesResource:
+        return ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_prefix="Release my-app",
+            issue_title_template=self.TITLE,
+            update_in_place=True,
+        )
+
+    def _publish(self, tmp_path, **kwargs):
+        return self._resource().publish_new_version(
+            sources_dir=tmp_path,
+            build_metadata=mock_build_metadata(),
+            skip_if_branch_missing=self.BRANCH,
+            **kwargs,
+        )
+
+    def _branch_gone(self, mock_repo):
+        mock_repo.get_branch.side_effect = UnknownObjectException(404, {}, {})
+
+    def test_missing_branch_posts_nothing(self, mock_github, tmp_path):
+        mock_gh_instance, mock_repo = mock_github
+        self._branch_gone(mock_repo)
+
+        version, metadata = self._publish(tmp_path, body_file="checklist.md")
+
+        assert version == SKIPPED_VERSION
+        assert metadata == {"skipped_by": f"branch {self.BRANCH} is missing"}
+        mock_repo.get_branch.assert_called_once_with(self.BRANCH)
+        mock_gh_instance.search_issues.assert_not_called()
+        mock_repo.create_issue.assert_not_called()
+
+    def test_missing_branch_leaves_an_open_issue_alone(self, mock_github, tmp_path):
+        """A finished release's issue is not edited or commented on either."""
+        mock_gh_instance, mock_repo = mock_github
+        self._branch_gone(mock_repo)
+        existing = create_mock_issue(
+            number=9, title=self.TITLE, state="open", created_at=NOW
+        )
+        mock_gh_instance.search_issues.return_value = [existing]
+
+        self._publish(tmp_path)
+
+        existing.edit.assert_not_called()
+        existing.create_comment.assert_not_called()
+
+    def test_present_branch_posts_as_normal(self, mock_github, tmp_path):
+        mock_gh_instance, mock_repo = mock_github
+        mock_gh_instance.search_issues.return_value = []
+        mock_repo.create_issue.return_value = create_mock_issue(
+            number=12, title=self.TITLE, state="open", created_at=NOW
+        )
+
+        version, _ = self._publish(tmp_path)
+
+        mock_repo.get_branch.assert_called_once_with(self.BRANCH)
+        mock_repo.create_issue.assert_called_once()
+        assert version.issue_number == 12
+
+    def test_a_recut_of_an_abandoned_version_still_gets_its_issue(
+        self, mock_github, tmp_path
+    ):
+        """Abandoning deletes the tag, so the next release reuses the number.
+
+        The new release has the same title as the abandoned one, whose closed
+        issue is still labelled `abandoned`. Its branch exists, so the put must
+        not mistake it for the abandoned release.
+        """
+        mock_gh_instance, mock_repo = mock_github
+        abandoned = create_mock_issue(
+            number=7,
+            title=self.TITLE,
+            state="closed",
+            created_at=T_MINUS_1,
+            closed_at=T_MINUS_1,
+            labels=["abandoned"],
+        )
+        mock_repo.get_issues.return_value = [abandoned]
+        mock_gh_instance.search_issues.return_value = []  # state:open finds none
+        mock_repo.create_issue.return_value = create_mock_issue(
+            number=13, title=self.TITLE, state="open", created_at=NOW
+        )
+
+        version, _ = self._publish(tmp_path)
+
+        mock_repo.create_issue.assert_called_once()
+        assert version.issue_number == 13
+
+    def test_any_other_lookup_error_fails_the_put(self, mock_github, tmp_path):
+        """Rate limits and outages must not be read as "the branch is gone"."""
+        mock_gh_instance, mock_repo = mock_github
+        mock_repo.get_branch.side_effect = GithubException(502, {}, {})
+
+        with pytest.raises(GithubException):
+            self._publish(tmp_path)
+
+        mock_repo.create_issue.assert_not_called()
+
+    def test_skip_if_file_wins(self, mock_github, tmp_path):
+        _, mock_repo = mock_github
+        (tmp_path / "nothing-to-approve").touch()
+
+        version, metadata = self._publish(tmp_path, skip_if_file="nothing-to-approve")
+
+        assert version == SKIPPED_VERSION
+        assert metadata == {"skipped_by": "nothing-to-approve"}
+        mock_repo.get_branch.assert_not_called()
+
+    def test_does_not_stop_close_with_labels(self, mock_github, tmp_path):
+        """Abandon deletes the branch first, then retires the issue."""
+        mock_gh_instance, mock_repo = mock_github
+        self._branch_gone(mock_repo)
+        mock_gh_instance.search_issues.return_value = []
+        mock_repo.get_issues.return_value = []
+
+        version, metadata = self._publish(
+            tmp_path, title_template=self.TITLE, close_with_labels=["abandoned"]
+        )
+
+        assert version == SKIPPED_VERSION
+        assert metadata == {"retired_issues": "none"}
+        mock_repo.get_branch.assert_not_called()
 
 
 class TestGetRefusesSkipLabeledIssue:
