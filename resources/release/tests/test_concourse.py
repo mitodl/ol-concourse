@@ -773,7 +773,9 @@ def test_fetch_new_versions_new_commits(mock_tmpdir, mock_run, tmp_path, monkeyp
 # ---------------------------------------------------------------------------
 
 
-@patch.object(ReleaseResource, "_production_version", return_value="2026.4.10.1")
+@patch.object(
+    ReleaseResource, "_production_status", return_value=("2026.4.10.1", "known")
+)
 @patch("concourse._enrich_with_github")
 @patch("concourse._run")
 @patch("concourse.tempfile.TemporaryDirectory")
@@ -813,6 +815,7 @@ def test_download_version_writes_all_outputs(
     assert (dest / "checklist.md").exists()
     assert (dest / "changelog_entry.md").exists()
     assert (dest / "production_version").read_text() == "2026.4.10.1"
+    assert (dest / "production_state").read_text() == "known"
 
 
 @patch("concourse._run")
@@ -1473,6 +1476,23 @@ def test_in_writes_an_empty_production_version_when_unknown(tmp_path, world):
     )
 
     assert (dest / "production_version").read_text() == ""
+    assert (dest / "production_state").read_text() == "unknown"
+
+
+def test_in_accepts_a_cache_bust_param(tmp_path, world):
+    """Concourse passes get params as keyword arguments; an unknown one fails.
+
+    The param exists so a get that needs production state current can differ
+    from the cached one on every build.
+    """
+    version = _check(world)
+    dest = tmp_path / "get"
+
+    make_resource(uri=f"file://{world.origin}").download_version(
+        version, dest, MagicMock(), cache_bust="1760000000000000000"
+    )
+
+    assert (dest / "version").read_text() == version.version
 
 
 def test_hotfix_consumes_its_request(tmp_path, world, in_production):
@@ -2857,6 +2877,78 @@ def test_production_version_queries_the_configured_environment(mock_github):
 def test_production_version_is_unknown_when_the_api_fails(_mock_github):
     resource = make_resource(access_token="tok", repository="mitodl/my-app")
     assert resource._production_version() == ""
+
+
+def _production_status_given(
+    mock_github: MagicMock, *deployments: MagicMock
+) -> tuple[str, str]:
+    """Run _production_status over *deployments*, listed newest-created first."""
+    get_repo = mock_github.return_value.get_repo
+    get_repo.return_value.get_deployments.return_value = list(deployments)
+    resource = make_resource(access_token="tok", repository="mitodl/my-app")
+    return resource._production_status()
+
+
+@patch("concourse.Github")
+def test_production_status_is_known_with_the_live_release(mock_github):
+    state = _production_status_given(
+        mock_github, _deployment("2026.4.14.1", "in_progress", "success")
+    )
+    assert state == ("2026.4.14.1", "known")
+
+
+@patch("concourse.Github")
+def test_production_status_is_none_for_an_empty_history(mock_github):
+    """Production has never been deployed: a first release is not a guess."""
+    assert _production_status_given(mock_github) == ("", "none")
+
+
+@patch("concourse.Github")
+def test_production_status_is_none_when_the_whole_history_never_succeeded(mock_github):
+    state = _production_status_given(
+        mock_github, _deployment("2026.4.14.1", "in_progress", "failure")
+    )
+    assert state == ("", "none")
+
+
+@patch("concourse.Github")
+def test_production_status_is_unknown_when_the_window_is_truncated(mock_github):
+    """A success may sit beyond the scan window, so this cannot say none."""
+    failures = [
+        _deployment(f"2026.4.{day}.1", "failure")
+        for day in range(1, 1 + _PRODUCTION_SCAN_LIMIT)
+    ]
+    older = _deployment("2026.3.1.1", "failure")
+    assert _production_status_given(mock_github, *failures, older) == ("", "unknown")
+
+
+def test_production_status_is_unknown_without_credentials():
+    resource = make_resource(access_token=None, repository=None)
+    assert resource._production_status() == ("", "unknown")
+
+
+@patch("concourse.Github", side_effect=RuntimeError("boom"))
+def test_production_status_is_unknown_when_the_api_fails(_mock_github):
+    resource = make_resource(access_token="tok", repository="mitodl/my-app")
+    assert resource._production_status() == ("", "unknown")
+
+
+@patch("concourse.Github")
+def test_production_status_is_unknown_on_a_tied_success(mock_github):
+    state = _production_status_given(
+        mock_github,
+        _deployment("2026.4.14.1", "success"),
+        _deployment("2026.4.15.1", "success"),
+    )
+    assert state == ("", "unknown")
+
+
+@patch("concourse.Github")
+def test_production_status_is_unknown_after_a_non_release_deploy(mock_github):
+    assert _production_status_given(mock_github, _deployment("main", "success")) == (
+        "",
+        "unknown",
+    )
 
 
 # ---------------------------------------------------------------------------
