@@ -3,7 +3,7 @@
 resources:
   - name: app-release
     type: release
-    check_every: never
+    check_every: 1h  # not never: see "The latest cuts are re-emitted" in README
     source:
       uri: git@github.com:mitodl/my-app.git
       branch: main
@@ -75,6 +75,10 @@ _DEFAULT_CLONE_DEPTH = 200
 # that succeeded.  Bounds the API calls when failed deploys pile up on top of
 # the last good one; past it, production's version is reported as unknown.
 _PRODUCTION_SCAN_LIMIT = 20
+
+# How many of the newest release tags ``check`` re-emits the cut of.  See
+# ``ReleaseResource._recent_cuts``.
+_RECUT_TAGS = 3
 
 CHANGELOG_HEADER = """\
 # Changelog
@@ -245,8 +249,8 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         The last element is the next YYYY.MM.DD.N version when HEAD of the
         tracked branch has moved past the latest release tag, or the existing
         latest version when no new commits exist.  It is preceded by the
-        version ``action=create`` emitted when it cut the latest release tag;
-        see :meth:`_latest_cut` for why.
+        versions ``action=create`` emitted when it cut the newest release tags;
+        see :meth:`_recent_cuts` for why.
         """
         with (
             _git_ssh_env(self.private_key) as env,
@@ -262,17 +266,17 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             )
             tags = _get_release_tags(repo_path, env=env)
             versions = self._compute_versions(repo_path, tags, env=env)
-            cut = self._latest_cut(repo_path, tags, env=env)
+            cuts = self._recent_cuts(repo_path, tags, env=env)
         # Oldest first: Concourse treats the last version as the newest, and
         # the build job and the release bot both take the newest.
-        return [cut, *versions] if cut and cut not in versions else versions
+        return [*(cut for cut in cuts if cut not in versions), *versions]
 
-    def _latest_cut(
+    def _recent_cuts(
         self, repo_path: Path, tags: list[str], env: dict[str, str]
-    ) -> ReleaseVersion | None:
-        """Rebuild the version ``action=create`` emitted for the latest release tag.
+    ) -> list[ReleaseVersion]:
+        """Rebuild what ``action=create`` emitted for the newest release tags.
 
-        Returns None when there is no release tag to rebuild it from.
+        Returns them oldest first, at most ``_RECUT_TAGS`` of them.
 
         Concourse keeps a resource's versions per resource config, and a
         custom type's config includes the type's image version.  Rebuilding
@@ -281,29 +285,44 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         put to.  The deploy jobs take this resource with ``passed:`` the
         build job, and Concourse matches that constraint by version digest
         against the *current* history, so a fresh history strands them: the
-        build job's last output, the release they would deploy, is not in it,
+        build job's outputs, the releases they would deploy, are not in it,
         and nothing can run until a new release is cut.
 
-        Emitting that output again, byte for byte, puts it back.  Every field
-        of it is recoverable from the tags: the tag's commit, the tag before
+        Emitting those outputs again, byte for byte, puts them back.  Every
+        field is recoverable from the tags: the tag's commit, the tag before
         it as the baseline, and for a hotfix the commit ``cherry-pick -x``
-        recorded.  Ordinarily it is already in the history, from the build
-        job's own put, and re-emitting it changes nothing.  An abandoned
-        release's tag is gone, so it is never resurrected; the release before
-        it is rebuilt instead.
+        recorded.  More than the newest tag, because the newest cut's build
+        may have failed after the cut, and the deploy jobs then need the
+        release before it, as they would have without a fresh history.
+        Ordinarily all of these are already in the history, from the build
+        job's own puts, and re-emitting them changes nothing.  An abandoned
+        release's tag is gone, so it is never resurrected.
         """
-        if not tags:
+        first = max(len(tags) - _RECUT_TAGS, 0)
+        cuts = []
+        for index in range(first, len(tags)):
+            cut = self._cut(repo_path, tags, index, env=env)
+            if cut:
+                cuts.append(cut)
+        return cuts
+
+    def _cut(
+        self, repo_path: Path, tags: list[str], index: int, *, env: dict[str, str]
+    ) -> ReleaseVersion | None:
+        """Rebuild what ``action=create`` emitted for ``tags[index]``, if it can."""
+        version = tags[index]
+        try:
+            tag_sha = _run(
+                ["git", "rev-list", "-n1", version], cwd=repo_path, env=env
+            ).strip()
+        except subprocess.CalledProcessError:
             return None
-        version = tags[-1]
-        tag_sha = _run(
-            ["git", "rev-list", "-n1", version], cwd=repo_path, env=env
-        ).strip()
         if not tag_sha:
             return None
 
         # The same baseline action=create chose: the release before this one,
         # or the semver fallback when this is the first date-format release.
-        since = tags[-2] if len(tags) >= 2 else ""  # noqa: PLR2004
+        since = tags[index - 1] if index > 0 else ""
         if not since and self.semver_tag_fallback:
             semver_tags = _get_semver_tags(repo_path, env=env)
             since = semver_tags[-1] if semver_tags else ""
@@ -323,10 +342,17 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
     ) -> str:
         """Return the commit a hotfix tag was cherry-picked from, or empty.
 
-        A hotfix tag sits on a ``cherry-pick -x`` of the fix made directly on
-        top of what production was built from (see :meth:`_create_hotfix`).
-        The trailer alone is not enough, since anyone can land a cherry-pick
-        on the tracked branch, so the parent has to be that base as well.
+        A hotfix tag sits on a ``cherry-pick -x`` of the fix, made directly on
+        what production was built from: the base release's ``Release <base>``
+        commit, or the base tag itself when that commit never reached the
+        tracked branch (see :meth:`_create_hotfix`).  The trailer alone is not
+        enough, since anyone can land a cherry-pick on the tracked branch, so
+        the parent has to be that base, and the tag must not be on the tracked
+        branch's first-parent line, where every normal cut is and a hotfix
+        never is: it only reaches the branch through its release's merge.
+
+        Decided from the tag's own ancestry rather than the tracked branch's,
+        which a shallow clone may not reach back to.
         """
         if not VERSION_PATTERN.match(base_tag):
             return ""
@@ -337,19 +363,32 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         if not picked:
             return ""
         try:
-            parent = _run(
-                ["git", "rev-parse", f"{tag_sha}^"], cwd=repo_path, env=env
+            base_sha = _run(
+                ["git", "rev-list", "-n1", base_tag], cwd=repo_path, env=env
             ).strip()
-            base_shas = {
+            # The parent, its own parents, and its subject.
+            shas, _, subject = (
                 _run(
-                    ["git", "rev-list", "-n1", base_tag], cwd=repo_path, env=env
-                ).strip(),
-                self._production_commit(repo_path, base_tag, env=env),
-            }
+                    ["git", "log", "-1", "--format=%H %P%x09%s", f"{tag_sha}^"],
+                    cwd=repo_path,
+                    env=env,
+                )
+                .strip()
+                .partition("\t")
+            )
+            mainline = _run(
+                ["git", "rev-list", "--first-parent", f"origin/{self.branch}"],
+                cwd=repo_path,
+                env=env,
+            ).split()
         except subprocess.CalledProcessError:
             # Outside the shallow clone: not provably a hotfix.
             return ""
-        return picked[-1] if parent in base_shas else ""
+        parent, *grandparents = shas.split() or [""]
+        on_base = parent == base_sha or (
+            grandparents[:1] == [base_sha] and subject == f"Release {base_tag}"
+        )
+        return picked[-1] if on_base and tag_sha not in mainline else ""
 
     def _compute_versions(
         self, repo_path: Path, tags: list[str], env: dict[str, str]

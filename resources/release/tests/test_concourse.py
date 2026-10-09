@@ -1426,6 +1426,12 @@ def _check(world: _World) -> ReleaseVersion:
     return _check_all(world)[-1]
 
 
+def _cuts(world: _World, **kwargs: Any) -> list[ReleaseVersion]:
+    """Return the re-emitted cuts: everything check offers but the newest."""
+    resource = make_resource(uri=f"file://{world.origin}", **kwargs)
+    return resource.fetch_new_versions(None)[:-1]
+
+
 def test_check_offers_a_pending_hotfix(world):
     _request_hotfix(world, world.fix_sha, world.fix_sha)
 
@@ -1455,7 +1461,7 @@ def test_check_re_emits_what_create_emitted(tmp_path, world):
 
     versions = _check_all(world)
 
-    assert versions[0] == created
+    assert versions[-2] == created
     assert versions[-1].version == CUT, "the newest version is still check's own"
     assert versions[-1] != created
 
@@ -1464,21 +1470,21 @@ def test_check_re_emits_what_create_emitted_after_finish(tmp_path, world):
     created, _ = _put(_workspace(tmp_path, world.origin, version=CUT))
     _put(_workspace(tmp_path, world.origin, version=CUT), action="finish")
 
-    assert _check_all(world)[0] == created
+    assert _cuts(world)[-1] == created
 
 
 def test_check_re_emits_what_a_hotfix_create_emitted(tmp_path, world, in_production):
     created, _ = _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
     assert created.hotfix == world.fix_sha
 
-    assert _check_all(world)[0] == created
+    assert _cuts(world)[-1] == created
 
 
 def test_check_re_emits_a_finished_hotfix_too(tmp_path, world, in_production):
     created, _ = _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
     _put(_workspace(tmp_path, world.origin), action="finish")
 
-    assert _check_all(world)[0] == created
+    assert _cuts(world)[-1] == created
 
 
 def test_check_never_re_emits_an_abandoned_release(tmp_path, world, mocker):
@@ -1487,7 +1493,7 @@ def test_check_never_re_emits_an_abandoned_release(tmp_path, world, mocker):
     _put(_workspace(tmp_path, world.origin, version=CUT))
     _put(_workspace(tmp_path, world.origin, version=CUT), action="abandon")
 
-    cut = _check_all(world)[0]
+    cut = _cuts(world)[-1]
 
     assert cut.version == PROD
     assert cut.head_sha == _git(world.origin, "rev-list", "-n1", PROD)
@@ -1516,7 +1522,7 @@ def test_check_re_emits_the_semver_baseline_of_a_first_release(tmp_path, git_iso
     )
     assert created.since == "v1.2.3"
 
-    assert resource.fetch_new_versions(None)[0] == created
+    assert resource.fetch_new_versions(None)[-2] == created
 
 
 def test_check_does_not_mistake_a_cherry_pick_on_main_for_a_hotfix(tmp_path, world):
@@ -1529,7 +1535,90 @@ def test_check_does_not_mistake_a_cherry_pick_on_main_for_a_hotfix(tmp_path, wor
     created, _ = _put(_workspace(tmp_path, world.origin, version=CUT))
     assert created.hotfix == ""
 
-    assert _check_all(world)[0] == created
+    assert _cuts(world)[-1] == created
+
+
+def test_check_re_emits_the_cuts_before_the_latest(tmp_path, world):
+    """If the latest cut's build failed, the deploy jobs need the one before."""
+    first, _ = _put(_workspace(tmp_path, world.origin, version=CUT))
+    _put(_workspace(tmp_path, world.origin, version=CUT), action="finish")
+    _commit(world.dev, "Later work", **{"later.txt": "later\n"})
+    _git(world.dev, "pull", "-q", "--no-rebase", "origin", "main")
+    _git(world.dev, "push", "-q", "origin", "main")
+    second, _ = _put(_workspace(tmp_path, world.origin, version="2026.9.10.3"))
+
+    cuts = _cuts(world)
+
+    assert [cut.version for cut in cuts] == [PROD, CUT, "2026.9.10.3"]
+    assert cuts[1:] == [first, second]
+
+
+def test_check_re_emits_only_the_newest_cuts(tmp_path, world):
+    for n in range(2, 5):
+        _git(world.dev, "tag", "-a", f"2026.9.10.{n}", "-m", "r", "main")
+    _git(world.dev, "push", "-q", "origin", "--tags")
+
+    assert [cut.version for cut in _cuts(world)] == [
+        "2026.9.10.2",
+        "2026.9.10.3",
+        "2026.9.10.4",
+    ]
+
+
+def test_check_does_not_mistake_a_pick_on_an_unfinished_release_for_a_hotfix(
+    tmp_path, world, mocker
+):
+    """A pick landed on main right on top of a release that shipped but never finished.
+
+    Its parent is that release's tag, exactly where a hotfix would sit, but it
+    is on main's first-parent line, where a hotfix never is.
+    """
+    mocker.patch.object(ReleaseResource, "_reached_production", return_value=True)
+    _put(_workspace(tmp_path, world.origin, version=CUT))
+    _git(world.dev, "pull", "-q", "--no-rebase", "origin", "main")
+    _git(world.dev, "checkout", "-q", "-b", "elsewhere", world.prod_sha)
+    picked = _commit(world.dev, "Fix elsewhere", **{"elsewhere.txt": "fix\n"})
+    _git(world.dev, "checkout", "-q", "main")
+    _git(world.dev, "cherry-pick", "-x", picked)
+    assert _git(world.dev, "rev-parse", "HEAD^") == _git(
+        world.origin, "rev-list", "-n1", CUT
+    )
+    _git(world.dev, "push", "-q", "origin", "main")
+    created, _ = _put(_workspace(tmp_path, world.origin, version="2026.9.10.3"))
+    assert created.hotfix == ""
+
+    assert _cuts(world)[-1] == created
+
+
+def test_check_finds_a_hotfix_past_the_shallow_clone(tmp_path, world, in_production):
+    """Main has moved far past where the hotfix merged back in."""
+    created, _ = _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+    _put(_workspace(tmp_path, world.origin), action="finish")
+    _git(world.dev, "pull", "-q", "--no-rebase", "origin", "main")
+    for n in range(5):
+        _commit(world.dev, f"Later {n}", **{"later.txt": f"{n}\n"})
+    _git(world.dev, "push", "-q", "origin", "main")
+
+    assert _cuts(world, clone_depth=3)[-1] == created
+
+
+def test_create_emits_exactly_the_fields_check_rebuilds(tmp_path, world):
+    """A new field changes every digest, and the next image rebuild strands again.
+
+    Adding one is fine, but it has to be rebuildable from the tags, and the
+    rebuild in ReleaseResource._cut has to set it.
+    """
+    created, _ = _put(_workspace(tmp_path, world.origin, version=CUT))
+
+    assert set(created.to_flat_dict()) == {
+        "version",
+        "head_sha",
+        "since",
+        "commit_count",
+        "authors",
+        "in_flight",
+        "hotfix",
+    }
 
 
 def test_check_offers_one_version_before_any_release(tmp_path, git_isolated):
