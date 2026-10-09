@@ -10,7 +10,7 @@ from itertools import islice
 from typing import TYPE_CHECKING, Literal
 from concoursetools import BuildMetadata, ConcourseResource
 from concoursetools.version import Version, SortableVersionMixin
-from github import Github, Auth, Consts
+from github import Github, Auth, Consts, UnknownObjectException
 from github.GithubObject import NotSet
 from github.Issue import Issue
 
@@ -537,6 +537,21 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             or "none"
         }
 
+    def _branch_exists(self, branch: str) -> bool:
+        """Return whether *branch* exists in the repository right now.
+
+        Only a 404 means absent; any other error propagates. ``get_branch``
+        requests the branch by exact name and raises on a 404 immediately.
+        ``get_git_ref`` looks like the narrower call but returns a lazy object
+        that makes no request until an attribute is read, so it never raises
+        here and would report every branch as present.
+        """
+        try:
+            self.repo.get_branch(branch)
+        except UnknownObjectException:
+            return False
+        return True
+
     def _recent_issues(self) -> Iterable[Issue]:
         """Return the newest issues in either state, newest first.
 
@@ -604,8 +619,27 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         close_if_file: str | None = None,
         skip_if_file: str | None = None,
         close_with_labels: list[str] | None = None,
+        skip_if_branch_missing: str | None = None,
     ) -> tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
         """Create or comment on a GitHub Issue and return its version.
+
+        *skip_if_branch_missing* names a branch in the repository; when it is
+        not there, nothing is posted. It is for a put that can run again after
+        the thing it announces is over -- a release issue opened by a QA deploy
+        that an unrelated infrastructure merge re-runs once its release has been
+        abandoned or finished, and whose branch is therefore gone. Without it
+        that run searches for an *open* issue, finds none (the old one was
+        closed), and opens a new one for a release that can no longer ship; the
+        gate would then deploy it when someone closed it. Whether the branch
+        exists is read from the branches API, not inferred from the issues, so a
+        release that is later re-cut under the same version -- abandoning
+        deletes the tag, and the next release reuses the number -- is not
+        mistaken for the abandoned one. It does not apply to *close_with_labels*,
+        which has to run after the branch is deleted. A lookup that fails for any
+        reason other than the branch being absent fails the put rather than
+        guessing, since posting a stale issue and withholding a live one are
+        both worse than a red build that a retrigger clears. Returns
+        :data:`SKIPPED_VERSION` like *skip_if_file*, which wins when both are set.
 
         *close_with_labels* retires an issue instead of posting one: every issue
         whose title is exactly the rendered title gets these labels. An open one
@@ -655,6 +689,15 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             return self._close_with_labels(
                 build_metadata, close_with_labels, title_template
             )
+
+        if skip_if_branch_missing and not self._branch_exists(skip_if_branch_missing):
+            print(  # noqa: T201
+                f"branch {skip_if_branch_missing!r} is not in {self.repo.full_name} "
+                "-- its release is over, so there is nothing to post"
+            )
+            return SKIPPED_VERSION, {
+                "skipped_by": f"branch {skip_if_branch_missing} is missing"
+            }
 
         # Assume that: title is enough uniqueness to discern whether the issue
         # already exists
