@@ -295,7 +295,8 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         may have failed after the cut, and the deploy jobs then need the
         release before it, as they would have without a fresh history.
         Ordinarily all of these are already in the history, from the build
-        job's own puts, and re-emitting them changes nothing.  An abandoned
+        job's own puts, and re-emitting them only reorders them beneath the
+        next version, which stays the newest.  An abandoned
         release's tag is gone, so it is never resurrected.
         """
         first = max(len(tags) - _RECUT_TAGS, 0)

@@ -494,8 +494,8 @@ def test_fetch_new_versions_semver_fallback_ignored_when_date_tags_exist(
         "",  # git branch -r (no in-flight)
         "",  # for-each-ref refs/tags/hotfix/ (no pending hotfix)
         "dev@example.com|new work",  # git log 2026.4.14.1..HEAD
-        tag_sha,  # _latest_cut: rev-list -n1 2026.4.14.1
-        "v1.3.0\n2026.4.14.1",  # _latest_cut: semver baseline of the first cut
+        tag_sha,  # _cut: rev-list -n1 2026.4.14.1
+        "v1.3.0\n2026.4.14.1",  # _cut: semver baseline of the first cut
     ]
     idx = 0
 
@@ -1445,7 +1445,7 @@ def test_check_offers_a_pending_hotfix(world):
 
 
 # ---------------------------------------------------------------------------
-# check: re-emitting the latest cut, so a fresh version history is not empty
+# check: re-emitting the newest cuts, so a fresh version history is not empty
 # ---------------------------------------------------------------------------
 
 CUT = "2026.9.10.2"
@@ -1534,6 +1534,39 @@ def test_check_does_not_mistake_a_cherry_pick_on_main_for_a_hotfix(tmp_path, wor
     _git(world.dev, "push", "-q", "origin", "main")
     created, _ = _put(_workspace(tmp_path, world.origin, version=CUT))
     assert created.hotfix == ""
+
+    assert _cuts(world)[-1] == created
+
+
+def test_check_re_emits_a_hotfix_of_an_unfinished_release(
+    tmp_path, git_isolated, in_production
+):
+    """Production's release never merged back, so the hotfix sits on its tag."""
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", str(origin))
+    dev = tmp_path / "dev"
+    _git(tmp_path, "clone", "-q", str(origin), str(dev))
+    cut = _commit(dev, "Initial", **{"app.txt": "broken\n", "version.txt": "0\n"})
+    _git(dev, "tag", "-a", PROD, "-m", f"Release {PROD}", cut)
+    fix = _commit(dev, "Fix the bug", **{"app.txt": "fixed\n"})
+    _git(dev, "push", "-q", "origin", "main", "--tags")
+    created, _ = _put(_workspace(tmp_path, origin), commit_hash=fix)
+    assert _git(origin, "rev-parse", f"{created.head_sha}^") == cut
+
+    cuts = make_resource(uri=f"file://{origin}").fetch_new_versions(None)[:-1]
+
+    assert cuts[-1] == created
+
+
+def test_check_re_emits_a_hotfix_of_a_merge_commit(tmp_path, world, in_production):
+    _git(world.dev, "checkout", "-q", "-b", "fix-branch")
+    _commit(world.dev, "Fix on a branch", **{"hotfix.txt": "fix\n"})
+    _git(world.dev, "checkout", "-q", "main")
+    _git(world.dev, "merge", "-q", "--no-ff", "fix-branch", "-m", "Merge fix-branch")
+    _git(world.dev, "push", "-q", "origin", "main")
+    merge_sha = _git(world.dev, "rev-parse", "HEAD")
+    created, _ = _put(_workspace(tmp_path, world.origin), commit_hash=merge_sha)
+    assert created.hotfix == merge_sha
 
     assert _cuts(world)[-1] == created
 

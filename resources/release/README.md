@@ -146,7 +146,8 @@ Re-emitting the build job's outputs byte for byte puts them back. It covers
 more than the newest tag because that cut's build may have failed after the
 cut. The deploy jobs then fall back to the release before it, as they would
 have without a fresh history. Ordinarily these versions are already in the
-history from the build job's own puts, and re-emitting them changes nothing.
+history from the build job's own puts, and re-emitting them only reorders them
+beneath the next version, which stays the newest.
 An abandoned release's tag is deleted, so it is never re-emitted.
 
 The repair depends on `ReleaseVersion`'s fields. A new field changes every
