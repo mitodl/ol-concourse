@@ -493,8 +493,9 @@ def test_fetch_new_versions_semver_fallback_ignored_when_date_tags_exist(
         head_sha,
         "",  # git branch -r (no in-flight)
         "",  # for-each-ref refs/tags/hotfix/ (no pending hotfix)
-        tag_sha,  # rev-list -n1 2026.4.14.1
-        "dev@example.com",
+        "dev@example.com|new work",  # git log 2026.4.14.1..HEAD
+        tag_sha,  # _latest_cut: rev-list -n1 2026.4.14.1
+        "v1.3.0\n2026.4.14.1",  # _latest_cut: semver baseline of the first cut
     ]
     idx = 0
 
@@ -513,7 +514,11 @@ def test_fetch_new_versions_semver_fallback_ignored_when_date_tags_exist(
         ).date()
         versions = resource.fetch_new_versions(None)
 
-    assert versions[0].since == "2026.4.14.1"
+    assert versions[-1].since == "2026.4.14.1"
+    # The re-emitted cut of 2026.4.14.1 was itself the first date-format
+    # release, so its baseline is the semver tag.
+    assert versions[0].version == "2026.4.14.1"
+    assert versions[0].since == "v1.3.0"
 
 
 @patch("concourse._run")
@@ -1412,9 +1417,13 @@ def _remote_tags(origin: Path) -> list[str]:
     return _git(origin, "tag", "--list").split()
 
 
+def _check_all(world: _World) -> list[ReleaseVersion]:
+    return make_resource(uri=f"file://{world.origin}").fetch_new_versions(None)
+
+
 def _check(world: _World) -> ReleaseVersion:
-    [version] = make_resource(uri=f"file://{world.origin}").fetch_new_versions(None)
-    return version
+    """Return the newest version check offers, which the build job takes."""
+    return _check_all(world)[-1]
 
 
 def test_check_offers_a_pending_hotfix(world):
@@ -1427,6 +1436,114 @@ def test_check_offers_a_pending_hotfix(world):
     assert version.since == PROD
     assert version.commit_count == "1"
     assert version.version == _compute_next_version([PROD])
+
+
+# ---------------------------------------------------------------------------
+# check: re-emitting the latest cut, so a fresh version history is not empty
+# ---------------------------------------------------------------------------
+
+CUT = "2026.9.10.2"
+
+
+def test_check_re_emits_what_create_emitted(tmp_path, world):
+    """A rebuilt image gives the resource a fresh history; the deploy jobs need this.
+
+    Concourse matches ``passed:`` by the digest of the version's JSON, so
+    anything short of field-for-field equality strands them all the same.
+    """
+    created, _ = _put(_workspace(tmp_path, world.origin, version=CUT))
+
+    versions = _check_all(world)
+
+    assert versions[0] == created
+    assert versions[-1].version == CUT, "the newest version is still check's own"
+    assert versions[-1] != created
+
+
+def test_check_re_emits_what_create_emitted_after_finish(tmp_path, world):
+    created, _ = _put(_workspace(tmp_path, world.origin, version=CUT))
+    _put(_workspace(tmp_path, world.origin, version=CUT), action="finish")
+
+    assert _check_all(world)[0] == created
+
+
+def test_check_re_emits_what_a_hotfix_create_emitted(tmp_path, world, in_production):
+    created, _ = _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+    assert created.hotfix == world.fix_sha
+
+    assert _check_all(world)[0] == created
+
+
+def test_check_re_emits_a_finished_hotfix_too(tmp_path, world, in_production):
+    created, _ = _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+    _put(_workspace(tmp_path, world.origin), action="finish")
+
+    assert _check_all(world)[0] == created
+
+
+def test_check_never_re_emits_an_abandoned_release(tmp_path, world, mocker):
+    """Its tag is gone, so the release before it is rebuilt instead."""
+    mocker.patch.object(ReleaseResource, "_reached_production", return_value=False)
+    _put(_workspace(tmp_path, world.origin, version=CUT))
+    _put(_workspace(tmp_path, world.origin, version=CUT), action="abandon")
+
+    cut = _check_all(world)[0]
+
+    assert cut.version == PROD
+    assert cut.head_sha == _git(world.origin, "rev-list", "-n1", PROD)
+    assert cut.in_flight == PROD
+    assert cut.since == ""
+    assert cut.hotfix == ""
+
+
+def test_check_re_emits_the_semver_baseline_of_a_first_release(tmp_path, git_isolated):
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", str(origin))
+    dev = tmp_path / "dev"
+    _git(tmp_path, "clone", "-q", str(origin), str(dev))
+    _commit(dev, "Initial", **{"version.txt": "0\n"})
+    _git(dev, "tag", "v1.2.3")
+    _commit(dev, "Work", **{"app.txt": "work\n"})
+    _git(dev, "push", "-q", "origin", "main", "--tags")
+    sources = _workspace(tmp_path, origin, version=CUT)
+    resource = make_resource(uri=f"file://{origin}", semver_tag_fallback=True)
+    created, _ = resource.publish_new_version(
+        sources,
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+    assert created.since == "v1.2.3"
+
+    assert resource.fetch_new_versions(None)[0] == created
+
+
+def test_check_does_not_mistake_a_cherry_pick_on_main_for_a_hotfix(tmp_path, world):
+    """Only a pick made directly on production's commit is a hotfix."""
+    _git(world.dev, "checkout", "-q", "-b", "elsewhere", world.prod_sha)
+    picked = _commit(world.dev, "Fix elsewhere", **{"elsewhere.txt": "fix\n"})
+    _git(world.dev, "checkout", "-q", "main")
+    _git(world.dev, "cherry-pick", "-x", picked)
+    _git(world.dev, "push", "-q", "origin", "main")
+    created, _ = _put(_workspace(tmp_path, world.origin, version=CUT))
+    assert created.hotfix == ""
+
+    assert _check_all(world)[0] == created
+
+
+def test_check_offers_one_version_before_any_release(tmp_path, git_isolated):
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", str(origin))
+    dev = tmp_path / "dev"
+    _git(tmp_path, "clone", "-q", str(origin), str(dev))
+    _commit(dev, "Initial", **{"app.txt": "work\n"})
+    _git(dev, "push", "-q", "origin", "main")
+
+    versions = make_resource(uri=f"file://{origin}").fetch_new_versions(None)
+
+    assert len(versions) == 1
+    assert versions[0].in_flight == ""
 
 
 def test_check_ignores_a_hotfix_tag_that_is_not_a_full_sha(world):

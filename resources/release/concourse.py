@@ -51,6 +51,9 @@ SEMVER_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 # ``action=create`` deletes when it cuts that hotfix.
 HOTFIX_TAG_PREFIX = "hotfix/"
 HOTFIX_REQUEST_PATTERN = re.compile(r"^hotfix/([0-9a-f]{40})$")
+# What ``cherry-pick -x`` appends to a hotfix commit.  The last one names the
+# commit picked; earlier ones were carried over from the fix's own message.
+CHERRY_PICK_TRAILER = re.compile(r"\(cherry picked from commit ([0-9a-f]{40})\)")
 
 # Commits this resource itself creates during a release: the version-bump /
 # changelog commit written by ``action=create`` and the no-ff merge commit
@@ -239,9 +242,11 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
     ) -> list[ReleaseVersion]:
         """Return the next release version if unreleased commits exist.
 
-        Returns a single-element list containing the next YYYY.MM.DD.N
-        version when HEAD of the tracked branch has moved past the latest
-        release tag, or the existing latest version when no new commits exist.
+        The last element is the next YYYY.MM.DD.N version when HEAD of the
+        tracked branch has moved past the latest release tag, or the existing
+        latest version when no new commits exist.  It is preceded by the
+        version ``action=create`` emitted when it cut the latest release tag;
+        see :meth:`_latest_cut` for why.
         """
         with (
             _git_ssh_env(self.private_key) as env,
@@ -255,12 +260,100 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 depth=self.clone_depth,
                 access_token=self.github_token,
             )
-            return self._compute_versions(repo_path, env=env)
+            tags = _get_release_tags(repo_path, env=env)
+            versions = self._compute_versions(repo_path, tags, env=env)
+            cut = self._latest_cut(repo_path, tags, env=env)
+        # Oldest first: Concourse treats the last version as the newest, and
+        # the build job and the release bot both take the newest.
+        return [cut, *versions] if cut and cut not in versions else versions
+
+    def _latest_cut(
+        self, repo_path: Path, tags: list[str], env: dict[str, str]
+    ) -> ReleaseVersion | None:
+        """Rebuild the version ``action=create`` emitted for the latest release tag.
+
+        Returns None when there is no release tag to rebuild it from.
+
+        Concourse keeps a resource's versions per resource config, and a
+        custom type's config includes the type's image version.  Rebuilding
+        this resource's image therefore moves every pipeline's release
+        resource to a fresh version history the next time it is checked or
+        put to.  The deploy jobs take this resource with ``passed:`` the
+        build job, and Concourse matches that constraint by version digest
+        against the *current* history, so a fresh history strands them: the
+        build job's last output, the release they would deploy, is not in it,
+        and nothing can run until a new release is cut.
+
+        Emitting that output again, byte for byte, puts it back.  Every field
+        of it is recoverable from the tags: the tag's commit, the tag before
+        it as the baseline, and for a hotfix the commit ``cherry-pick -x``
+        recorded.  Ordinarily it is already in the history, from the build
+        job's own put, and re-emitting it changes nothing.  An abandoned
+        release's tag is gone, so it is never resurrected; the release before
+        it is rebuilt instead.
+        """
+        if not tags:
+            return None
+        version = tags[-1]
+        tag_sha = _run(
+            ["git", "rev-list", "-n1", version], cwd=repo_path, env=env
+        ).strip()
+        if not tag_sha:
+            return None
+
+        # The same baseline action=create chose: the release before this one,
+        # or the semver fallback when this is the first date-format release.
+        since = tags[-2] if len(tags) >= 2 else ""  # noqa: PLR2004
+        if not since and self.semver_tag_fallback:
+            semver_tags = _get_semver_tags(repo_path, env=env)
+            since = semver_tags[-1] if semver_tags else ""
+
+        return ReleaseVersion(
+            version=version,
+            head_sha=tag_sha,
+            since=since,
+            commit_count="0",
+            authors="",
+            in_flight=version,
+            hotfix=self._hotfix_source(repo_path, tag_sha, since, env=env),
+        )
+
+    def _hotfix_source(
+        self, repo_path: Path, tag_sha: str, base_tag: str, *, env: dict[str, str]
+    ) -> str:
+        """Return the commit a hotfix tag was cherry-picked from, or empty.
+
+        A hotfix tag sits on a ``cherry-pick -x`` of the fix made directly on
+        top of what production was built from (see :meth:`_create_hotfix`).
+        The trailer alone is not enough, since anyone can land a cherry-pick
+        on the tracked branch, so the parent has to be that base as well.
+        """
+        if not VERSION_PATTERN.match(base_tag):
+            return ""
+        message = _run(
+            ["git", "log", "-1", "--format=%B", tag_sha], cwd=repo_path, env=env
+        )
+        picked = CHERRY_PICK_TRAILER.findall(message)
+        if not picked:
+            return ""
+        try:
+            parent = _run(
+                ["git", "rev-parse", f"{tag_sha}^"], cwd=repo_path, env=env
+            ).strip()
+            base_shas = {
+                _run(
+                    ["git", "rev-list", "-n1", base_tag], cwd=repo_path, env=env
+                ).strip(),
+                self._production_commit(repo_path, base_tag, env=env),
+            }
+        except subprocess.CalledProcessError:
+            # Outside the shallow clone: not provably a hotfix.
+            return ""
+        return picked[-1] if parent in base_shas else ""
 
     def _compute_versions(
-        self, repo_path: Path, env: dict[str, str]
+        self, repo_path: Path, tags: list[str], env: dict[str, str]
     ) -> list[ReleaseVersion]:
-        tags = _get_release_tags(repo_path, env=env)
         latest_tag = tags[-1] if tags else None
 
         head_sha = _run(
