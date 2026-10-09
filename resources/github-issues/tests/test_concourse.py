@@ -1653,6 +1653,131 @@ class TestSkipIfBranchMissing:
         mock_repo.get_branch.assert_not_called()
 
 
+def _ref(name: str) -> MagicMock:
+    ref = MagicMock()
+    ref.ref = name
+    return ref
+
+
+class TestSkipIfTagMissing:
+    """Only an abandoned release must stop posting; a finished one may not.
+
+    Abandoning deletes the version tag; finishing keeps it and deletes only the
+    branch. After a rollback, a finished release is waiting for approval again.
+    """
+
+    VERSION = "2026.9.22.1"
+    TITLE = f"Release my-app {VERSION}"
+
+    def _resource(self) -> ConcourseGithubIssuesResource:
+        return ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_prefix="Release my-app",
+            issue_title_template=self.TITLE,
+            update_in_place=True,
+        )
+
+    def _publish(self, tmp_path, **kwargs):
+        return self._resource().publish_new_version(
+            sources_dir=tmp_path,
+            build_metadata=mock_build_metadata(),
+            **{"skip_if_tag_missing": self.VERSION, **kwargs},
+        )
+
+    def _created(self, mock_github, number=12):
+        mock_gh_instance, mock_repo = mock_github
+        mock_gh_instance.search_issues.return_value = []
+        mock_repo.create_issue.return_value = create_mock_issue(
+            number=number, title=self.TITLE, state="open", created_at=NOW
+        )
+
+    def test_missing_tag_posts_nothing(self, mock_github, tmp_path):
+        mock_gh_instance, mock_repo = mock_github
+        mock_repo.get_git_matching_refs.return_value = []
+
+        version, metadata = self._publish(tmp_path, body_file="checklist.md")
+
+        assert version == SKIPPED_VERSION
+        assert metadata == {"skipped_by": f"tag {self.VERSION} is missing"}
+        mock_repo.get_git_matching_refs.assert_called_once_with(f"tags/{self.VERSION}")
+        mock_gh_instance.search_issues.assert_not_called()
+        mock_repo.create_issue.assert_not_called()
+
+    def test_only_an_exact_tag_counts(self, mock_github, tmp_path):
+        """matching-refs is a prefix match: 2026.9.22.1 also matches .10."""
+        _, mock_repo = mock_github
+        mock_repo.get_git_matching_refs.return_value = [
+            _ref(f"refs/tags/{self.VERSION}0")
+        ]
+
+        version, _ = self._publish(tmp_path)
+
+        assert version == SKIPPED_VERSION
+        mock_repo.create_issue.assert_not_called()
+
+    def test_a_finished_release_with_its_tag_still_posts(self, mock_github, tmp_path):
+        """Finish deletes the branch but not the tag: the issue must be posted."""
+        _, mock_repo = mock_github
+        mock_repo.get_git_matching_refs.return_value = [
+            _ref(f"refs/tags/{self.VERSION}0"),
+            _ref(f"refs/tags/{self.VERSION}"),
+        ]
+        mock_repo.get_branch.side_effect = UnknownObjectException(404, {}, {})
+        self._created(mock_github)
+
+        version, _ = self._publish(tmp_path)
+
+        mock_repo.get_branch.assert_not_called()
+        mock_repo.create_issue.assert_called_once()
+        assert version.issue_number == 12
+
+    def test_any_lookup_error_fails_the_put(self, mock_github, tmp_path):
+        _, mock_repo = mock_github
+        mock_repo.get_git_matching_refs.side_effect = GithubException(502, {}, {})
+
+        with pytest.raises(GithubException):
+            self._publish(tmp_path)
+
+        mock_repo.create_issue.assert_not_called()
+
+    def test_skip_if_file_wins(self, mock_github, tmp_path):
+        _, mock_repo = mock_github
+        (tmp_path / "nothing-to-approve").touch()
+
+        version, metadata = self._publish(tmp_path, skip_if_file="nothing-to-approve")
+
+        assert version == SKIPPED_VERSION
+        assert metadata == {"skipped_by": "nothing-to-approve"}
+        mock_repo.get_git_matching_refs.assert_not_called()
+
+    def test_does_not_stop_close_with_labels(self, mock_github, tmp_path):
+        """Abandon deletes the tag first, then retires the issue."""
+        mock_gh_instance, mock_repo = mock_github
+        mock_repo.get_git_matching_refs.return_value = []
+        mock_gh_instance.search_issues.return_value = []
+        mock_repo.get_issues.return_value = []
+
+        version, metadata = self._publish(
+            tmp_path, title_template=self.TITLE, close_with_labels=["abandoned"]
+        )
+
+        assert version == SKIPPED_VERSION
+        assert metadata == {"retired_issues": "none"}
+        mock_repo.get_git_matching_refs.assert_not_called()
+
+    def test_an_empty_value_disables_the_check(self, mock_github, tmp_path):
+        """An infrastructure-only issue passes an empty tag: no lookup at all."""
+        _, mock_repo = mock_github
+        self._created(mock_github)
+
+        version, _ = self._publish(tmp_path, skip_if_tag_missing="")
+
+        mock_repo.get_git_matching_refs.assert_not_called()
+        assert version.issue_number == 12
+
+
 class TestGetRefusesSkipLabeledIssue:
     """A version `check` already discovered can be abandoned before it is fetched."""
 
