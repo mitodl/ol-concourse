@@ -613,8 +613,14 @@ def release_resource(  # noqa: PLR0913
     :param changelog_dir: Directory for per-release files (default:
         ``releases``).
     :param webhook_token: Concourse webhook token; used by the Slack release
-        bot to trigger ``check`` explicitly.  Defaults ``check_every`` to
-        ``never`` so the resource is not polled.
+        bot to trigger ``check`` explicitly.  ``check_every`` defaults to
+        ``never`` so the resource is not polled.  Pipelines that take this
+        resource with ``passed:`` should override it with an interval (e.g.
+        ``.model_copy(update={"check_every": Duration("1h")})``): rebuilding
+        the resource image gives the resource a fresh version history on its
+        next put, which only a check repairs.  Concourse checks a resource that
+        triggers nothing except through ``passed:`` only while that history is
+        fresh, empty, or failing, so this is not polling.
     :param semver_tag_fallback: When ``True`` and no date-format tags exist,
         fall back to the latest ``vX.Y.Z`` / ``X.Y.Z`` tag as the ``since``
         boundary.  Intended for repos transitioning off a semver release
