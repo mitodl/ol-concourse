@@ -552,6 +552,20 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             return False
         return True
 
+    def _tag_exists(self, tag: str) -> bool:
+        """Return whether the tag *tag* exists in the repository right now.
+
+        Reads the matching-refs API, which returns ``[]`` rather than a 404
+        when nothing matches and so cannot mistake an outage for an absence:
+        any error propagates. It matches by prefix (``2026.10.8`` matches
+        ``2026.10.8.1``), so only an exact ``refs/tags/<tag>`` counts.
+        ``get_git_ref`` is lazy, for the reason given in :meth:`_branch_exists`.
+        """
+        wanted = f"refs/tags/{tag}"
+        return any(
+            ref.ref == wanted for ref in self.repo.get_git_matching_refs(f"tags/{tag}")
+        )
+
     def _recent_issues(self) -> Iterable[Issue]:
         """Return the newest issues in either state, newest first.
 
@@ -620,8 +634,20 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         skip_if_file: str | None = None,
         close_with_labels: list[str] | None = None,
         skip_if_branch_missing: str | None = None,
+        skip_if_tag_missing: str | None = None,
     ) -> tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
         """Create or comment on a GitHub Issue and return its version.
+
+        *skip_if_tag_missing* is *skip_if_branch_missing* for a tag, and is the
+        one to use when only an *abandoned* release should post nothing: the
+        release resource deletes the version tag when it abandons a release,
+        but keeps it when it finishes one, where it deletes only the branch. A
+        finished release can be waiting for approval again (Production rolled
+        back to an older release), and a branch check would withhold its
+        issue. A re-cut release recreates the tag, so it still gets its issue.
+        It does not apply to *close_with_labels*, any lookup error fails the
+        put, and *skip_if_file* wins, all as for *skip_if_branch_missing*.
+        When both are set, either one missing skips the put.
 
         *skip_if_branch_missing* names a branch in the repository; when it is
         not there, nothing is posted. It is for a put that can run again after
@@ -697,6 +723,15 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             )
             return SKIPPED_VERSION, {
                 "skipped_by": f"branch {skip_if_branch_missing} is missing"
+            }
+
+        if skip_if_tag_missing and not self._tag_exists(skip_if_tag_missing):
+            print(  # noqa: T201
+                f"tag {skip_if_tag_missing!r} is not in {self.repo.full_name} "
+                "-- its release was abandoned, so there is nothing to post"
+            )
+            return SKIPPED_VERSION, {
+                "skipped_by": f"tag {skip_if_tag_missing} is missing"
             }
 
         # Assume that: title is enough uniqueness to discern whether the issue
