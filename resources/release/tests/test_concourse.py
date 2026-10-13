@@ -1623,6 +1623,31 @@ def test_check_does_not_mistake_a_pick_on_an_unfinished_release_for_a_hotfix(
     assert _cuts(world)[-1] == created
 
 
+def test_check_does_not_mistake_a_pick_past_the_shallow_clone_for_a_hotfix(
+    tmp_path, world, mocker
+):
+    """The same pick, but main has moved past it by more than the clone's depth.
+
+    The truncated first-parent line no longer reaches it, which proves
+    nothing; the clone has to be deepened until it does.
+    """
+    mocker.patch.object(ReleaseResource, "_reached_production", return_value=True)
+    _put(_workspace(tmp_path, world.origin, version=CUT))
+    _git(world.dev, "pull", "-q", "--no-rebase", "origin", "main")
+    _git(world.dev, "checkout", "-q", "-b", "elsewhere", world.prod_sha)
+    picked = _commit(world.dev, "Fix elsewhere", **{"elsewhere.txt": "fix\n"})
+    _git(world.dev, "checkout", "-q", "main")
+    _git(world.dev, "cherry-pick", "-x", picked)
+    _git(world.dev, "push", "-q", "origin", "main")
+    created, _ = _put(_workspace(tmp_path, world.origin, version="2026.9.10.3"))
+    assert created.hotfix == ""
+    for n in range(5):
+        _commit(world.dev, f"Later {n}", **{"later.txt": f"{n}\n"})
+    _git(world.dev, "push", "-q", "origin", "main")
+
+    assert _cuts(world, clone_depth=3)[-1] == created
+
+
 def test_check_finds_a_hotfix_past_the_shallow_clone(tmp_path, world, in_production):
     """Main has moved far past where the hotfix merged back in."""
     created, _ = _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)

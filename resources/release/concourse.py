@@ -328,6 +328,9 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             semver_tags = _get_semver_tags(repo_path, env=env)
             since = semver_tags[-1] if semver_tags else ""
 
+        hotfix = self._hotfix_source(repo_path, tag_sha, since, env=env)
+        if hotfix is None:
+            return None
         return ReleaseVersion(
             version=version,
             head_sha=tag_sha,
@@ -335,12 +338,12 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             commit_count="0",
             authors="",
             in_flight=version,
-            hotfix=self._hotfix_source(repo_path, tag_sha, since, env=env),
+            hotfix=hotfix,
         )
 
     def _hotfix_source(
         self, repo_path: Path, tag_sha: str, base_tag: str, *, env: dict[str, str]
-    ) -> str:
+    ) -> str | None:
         """Return the commit a hotfix tag was cherry-picked from, or empty.
 
         A hotfix tag sits on a ``cherry-pick -x`` of the fix, made directly on
@@ -351,9 +354,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         the parent has to be that base, and the tag must not be on the tracked
         branch's first-parent line, where every normal cut is and a hotfix
         never is: it only reaches the branch through its release's merge.
-
-        Decided from the tag's own ancestry rather than the tracked branch's,
-        which a shallow clone may not reach back to.
+        ``None`` when the clone cannot be deepened far enough to tell.
         """
         if not VERSION_PATTERN.match(base_tag):
             return ""
@@ -377,11 +378,6 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 .strip()
                 .partition("\t")
             )
-            mainline = _run(
-                ["git", "rev-list", "--first-parent", f"origin/{self.branch}"],
-                cwd=repo_path,
-                env=env,
-            ).split()
         except subprocess.CalledProcessError:
             # Outside the shallow clone: not provably a hotfix.
             return ""
@@ -389,7 +385,51 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         on_base = parent == base_sha or (
             grandparents[:1] == [base_sha] and subject == f"Release {base_tag}"
         )
-        return picked[-1] if on_base and tag_sha not in mainline else ""
+        if not on_base:
+            return ""
+        on_mainline = self._on_first_parent_line(repo_path, tag_sha, env=env)
+        if on_mainline is None:
+            return None
+        return "" if on_mainline else picked[-1]
+
+    def _on_first_parent_line(
+        self, repo_path: Path, sha: str, *, env: dict[str, str]
+    ) -> bool | None:
+        """Return whether *sha* is on the tracked branch's first-parent line.
+
+        The line is walked newest first, so once it reaches an ancestor of
+        *sha* it has passed every place *sha* could be.  Short of that, a
+        shallow clone's line just stopped early, which proves nothing, so the
+        clone is deepened until it does.  ``None`` if deepening gets no
+        further.
+        """
+        shallow = Path(
+            _run(
+                ["git", "rev-parse", "--path-format=absolute", "--git-path", "shallow"],
+                cwd=repo_path,
+                env=env,
+            ).strip()
+        )
+        oldest = ""
+        while True:
+            mainline = _run(
+                ["git", "rev-list", "--first-parent", f"origin/{self.branch}"],
+                cwd=repo_path,
+                env=env,
+            ).split()
+            if sha in mainline:
+                return True
+            if mainline[-1] == oldest:
+                return None
+            oldest = mainline[-1]
+            boundary = shallow.exists() and oldest in shallow.read_text().split()
+            if not boundary or _is_ancestor(repo_path, oldest, sha, env=env):
+                return False
+            _run(
+                ["git", "fetch", f"--deepen={self.clone_depth}", "origin", self.branch],
+                cwd=repo_path,
+                env=env,
+            )
 
     def _compute_versions(
         self, repo_path: Path, tags: list[str], env: dict[str, str]
