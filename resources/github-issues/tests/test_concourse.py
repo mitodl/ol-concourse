@@ -2144,3 +2144,43 @@ class TestPublishFindsOnlyOpenIssues:
         )
         mock_repo.get_issue.assert_called_once_with(46)
         issue.edit.assert_called_once_with(body="diff")
+
+    def test_labels_are_left_alone_if_the_issue_closes_after_the_lookup(
+        self, mock_github
+    ):
+        """The lookup read it open; by the label read it was retired.
+
+        Removing `abandoned` from it then would let the gate ship an abandoned
+        release, so the label reconcile re-reads and leaves a closed issue be.
+        """
+        mock_gh_instance, mock_repo = mock_github
+        looked_up = create_mock_issue(
+            number=47, title=self.TITLE, state="open", created_at=T_MINUS_1
+        )
+        looked_up.body = ""
+        retired = create_mock_issue(
+            number=47,
+            title=self.TITLE,
+            state="closed",
+            created_at=T_MINUS_1,
+            closed_at=NOW,
+            labels=["abandoned"],
+        )
+        mock_gh_instance.search_issues.return_value = [looked_up]
+        mock_repo.get_issues.return_value = []
+        mock_repo.get_issue.side_effect = [looked_up, retired]
+        ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template=self.TITLE,
+            issue_body_template="diff",
+            update_in_place=True,
+        ).publish_new_version(
+            sources_dir="dummy",
+            build_metadata=mock_build_metadata(),
+            labels=["release"],
+        )
+        assert mock_repo.get_issue.call_count == 2
+        retired.remove_from_labels.assert_not_called()
+        retired.add_to_labels.assert_not_called()
