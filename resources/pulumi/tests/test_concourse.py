@@ -1462,6 +1462,173 @@ class TestNoChangesMarker:
         assert not (tmp_path / "deploy_summary.md.no-changes").exists()
 
 
+def _gate_event(operation: str, resource_type: str, name: str) -> dict[str, Any]:
+    return {
+        "operation": operation,
+        "urn": f"urn:pulumi:Production::learn-ai::{resource_type}::{name}",
+        "type": resource_type,
+        "diffs": [],
+        "detailed_diff": {},
+    }
+
+
+def _stack_reference(name: str) -> dict[str, Any]:
+    return _gate_event("read", "pulumi:pulumi:StackReference", name)
+
+
+class TestCountsAgreeWithTheChangeList:
+    """The table and the per-resource list must not contradict each other.
+
+    They come from different Pulumi sources. The table is the engine's change
+    summary, which skips default providers and counts a read only when the
+    value it read changed; the list is the step-event stream, which reports
+    both. mitodl/learn-ai#103's table said `create 0`, `delete 0` and `read 2`
+    above a list with one create, one delete and 13 reads, and that issue was
+    the Production approval.
+    """
+
+    def _render(self, update: Any, tmp_path: Path) -> str:
+        version = PulumiVersion(id="0", summary=json.dumps(update.to_flat_dict()))
+        _make_resource().download_version(
+            version,
+            tmp_path,
+            MagicMock(),
+            summary_file="preview.md",
+            read_outputs=False,
+            preview_stack="Production",
+        )
+        return (tmp_path / "preview.md").read_text()
+
+    def _learn_ai_103(self) -> Any:
+        """Return a provider upgrade, two counted updates and 13 reads."""
+        changes = [
+            _gate_event("delete", "pulumi:providers:aws", "default_7_47_0"),
+            _gate_event("create", "pulumi:providers:aws", "default_7_48_0"),
+            _gate_event("update", "pulumi:providers:fastly", "fastly-provider"),
+            _gate_event(
+                "update",
+                "aws:elasticache/replicationGroup:ReplicationGroup",
+                "learn-ai-redis-production",
+            ),
+        ] + [_stack_reference(f"organization/stack-{i}/Production") for i in range(13)]
+        return pulumi_utils._preview_stack_update(
+            {
+                "change_summary": {"update": 2, "read": 2, "same": 105},
+                "changes": changes,
+            }
+        )
+
+    def _section(self, body: str, op: str) -> str:
+        """Return the open What-changed section for *op*, or "" if absent."""
+        marker = f"<details open><summary><b>{op}</b>"
+        if marker not in body:
+            return ""
+        start = body.index(marker)
+        return body[start : body.index("</details>", start)]
+
+    def test_every_counted_section_matches_its_table_row(self, tmp_path: Path) -> None:
+        body = self._render(self._learn_ai_103(), tmp_path)
+        assert "| update | 2 |" in body
+        assert "<b>update</b> (2)" in body
+        assert "| create | 0 |" in body
+        assert "| delete | 0 |" in body
+        assert not self._section(body, "create")
+        assert not self._section(body, "delete")
+        assert not self._section(body, "read")
+
+    def test_explicit_providers_stay_in_the_counted_list(self, tmp_path: Path) -> None:
+        """Pulumi counts a provider the program declares; only defaults are skipped."""
+        body = self._render(self._learn_ai_103(), tmp_path)
+        assert "`fastly-provider`" in self._section(body, "update")
+
+    def test_uncounted_steps_are_listed_collapsed_and_labelled(
+        self, tmp_path: Path
+    ) -> None:
+        body = self._render(self._learn_ai_103(), tmp_path)
+        assert "<details><summary>Reads and default providers (15)</summary>" in body
+        assert "- delete `default_7_47_0` — `pulumi:providers:aws`" in body
+        assert "- create `default_7_48_0` — `pulumi:providers:aws`" in body
+        assert "- read `organization/stack-12/Production`" in body
+        assert "counts a read only when the value it read changed" in body
+
+    def test_only_reads_is_no_changes_and_skips_the_gate(self, tmp_path: Path) -> None:
+        """mitodl/ol-analytics-api#110: all zeros, three unchanged StackReferences.
+
+        Every app stack reads StackReferences on every preview, so counting
+        their step events as material opened a Production approval for an
+        infrastructure diff of nothing.
+        """
+        update = pulumi_utils._preview_stack_update(
+            {
+                "change_summary": {"same": 52},
+                "changes": [
+                    _stack_reference(
+                        "organization/ol-infrastructure-eks/data.Production"
+                    ),
+                    _stack_reference("organization/ol-infrastructure-sentry/default"),
+                ],
+            }
+        )
+        body = self._render(update, tmp_path)
+        assert "No changes" in body
+        assert (tmp_path / f"preview.md{NO_CHANGES_MARKER_SUFFIX}").exists()
+
+    def test_a_changed_read_alone_is_not_material(self, tmp_path: Path) -> None:
+        """A read Pulumi did count still applies nothing to infrastructure."""
+        update = pulumi_utils._preview_stack_update(
+            {
+                "change_summary": {"read": 1, "same": 52},
+                "changes": [_stack_reference("organization/ol-infrastructure-eks/x")],
+            }
+        )
+        self._render(update, tmp_path)
+        assert (tmp_path / f"preview.md{NO_CHANGES_MARKER_SUFFIX}").exists()
+
+    def test_default_provider_upgrade_alone_is_not_material(
+        self, tmp_path: Path
+    ) -> None:
+        update = pulumi_utils._preview_stack_update(
+            {
+                "change_summary": {"same": 52},
+                "changes": [
+                    _gate_event("delete", "pulumi:providers:aws", "default_7_47_0"),
+                    _gate_event("create", "pulumi:providers:aws", "default_7_48_0"),
+                ],
+            }
+        )
+        self._render(update, tmp_path)
+        assert (tmp_path / f"preview.md{NO_CHANGES_MARKER_SUFFIX}").exists()
+
+    def test_a_real_change_beside_reads_is_still_material(self, tmp_path: Path) -> None:
+        update = pulumi_utils._preview_stack_update(
+            {
+                "change_summary": {"update": 1, "same": 52},
+                "changes": [
+                    _stack_reference("organization/ol-infrastructure-eks/x"),
+                    _gate_event("update", "kubernetes:apps/v1:Deployment", "app"),
+                ],
+            }
+        )
+        body = self._render(update, tmp_path)
+        assert "No changes" not in body
+        assert not (tmp_path / f"preview.md{NO_CHANGES_MARKER_SUFFIX}").exists()
+
+    def test_a_provider_named_default_needs_the_provider_type(
+        self, tmp_path: Path
+    ) -> None:
+        """Only `pulumi:providers:` types are default providers, whatever the name."""
+        update = pulumi_utils._preview_stack_update(
+            {
+                "change_summary": {"delete": 1},
+                "changes": [
+                    _gate_event("delete", "aws:s3/bucket:Bucket", "default-bucket")
+                ],
+            }
+        )
+        body = self._render(update, tmp_path)
+        assert "`default-bucket`" in self._section(body, "delete")
+
+
 class TestPreviewFailureTolerance:
     """A gate preview runs AFTER the deploy applied. It must never report red.
 
