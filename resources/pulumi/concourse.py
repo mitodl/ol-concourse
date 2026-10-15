@@ -432,7 +432,7 @@ def _is_uncounted(event: dict[str, Any]) -> bool:
     providers entirely, counts a read only when the value it read changed
     (``shouldRecordReadStep`` in pulumi/pkg/engine/update.go), and counts a
     replace once, while the step stream reports every read and every step of a
-    replace. None of these is a change the table has not already counted.
+    replace. None of these changes infrastructure beyond what the table counts.
     """
     op = str(event.get("operation"))
     return op == "read" or op in _REPLACEMENT_STEP_OPS or _is_default_provider(event)
@@ -760,7 +760,7 @@ def _render_uncounted(events: list[dict[str, Any]]) -> list[str]:
             "counts each replace once, under `replace`. So its rows can be lower "
             "than this list. A provider upgrade shows here as one create and one "
             "delete, and a replace as its create-replacement and delete-replaced "
-            "halves. Nothing here is a change the table has not already counted."
+            "halves. Nothing here changes infrastructure beyond what the table counts."
         ),
         "",
     ]
