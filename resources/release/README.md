@@ -23,7 +23,8 @@ resource_types:
 resources:
   - name: app-release
     type: release
-    check_every: never          # checked on demand, not polled
+    check_every: 1h             # checked when a fresh history needs repair;
+                                # see "The latest cuts are re-emitted"
     webhook_token: ((release.webhook_token))   # optional; the release bot
                                                # checks over the API instead
     source:
@@ -119,6 +120,44 @@ wrong. Superseding an in-flight release is `action: create`'s job.
 Detection queries the remote with `git ls-remote` rather than reading local
 `origin/releases/*` tracking refs, because an `out` step's workspace checkout
 comes from the `git` resource and only tracks the configured branch.
+
+### The latest cuts are re-emitted, so a rebuilt image does not strand deploys
+
+The next version is always the **last** element `check` returns. Ahead of it,
+`check` returns the versions `action: create` emitted when it cut the three
+newest release tags, oldest first. Each one is rebuilt field for field from the
+tags:
+
+- `head_sha` is the tag's commit.
+- `since` is the tag before it, or the semver fallback.
+- `in_flight` is the tag itself.
+- `commit_count` is `"0"`, and `authors` is empty.
+- For a hotfix, `hotfix` is the commit named by the `cherry-pick -x` trailer.
+
+Concourse keeps a resource's versions per resource config, and a custom type's
+config includes the type's image version. After this image is rebuilt, the
+next check of each pipeline's release resource, or put to it, starts a fresh,
+empty version history. Deploy jobs take this resource with `passed:` the build
+job, and Concourse matches that by version digest against the current history.
+Without the re-emitted cuts they couldn't run again until a new release was
+cut, not even for an infrastructure-only change.
+
+Re-emitting the build job's outputs byte for byte puts them back. It covers
+more than the newest tag because that cut's build may have failed after the
+cut. The deploy jobs then fall back to the release before it, as they would
+have without a fresh history. Ordinarily these versions are already in the
+history from the build job's own puts, and re-emitting them only reorders them
+beneath the next version, which stays the newest.
+An abandoned release's tag is deleted, so it is never re-emitted.
+
+The repair depends on `ReleaseVersion`'s fields. A new field changes every
+digest, so it has to be rebuildable from the tags too.
+
+A put can also start a fresh history, and nothing checks a `check_every: never`
+resource afterwards. Give the resource a real `check_every`. Concourse only
+checks a resource that doesn't trigger a job (except through `passed:`) when
+its history has never been checked, is empty, or failed its last check. So
+the interval only paces retries of a failing check.
 
 > **Depth note**: The resource uses a shallow clone (`--depth=200`). For repositories
 > where the previous release tag is more than 200 commits back, consider a full clone.
