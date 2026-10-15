@@ -1545,7 +1545,7 @@ class TestCountsAgreeWithTheChangeList:
         self, tmp_path: Path
     ) -> None:
         body = self._render(self._learn_ai_103(), tmp_path)
-        assert "<details><summary>Reads and default providers (15)</summary>" in body
+        assert "<details><summary>Steps the table does not count (15)</summary>" in body
         assert "- delete `default_7_47_0` — `pulumi:providers:aws`" in body
         assert "- create `default_7_48_0` — `pulumi:providers:aws`" in body
         assert "- read `organization/stack-12/Production`" in body
@@ -1611,6 +1611,30 @@ class TestCountsAgreeWithTheChangeList:
         )
         body = self._render(update, tmp_path)
         assert "No changes" not in body
+        assert not (tmp_path / f"preview.md{NO_CHANGES_MARKER_SUFFIX}").exists()
+
+    def test_a_replace_is_one_section_like_its_one_table_row(
+        self, tmp_path: Path
+    ) -> None:
+        """Pulumi counts a replace once; the step stream reports three steps."""
+        bucket = "aws:s3/bucket:Bucket"
+        update = pulumi_utils._preview_stack_update(
+            {
+                "change_summary": {"replace": 1, "same": 52},
+                "changes": [
+                    _gate_event("create-replacement", bucket, "assets"),
+                    _gate_event("replace", bucket, "assets"),
+                    _gate_event("delete-replaced", bucket, "assets"),
+                ],
+            }
+        )
+        body = self._render(update, tmp_path)
+        assert "| replace | 1 |" in body
+        assert "<b>replace</b> (1)" in body
+        assert "<b>create-replacement</b>" not in body
+        assert "<b>delete-replaced</b>" not in body
+        assert "- create-replacement `assets`" in body
+        assert "- delete-replaced `assets`" in body
         assert not (tmp_path / f"preview.md{NO_CHANGES_MARKER_SUFFIX}").exists()
 
     def test_a_provider_named_default_needs_the_provider_type(

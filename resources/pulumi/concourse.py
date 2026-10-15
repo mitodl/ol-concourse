@@ -394,6 +394,21 @@ _NOTABLE_OPS = ("create", "update", "replace", "delete")
 # no infrastructure, so it is not something to approve either.
 _NON_MATERIAL_OPS = frozenset({"same", "read"})
 
+# The halves of a replace, and its cleanup. Pulumi counts a replace once, as
+# `replace`, and emits these as separate steps it never counts: they are the
+# replacing and internal steps whose Logical() is false in
+# pulumi/pkg/resource/deploy/step.go.
+_REPLACEMENT_STEP_OPS = frozenset(
+    {
+        "create-replacement",
+        "delete-replaced",
+        "read-replacement",
+        "import-replacement",
+        "discard-replaced",
+        "remove-pending-replace",
+    }
+)
+
 
 def _is_default_provider(event: dict[str, Any]) -> bool:
     """Return whether *event* is a step on a Pulumi-managed default provider.
@@ -414,11 +429,13 @@ def _is_uncounted(event: dict[str, Any]) -> bool:
 
     The table comes from the engine's summary and the per-resource list from its
     step events, and the two count differently: the summary skips default
-    providers entirely and counts a read only when the value it read changed
-    (``shouldRecordReadStep`` in pulumi/pkg/engine/update.go), while the step
-    stream reports every read. Neither kind changes infrastructure.
+    providers entirely, counts a read only when the value it read changed
+    (``shouldRecordReadStep`` in pulumi/pkg/engine/update.go), and counts a
+    replace once, while the step stream reports every read and every step of a
+    replace. None of these is a change the table has not already counted.
     """
-    return str(event.get("operation")) == "read" or _is_default_provider(event)
+    op = str(event.get("operation"))
+    return op == "read" or op in _REPLACEMENT_STEP_OPS or _is_default_provider(event)
 
 
 def _preview_has_material_changes(summary: dict[str, Any]) -> bool:
@@ -575,12 +592,6 @@ def _render_preview(
             "merges can change what actually applies."
         ),
         "",
-        # ★ Closing an issue is an untyped signal: Concourse emits a version of
-        # the ISSUE resource, not of git, so a gate cannot bind to the revision
-        # it was rendered from. If another commit lands and previews while this
-        # gate is open, closing it deploys the newer one. Naming the revision is
-        # the cheapest honest defence -- a reviewer can compare it against the
-        # branch head before closing.
     ]
 
     revisions = _previewed_revision(work_dir)
@@ -730,7 +741,7 @@ def _render_changes(events: list[dict[str, Any]], total: int = 0) -> list[str]:
 
 
 def _render_uncounted(events: list[dict[str, Any]]) -> list[str]:
-    """List the reads and default-provider steps the table above leaves out.
+    """List the steps the table above leaves out, collapsed.
 
     Collapsed and labelled, not dropped: a reviewer who saw `delete 0` in the
     table and then a `delete` section below it stopped trusting the preview,
@@ -741,14 +752,15 @@ def _render_uncounted(events: list[dict[str, Any]]) -> list[str]:
     if not events:
         return []
     lines = [
-        f"<details><summary>Reads and default providers ({len(events)})</summary>",
+        f"<details><summary>Steps the table does not count ({len(events)})</summary>",
         "",
         (
             "The table above counts a read only when the value it read changed, "
-            "and never counts the default providers Pulumi manages itself, so "
-            "its `read`, `create` and `delete` rows can be lower than this list. "
-            "A provider upgrade shows here as one create and one delete. None of "
-            "these changes infrastructure."
+            "never counts the default providers Pulumi manages itself, and "
+            "counts each replace once, under `replace`. So its rows can be lower "
+            "than this list. A provider upgrade shows here as one create and one "
+            "delete, and a replace as its create-replacement and delete-replaced "
+            "halves. Nothing here is a change the table has not already counted."
         ),
         "",
     ]
