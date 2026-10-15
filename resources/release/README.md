@@ -179,6 +179,13 @@ Clones the repository and generates release artefacts from `version.since..versi
 | `checklist.md` | GitHub Issue body with a markdown task list grouped by author (`### <author_name>` headings, newest contributor first); use as `body_file` in `github-issues` resource |
 | `changelog_entry.md` | Single [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) entry for this version |
 
+`commits.json`, `checklist.md` and the changelog follow the tracked branch's
+first-parent line: a PR merged with a merge commit is one entry, its merge
+commit. The commits it merged are not listed separately, since each would
+resolve to the same PR. The entry is credited to the author of the merged
+branch's tip rather than to whoever merged it. `commit_count` and `authors`
+still count every commit, since they are part of the version identity.
+
 `production_version` is the release most recently deployed to production: the
 ref of the `production_environment` GitHub Deployment whose `success` status is
 latest, among the newest 20 deployments. Ordering by when a deploy succeeded,

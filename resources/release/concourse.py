@@ -602,6 +602,9 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
         A hotfix contains exactly its one commit, whatever sits between the
         previous release and that commit on the tracked branch.
+
+        Only the tracked branch's first-parent line is listed; see
+        :func:`_first_parent_commits`.
         """
         if version.hotfix:
             range_spec = f"{version.hotfix}^!"
@@ -609,12 +612,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             range_spec = f"{version.since}..{version.head_sha}"
         else:
             range_spec = version.head_sha
-        output = _run(
-            ["git", "log", "--format=%H|%ae|%an|%s", range_spec],
-            cwd=repo_path,
-            env=env,
-        )
-        commits = _parse_commit_log(output)
+        commits = _first_parent_commits(repo_path, range_spec, env=env)
 
         token = self.github_token
         if token and self.repository:
@@ -1442,14 +1440,12 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
     def _collect_commits_range(
         self, repo_path: Path, since_ref: str, until_ref: str, env: dict[str, str]
     ) -> list[dict[str, Any]]:
-        """Return enriched commit list between two refs."""
+        """Return enriched commit list between two refs.
+
+        First-parent only; see :func:`_first_parent_commits`.
+        """
         range_spec = f"{since_ref}..{until_ref}" if since_ref else until_ref
-        output = _run(
-            ["git", "log", "--format=%H|%ae|%an|%s", range_spec],
-            cwd=repo_path,
-            env=env,
-        )
-        commits = _parse_commit_log(output)
+        commits = _first_parent_commits(repo_path, range_spec, env=env)
 
         token = self.github_token
         if token and self.repository:
@@ -1948,6 +1944,86 @@ def _configure_https_auth(
 # ---------------------------------------------------------------------------
 # Commit log parsing
 # ---------------------------------------------------------------------------
+
+
+def _first_parent_commits(
+    repo_path: Path, range_spec: str, *, env: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Return the commits on *range_spec*'s first-parent line, unenriched.
+
+    A PR merged with a merge commit is listed as that merge commit alone. The
+    commits it merged are left out: _enrich_with_github resolves each of them
+    to the same PR, so each would be another identical checklist item.
+
+    A merge commit is authored by whoever merged it, which need not be whoever
+    wrote the change, and the checklist asks its author to sign off. So it is
+    credited to the author of its second parent, the tip of the merged branch.
+    """
+    output = _run(
+        ["git", "log", "--first-parent", "--format=%H|%ae|%an|%s", range_spec],
+        cwd=repo_path,
+        env=env,
+    )
+    commits = _parse_commit_log(output)
+    _credit_merged_branches(repo_path, range_spec, commits, env=env)
+    return commits
+
+
+def _credit_merged_branches(
+    repo_path: Path,
+    range_spec: str,
+    commits: list[dict[str, Any]],
+    *,
+    env: dict[str, str],
+) -> None:
+    """Credit each merge commit in *commits* to the author of its second parent.
+
+    Two git calls however many merges there are: one lists the merges and
+    their parents, one reads every second parent's author.
+    """
+    second_parents = {}
+    for line in _run(
+        ["git", "log", "--first-parent", "--merges", "--format=%H %P", range_spec],
+        cwd=repo_path,
+        env=env,
+    ).splitlines():
+        sha, *parents = line.split()
+        # A shallow clone's boundary commit has no parents listed, so it is
+        # not a merge here and keeps whoever merged it.
+        if len(parents) > 1:
+            second_parents[sha] = parents[1]
+    if not second_parents:
+        return
+    try:
+        output = _run(
+            [
+                "git",
+                "log",
+                "--no-walk=unsorted",
+                "--format=%H|%ae|%an",
+                *sorted(set(second_parents.values())),
+            ],
+            cwd=repo_path,
+            env=env,
+        )
+    except subprocess.CalledProcessError:
+        # Attribution is a courtesy; an unreadable parent must not fail the step.
+        print(  # noqa: T201
+            "Could not read merged branch authors; crediting merges to whoever "
+            "merged them",
+            file=sys.stderr,
+        )
+        return
+    authors = {}
+    for line in output.splitlines():
+        sha, _, rest = line.partition("|")
+        email, _, name = rest.partition("|")
+        if email.strip():
+            authors[sha.strip()] = (email.strip(), name.strip() or email.strip())
+    for commit in commits:
+        author = authors.get(second_parents.get(commit["sha"], ""))
+        if author:
+            commit["author"], commit["author_name"] = author
 
 
 def _parse_commit_log(output: str) -> list[dict[str, Any]]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from concourse import (
     _clone,
     _commit_info_range,
     _compute_next_version,
+    _first_parent_commits,
     _get_in_flight_release_version,
     _is_release_machinery,
     _get_semver_tags,
@@ -911,6 +913,7 @@ def test_publish_new_version_create(mock_run, tmp_path):
             "",  # git status --porcelain (staging check — empty, no dirty files)
             "",  # git tag --list (for prior tags in _collect_commits_range)
             "",  # git log (no commits in range)
+            "",  # git log --merges (no merges to credit)
             "",  # git push origin releases/2026.4.14.1
             "",  # git tag 2026.4.14.1 <sha>
             "",  # git push origin refs/tags/2026.4.14.1
@@ -1716,6 +1719,120 @@ def test_in_lists_only_the_hotfix_commit(tmp_path, world):
     assert (dest / "hotfix").read_text() == world.fix_sha
     commits = json.loads((dest / "commits.json").read_text())
     assert [c["sha"] for c in commits] == [world.fix_sha]
+
+
+def _merge_pull_request(world: _World) -> tuple[str, list[str]]:
+    """Merge Alice's two-commit PR into main with Bob's merge commit, as GitHub does."""
+    _git(world.dev, "checkout", "-q", "-b", "feat")
+    branch_shas = []
+    for name, message in (("one.txt", "feat: part one"), ("two.txt", "feat: part two")):
+        (world.dev / name).write_text(f"{message}\n")
+        _git(world.dev, "add", "-A")
+        _git(
+            world.dev,
+            "commit",
+            "-q",
+            "--author",
+            "Alice <alice@example.com>",
+            "-m",
+            message,
+        )
+        branch_shas.append(_git(world.dev, "rev-parse", "HEAD"))
+    _git(world.dev, "checkout", "-q", "main")
+    _git(
+        world.dev,
+        "-c",
+        "user.name=Bob",
+        "-c",
+        "user.email=bob@example.com",
+        "merge",
+        "-q",
+        "--no-ff",
+        "feat",
+        "-m",
+        "Merge pull request #7 from mitodl/feat\n\nfeat: the feature",
+    )
+    _git(world.dev, "push", "-q", "origin", "main")
+    return _git(world.dev, "rev-parse", "HEAD"), branch_shas
+
+
+def _enrich_all_to_pr_7(commits, _token, _repository):
+    """Stand in for GitHub, which resolves the merge and what it merged to #7."""
+    for commit in commits:
+        if commit["message"].startswith(("Merge pull request #7", "feat: part")):
+            commit["pr_number"] = 7
+            commit["pr_title"] = "feat: the feature"
+    return commits
+
+
+def test_in_lists_a_merged_pr_once_not_once_per_commit(tmp_path, world, mocker):
+    """Each merged commit enriches to the same PR, so each was another item."""
+    mocker.patch("concourse._enrich_with_github", side_effect=_enrich_all_to_pr_7)
+    # The token enrichment needs would otherwise send a real production lookup.
+    mocker.patch.object(
+        ReleaseResource, "_production_status", return_value=("", "unknown")
+    )
+    merge_sha, branch_shas = _merge_pull_request(world)
+    version = _check(world)
+    dest = tmp_path / "get"
+
+    make_resource(
+        uri=f"file://{world.origin}", access_token="t", repository="mitodl/my-app"
+    ).download_version(version, dest, MagicMock())
+
+    commits = json.loads((dest / "commits.json").read_text())
+    shas = [c["sha"] for c in commits]
+    assert merge_sha in shas
+    assert not set(branch_shas) & set(shas)
+    assert world.fix_sha in shas, "commits made on main are still listed"
+    checklist = (dest / "checklist.md").read_text()
+    assert checklist.count("(#7)") == 1
+
+
+def test_a_merged_pr_is_credited_to_its_author_not_its_merger(tmp_path, world):
+    """The checklist asks the author to sign off, and Bob only clicked merge."""
+    merge_sha, _ = _merge_pull_request(world)
+    version = _check(world)
+    dest = tmp_path / "get"
+
+    make_resource(uri=f"file://{world.origin}").download_version(
+        version, dest, MagicMock()
+    )
+
+    commits = json.loads((dest / "commits.json").read_text())
+    merge = next(c for c in commits if c["sha"] == merge_sha)
+    assert merge["author"] == "alice@example.com"
+    assert merge["author_name"] == "Alice"
+    assert "### Bob" not in (dest / "checklist.md").read_text()
+
+
+def test_create_lists_a_merged_pr_once(world):
+    """The cut's commit list (changelog) follows the same first-parent rule."""
+    merge_sha, branch_shas = _merge_pull_request(world)
+
+    commits = make_resource()._collect_commits_range(
+        world.dev, PROD, "main", env=dict(os.environ)
+    )
+
+    shas = [c["sha"] for c in commits]
+    assert shas[0] == merge_sha
+    assert not set(branch_shas) & set(shas)
+    assert commits[0]["author"] == "alice@example.com"
+
+
+def test_a_merge_at_a_shallow_clone_boundary_keeps_its_merger(tmp_path, world):
+    """Its parents are past the depth, so there is no branch tip to credit."""
+    merge_sha, _ = _merge_pull_request(world)
+    shallow = tmp_path / "shallow"
+    _git(
+        tmp_path, "clone", "-q", "--depth", "1", f"file://{world.origin}", str(shallow)
+    )
+
+    commits = _first_parent_commits(shallow, merge_sha, env=dict(os.environ))
+
+    assert [(c["sha"], c["author"]) for c in commits] == [
+        (merge_sha, "bob@example.com")
+    ]
 
 
 def test_in_writes_an_empty_hotfix_file_for_a_normal_release(tmp_path, world):
