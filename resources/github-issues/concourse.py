@@ -7,15 +7,12 @@ import json
 from collections.abc import Iterable
 from datetime import datetime, timedelta
 from itertools import islice
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 from concoursetools import BuildMetadata, ConcourseResource
 from concoursetools.version import Version, SortableVersionMixin
 from github import Github, Auth, Consts, UnknownObjectException
 from github.GithubObject import NotSet
 from github.Issue import Issue
-
-if TYPE_CHECKING:
-    from github.Issue import IssueSearchResult
 
 ISO_8601_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
@@ -25,8 +22,8 @@ ISO_8601_FORMAT = "%Y-%m-%dT%H:%M:%S"
 # body_files composition can produce one that does -- so this is the last
 # point that can actually guarantee the API call succeeds.
 GITHUB_BODY_MAX_CHARS = 65536
-# How many of the newest issues close_with_labels reads to cover the lag of GitHub's
-# search index. One page at ``per_page=100``.
+# How many of the newest issues an exact-title lookup reads to cover the lag of
+# GitHub's search index. One page at ``per_page=100``.
 _RECENT_ISSUE_SCAN = 100
 _TRUNCATION_NOTICE = (
     "\n\n> :warning: **Body truncated** -- this content exceeded GitHub's "
@@ -482,32 +479,16 @@ class ConcourseGithubIssuesResource(ConcourseResource):
     ) -> tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
         """Label, and close if open, every issue titled exactly as rendered."""
         title = self.get_title_from_build(build_metadata, title_template=title_template)
-        safe_title = title.replace('"', '\\"')
-        # No state filter: a reviewer may have closed the issue after the
-        # release was cut but before this build ran. A gate that has not
-        # polled yet would still fire on it, and labelling it is what stops
-        # that. An issue the gate already consumed was renamed `[CONSUMED ...]`
-        # by its get, so the exact-title test below never matches one.
-        query = f'repo:{self.repo.full_name} "{safe_title}" in:title is:issue'
-        # Search matches on tokens, not on the whole title, so keep only exact
-        # matches: closing a neighbour's issue is worse than closing none.
-        found: dict[int, Issue | IssueSearchResult] = {
-            issue.number: issue
-            for issue in self.gh.search_issues(query)
-            if issue.title == title
-        }
-        # The search index lags behind issue creation, and an abandon can land
-        # moments after the QA put that opened the gate issue. Finding nothing
-        # would leave that issue open and able to ship the release, so also
-        # read the newest issues from the issues API, which is consistent.
-        for issue in self._recent_issues():
-            if issue.title == title and not issue.pull_request:
-                found.setdefault(issue.number, issue)
-        issues = sorted(found.values(), key=lambda issue: issue.number)
-        for found_issue in issues:
-            # Search results can be stale in either direction, so whether to
-            # close comes from the issues API.
-            issue = self.repo.get_issue(found_issue.number)
+        # Any state: a reviewer may have closed the issue after the release was
+        # cut but before this build ran. A gate that has not polled yet would
+        # still fire on it, and labelling it is what stops that. An issue the
+        # gate already consumed was renamed `[CONSUMED ...]` by its get, so the
+        # exact-title match never finds one. An abandon can also land moments
+        # after the QA put that opened the gate issue, before search has
+        # indexed it; finding nothing would leave that issue open and able to
+        # ship the release, which is why the lookup reads the issues API too.
+        issues = self._issues_titled(title, open_only=False)
+        for issue in issues:
             if issue.state == "open":
                 print(f"about to label {issue=} with {labels=} and close it")  # noqa: T201
                 issue.create_comment(
@@ -565,6 +546,37 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         return any(
             ref.ref == wanted for ref in self.repo.get_git_matching_refs(f"tags/{tag}")
         )
+
+    def _issues_titled(self, title: str, *, open_only: bool) -> list[Issue]:
+        """Return every issue titled exactly *title*, read fresh, oldest first.
+
+        Search matches on tokens, not on the whole title, so only exact matches
+        count: acting on a neighbour's issue is worse than acting on none. Its
+        index also lags issue state in both directions. An issue created
+        seconds ago can be missing from it, so the newest issues are read from
+        the issues API as well. An issue closed seconds ago can still match
+        ``state:open``, so every match is re-read from the issues API, which is
+        consistent, and the state it reports is the one returned. With
+        *open_only*, the search asks for open issues and any match the issues
+        API calls closed is dropped.
+        """
+        safe_title = title.replace('"', '\\"')
+        state = "state:open " if open_only else ""
+        query = f'repo:{self.repo.full_name} {state}"{safe_title}" in:title is:issue'
+        numbers = {
+            issue.number
+            for issue in self.gh.search_issues(query)
+            if issue.title == title
+        }
+        numbers.update(
+            issue.number
+            for issue in self._recent_issues()
+            if issue.title == title and not issue.pull_request
+        )
+        issues = [self.repo.get_issue(number) for number in sorted(numbers)]
+        if open_only:
+            issues = [issue for issue in issues if issue.state == "open"]
+        return issues
 
     def _recent_issues(self) -> Iterable[Issue]:
         """Return the newest issues in either state, newest first.
@@ -746,17 +758,15 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             )
         )
 
-        # Use GitHub Search API for efficiency instead of listing all issues
         candidate_issue_title = self.get_title_from_build(
             build_metadata, title_template=title_template
         )
-        # Ensure title is properly quoted for the search query
-        safe_title = candidate_issue_title.replace('"', '\\"')
-        query = (
-            f'repo:{self.repo.full_name} state:open "{safe_title}" in:title is:issue'
-        )
-        search_results = self.gh.search_issues(query)
-        already_exists = list(search_results)  # Evaluate the PaginatedList
+        # Only an issue the issues API calls open counts. Search can still
+        # return one closed seconds ago, and editing that would rewrite an
+        # approval that was already given -- for a release gate, a QA re-run
+        # replacing the body of a closed Production gate. A closed issue means
+        # this put needs a new one. The newest open match is the one used.
+        already_exists = self._issues_titled(candidate_issue_title, open_only=True)
 
         if len(already_exists) > 1:
             print("Warning: There are multiple matches for the desired issue title!")  # noqa: T201
@@ -771,7 +781,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             )
             print(f"created issue: {working_issue=}")  # noqa: T201
         elif self.update_in_place:
-            working_issue = already_exists[0]
+            working_issue = already_exists[-1]
             # Edit in place rather than commenting -- a retrigger with no
             # real change to review (e.g. an unrelated upstream pipeline
             # commit) would otherwise post a second, freshly-unchecked
@@ -805,7 +815,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             if set(desired_labels) != {label.name for label in working_issue.labels}:
                 self._reconcile_labels(working_issue.number, desired_labels)
         else:
-            working_issue = already_exists[0]
+            working_issue = already_exists[-1]
             print(f"about to comment on {working_issue=} with {issue_body=}")  # noqa: T201
             working_issue.create_comment(issue_body)
 

@@ -57,7 +57,13 @@ The issue title and body are generated from configurable templates:
 - `issue_title_template` — default: `[bot] Pipeline {BUILD_PIPELINE_NAME} task {BUILD_JOB_NAME} completed`
 - `issue_body_template` — Markdown body with build details and a link to the build log
 
-If no open issue matches the title, a new one is created. If a matching open
+If no open issue matches the title, a new one is created. A match is an issue
+whose title is exactly the rendered title, found by search plus a read of the
+newest 100 issues, and open by the issues API. Search alone lags issue state in
+both directions: it can miss an issue created moments ago, which would open a
+duplicate, and still list one closed moments ago as open, which would write to
+an issue someone has already acted on (for a gate, an approval already given).
+When several open issues match, the newest is used. If a matching open
 issue already exists, the default behavior is to **comment** on it -- for
 most consumers of this resource, a fresh comment on an already-open issue
 *is* the useful signal: it means this gate has been hit again (e.g. deploys
@@ -73,10 +79,10 @@ checklist line (`- [ ] ...`) already checked in the current body stays
 checked after the edit, matched by the line's content after the checkbox
 mark -- only genuinely new or changed lines start unchecked. The put's
 `labels` are also reconciled onto the issue, by adding and removing one label
-at a time, so a label written after the put read the issue survives. A
-matching issue that the issues API reports as closed keeps its labels: the
-search index can still list an issue that `close_with_labels` has just
-retired as open.
+at a time, so a label written after the put read the issue survives. The
+labels are read again just before they are reconciled, and an issue closed
+by then keeps its labels, so one that `close_with_labels` has just retired is
+left alone.
 
 ## Authentication
 
