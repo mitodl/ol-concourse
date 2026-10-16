@@ -390,7 +390,52 @@ _NOTABLE_OPS = ("create", "update", "replace", "delete")
 # Ops that mean "nothing is being done to this resource". Pulumi reports a
 # genuine no-op preview as {"same": N}, not as an empty summary, so these have
 # to be discounted before asking whether a preview found anything worth reading.
-_NON_MATERIAL_OPS = frozenset({"same"})
+# A read only fetches state (a StackReference, a `.get()`); applying it changes
+# no infrastructure, so it is not something to approve either.
+_NON_MATERIAL_OPS = frozenset({"same", "read"})
+
+# The halves of a replace, and its cleanup. Pulumi counts a replace once, as
+# `replace`, and emits these as separate steps it never counts: they are the
+# replacing and internal steps whose Logical() is false in
+# pulumi/pkg/resource/deploy/step.go.
+_REPLACEMENT_STEP_OPS = frozenset(
+    {
+        "create-replacement",
+        "delete-replaced",
+        "read-replacement",
+        "import-replacement",
+        "discard-replaced",
+        "remove-pending-replace",
+    }
+)
+
+
+def _is_default_provider(event: dict[str, Any]) -> bool:
+    """Return whether *event* is a step on a Pulumi-managed default provider.
+
+    Mirrors Pulumi's own ``providers.IsDefaultProvider``: a ``pulumi:providers:``
+    type whose name starts with ``default``. The engine treats these steps as
+    internal and leaves them out of its change summary, so an AWS provider bump
+    that the step stream reports as creating ``default_7_48_0`` and deleting
+    ``default_7_47_0`` is counted as nothing.
+    """
+    return _resource_type(event).startswith("pulumi:providers:") and _resource_name(
+        str(event.get("urn", ""))
+    ).startswith("default")
+
+
+def _is_uncounted(event: dict[str, Any]) -> bool:
+    """Return whether *event* is a step Pulumi's change summary does not count.
+
+    The table comes from the engine's summary and the per-resource list from its
+    step events, and the two count differently: the summary skips default
+    providers entirely, counts a read only when the value it read changed
+    (``shouldRecordReadStep`` in pulumi/pkg/engine/update.go), and counts a
+    replace once, while the step stream reports every read and every step of a
+    replace. None of these changes infrastructure beyond what the table counts.
+    """
+    op = str(event.get("operation"))
+    return op == "read" or op in _REPLACEMENT_STEP_OPS or _is_default_provider(event)
 
 
 def _preview_has_material_changes(summary: dict[str, Any]) -> bool:
@@ -398,12 +443,21 @@ def _preview_has_material_changes(summary: dict[str, Any]) -> bool:
 
     A no-op preview still reports `resource_changes={"same": N}`, so that op
     alone must be discounted -- otherwise `resource_changes` is always truthy
-    and an empty diff looks the same as a real one.
+    and an empty diff looks the same as a real one. The same goes for the step
+    events: every stack with a StackReference reports a read for it on every
+    preview, which used to open a Production approval for a diff of nothing.
     """
     changes: dict[str, int] = json.loads(summary.get("resource_changes", "{}"))
     events = json.loads(summary.get("changes", "[]"))
     material = {op: n for op, n in changes.items() if op not in _NON_MATERIAL_OPS and n}
-    return bool(events or material)
+    return bool(material) or any(
+        not _is_uncounted(event)
+        or (
+            event.get("operation") == "delete-replaced"
+            and not _is_default_provider(event)
+        )
+        for event in events
+    )
 
 
 def _render_summary(
@@ -545,12 +599,6 @@ def _render_preview(
             "merges can change what actually applies."
         ),
         "",
-        # ★ Closing an issue is an untyped signal: Concourse emits a version of
-        # the ISSUE resource, not of git, so a gate cannot bind to the revision
-        # it was rendered from. If another commit lands and previews while this
-        # gate is open, closing it deploys the newer one. Naming the revision is
-        # the cheapest honest defence -- a reviewer can compare it against the
-        # branch head before closing.
     ]
 
     revisions = _previewed_revision(work_dir)
@@ -659,10 +707,14 @@ def _render_changes(events: list[dict[str, Any]], total: int = 0) -> list[str]:
         return []
 
     by_op: dict[str, list[dict[str, Any]]] = {}
+    uncounted: list[dict[str, Any]] = []
     for event in events:
-        by_op.setdefault(str(event.get("operation", "?")), []).append(event)
+        if _is_uncounted(event):
+            uncounted.append(event)
+        else:
+            by_op.setdefault(str(event.get("operation", "?")), []).append(event)
 
-    lines = ["", "### What changed", ""]
+    lines = ["", "### What changed", ""] if by_op else [""]
     # Ordered so the destructive ops a reviewer most needs to see come first,
     # then anything Pulumi reports that this list does not anticipate.
     ordered: list[str] = [
@@ -681,6 +733,8 @@ def _render_changes(events: list[dict[str, Any]], total: int = 0) -> list[str]:
                 lines.append(f"  - {prop}")
         lines.extend(["", "</details>", ""])
 
+    lines.extend(_render_uncounted(uncounted))
+
     if total > len(events):
         # Never truncate silently -- a shortened list that reads as complete is
         # exactly the kind of thing this whole feature exists to prevent. The
@@ -690,6 +744,38 @@ def _render_changes(events: list[dict[str, Any]], total: int = 0) -> list[str]:
             f"> :warning: Showing {len(events)} of {total} changed resources. "
             "See the build log for the full diff."
         )
+    return lines
+
+
+def _render_uncounted(events: list[dict[str, Any]]) -> list[str]:
+    """List the steps the table above leaves out, collapsed.
+
+    Collapsed and labelled, not dropped: a reviewer who saw `delete 0` in the
+    table and then a `delete` section below it stopped trusting the preview,
+    but a provider swap is still worth being able to find. Kept out of the
+    open sections even for a read the table did count, because the step event
+    cannot say which reads those were: it fires before the read runs.
+    """
+    if not events:
+        return []
+    lines = [
+        f"<details><summary>Steps the table does not count ({len(events)})</summary>",
+        "",
+        (
+            "The table above counts a read only when the value it read changed, "
+            "never counts the default providers Pulumi manages itself, and "
+            "counts each replace once, under `replace`. So its rows can be lower "
+            "than this list. A provider upgrade shows here as one create and one "
+            "delete, and a replace as its create-replacement and delete-replaced "
+            "halves. Nothing here changes infrastructure beyond what the table counts."
+        ),
+        "",
+    ]
+    for event in sorted(events, key=lambda e: str(e.get("urn", ""))):
+        name = _resource_name(str(event.get("urn", "")))
+        op = str(event.get("operation", "?"))
+        lines.append(f"- {op} `{name}` — `{_resource_type(event)}`")
+    lines.extend(["", "</details>", ""])
     return lines
 
 
