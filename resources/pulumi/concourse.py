@@ -450,7 +450,14 @@ def _preview_has_material_changes(summary: dict[str, Any]) -> bool:
     changes: dict[str, int] = json.loads(summary.get("resource_changes", "{}"))
     events = json.loads(summary.get("changes", "[]"))
     material = {op: n for op, n in changes.items() if op not in _NON_MATERIAL_OPS and n}
-    return bool(material or [e for e in events if not _is_uncounted(e)])
+    return bool(material) or any(
+        not _is_uncounted(event)
+        or (
+            event.get("operation") == "delete-replaced"
+            and not _is_default_provider(event)
+        )
+        for event in events
+    )
 
 
 def _render_summary(
