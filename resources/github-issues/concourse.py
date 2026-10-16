@@ -574,6 +574,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             if issue.title == title and not issue.pull_request
         )
         issues = [self.repo.get_issue(number) for number in sorted(numbers)]
+        issues = [issue for issue in issues if issue.title == title]
         if open_only:
             issues = [issue for issue in issues if issue.state == "open"]
         return issues
