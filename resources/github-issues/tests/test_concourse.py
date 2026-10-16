@@ -75,6 +75,19 @@ def create_mock_issue(
     return mock
 
 
+def found_open(mock_github, *issues: MagicMock) -> None:
+    """Make search return *issues*, and the issues API read the same ones back.
+
+    The put re-reads every search hit from the issues API, so a test whose
+    search finds an issue has to say what that read returns.
+    """
+    mock_gh_instance, mock_repo = mock_github
+    mock_gh_instance.search_issues.return_value = list(issues)
+    mock_repo.get_issue.side_effect = lambda number: next(
+        issue for issue in issues if issue.number == number
+    )
+
+
 # Sample datetimes for consistent testing
 NOW = datetime.now()  # noqa: DTZ005
 T_MINUS_1 = NOW - timedelta(days=1)
@@ -543,7 +556,7 @@ def test_publish_new_version_comments_on_existing_by_default(mock_github):
     )
     existing_mock_issue.create_comment = MagicMock()
     existing_mock_issue.edit = MagicMock()
-    mock_gh_instance.search_issues.return_value = [existing_mock_issue]
+    found_open(mock_github, existing_mock_issue)
 
     resource = ConcourseGithubIssuesResource(
         repository="test/repo",
@@ -575,9 +588,7 @@ def test_publish_new_version_updates_existing_when_update_in_place(mock_github):
     )
     existing_mock_issue.body = ""
     existing_mock_issue.edit = MagicMock()
-    mock_gh_instance.search_issues.return_value = [
-        existing_mock_issue
-    ]  # Found existing
+    found_open(mock_github, existing_mock_issue)
 
     resource = ConcourseGithubIssuesResource(
         repository="test/repo",
@@ -793,7 +804,7 @@ def test_publish_new_version_body_file_updates_existing_when_update_in_place(
     )
     existing_issue.body = ""
     existing_issue.edit = MagicMock()
-    mock_gh_instance.search_issues.return_value = [existing_issue]
+    found_open(mock_github, existing_issue)
 
     resource = ConcourseGithubIssuesResource(
         repository="test/repo",
@@ -1059,7 +1070,7 @@ class TestCloseIfFile:
             created_at=T_MINUS_1,
         )
         issue.body = ""
-        mock_gh_instance.search_issues.return_value = [issue]
+        found_open(mock_github, issue)
 
         resource = ConcourseGithubIssuesResource(
             repository="test/repo",
@@ -1906,6 +1917,8 @@ def _publish_onto_existing(
         created_at=T_MINUS_1,
         labels=existing_labels,
     )
+    fresh.body = ""
+    fresh.edit = MagicMock()
     issue.fresh = fresh
     mock_repo.get_issue.side_effect = lambda number: fresh
     _update_in_place_resource().publish_new_version(
@@ -1963,7 +1976,8 @@ def test_update_in_place_leaves_a_closed_issues_labels_alone(mock_github):
     )
     issue.fresh.remove_from_labels.assert_not_called()
     issue.fresh.add_to_labels.assert_not_called()
-    assert not [c for c in issue.edit.call_args_list if "labels" in c.kwargs]
+    for written in (issue, issue.fresh):
+        assert not [c for c in written.edit.call_args_list if "labels" in c.kwargs]
 
 
 def test_update_in_place_does_not_rewrite_labels_that_already_match(mock_github):
@@ -1973,7 +1987,8 @@ def test_update_in_place_does_not_rewrite_labels_that_already_match(mock_github)
         existing_labels=["DevOps", "promotion-to-qa"],
         desired_labels=["promotion-to-qa", "DevOps"],  # same set, different order
     )
-    assert not [c for c in issue.edit.call_args_list if "labels" in c.kwargs]
+    for written in (issue, issue.fresh):
+        assert not [c for c in written.edit.call_args_list if "labels" in c.kwargs]
     issue.fresh.add_to_labels.assert_not_called()
     issue.fresh.remove_from_labels.assert_not_called()
 
@@ -1982,7 +1997,7 @@ def test_update_in_place_still_edits_the_body(mock_github):
     issue = _publish_onto_existing(
         mock_github, existing_labels=[], desired_labels=["DevOps"]
     )
-    assert [c for c in issue.edit.call_args_list if "body" in c.kwargs]
+    assert [c for c in issue.fresh.edit.call_args_list if "body" in c.kwargs]
 
 
 def test_update_in_place_leaves_assignees_alone(mock_github):
@@ -1990,7 +2005,8 @@ def test_update_in_place_leaves_assignees_alone(mock_github):
     issue = _publish_onto_existing(
         mock_github, existing_labels=[], desired_labels=["DevOps"]
     )
-    assert not [c for c in issue.edit.call_args_list if "assignees" in c.kwargs]
+    for written in (issue, issue.fresh):
+        assert not [c for c in written.edit.call_args_list if "assignees" in c.kwargs]
 
 
 def test_comment_path_does_not_touch_labels(mock_github):
@@ -2006,7 +2022,7 @@ def test_comment_path_does_not_touch_labels(mock_github):
     issue.body = ""
     issue.edit = MagicMock()
     issue.create_comment = MagicMock()
-    mock_gh_instance.search_issues.return_value = [issue]
+    found_open(mock_github, issue)
     ConcourseGithubIssuesResource(
         repository="test/repo",
         access_token="dummy_token",
@@ -2022,3 +2038,149 @@ def test_comment_path_does_not_touch_labels(mock_github):
     )
     issue.edit.assert_not_called()
     issue.create_comment.assert_called_once()
+
+
+class TestPublishFindsOnlyOpenIssues:
+    """The issue a put writes to must be open by the issues API, not by search."""
+
+    TITLE = "[bot] Pulumi proj Production ready to deploy."
+
+    def _issue(self, number, state="open", title=None):
+        issue = create_mock_issue(
+            number=number,
+            title=title or self.TITLE,
+            state=state,
+            created_at=T_MINUS_1,
+            closed_at=NOW if state == "closed" else None,
+        )
+        issue.body = ""
+        return issue
+
+    def _publish(self, mock_github, *, searched=(), recent=(), fresh=(), **kwargs):
+        """Publish with search returning *searched* and the newest page *recent*.
+
+        *fresh* is what the issues API reads back by number; by default the
+        same objects search and the newest page returned.
+        """
+        mock_gh_instance, mock_repo = mock_github
+        mock_gh_instance.search_issues.return_value = list(searched)
+        mock_repo.get_issues.return_value = list(recent)
+        known = list(fresh) or [*searched, *recent]
+        mock_repo.get_issue.side_effect = lambda number: next(
+            issue for issue in known if issue.number == number
+        )
+        mock_repo.create_issue.return_value = self._issue(99)
+        ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template=self.TITLE,
+            issue_body_template="diff",
+            **kwargs,
+        ).publish_new_version(sources_dir="dummy", build_metadata=mock_build_metadata())
+        return mock_repo
+
+    def test_update_in_place_does_not_edit_an_issue_closed_since_indexing(
+        self, mock_github
+    ):
+        """Search still calls it open; it was approved seconds ago.
+
+        Editing it would replace the body of an approval already given -- for a
+        release gate, a QA re-run rewriting what the reviewer approved.
+        """
+        stale = self._issue(40)
+        closed = self._issue(40, state="closed")
+        mock_repo = self._publish(
+            mock_github, searched=[stale], fresh=[closed], update_in_place=True
+        )
+        stale.edit.assert_not_called()
+        closed.edit.assert_not_called()
+        mock_repo.create_issue.assert_called_once()
+
+    def test_comment_path_does_not_comment_on_a_closed_issue(self, mock_github):
+        stale = self._issue(40)
+        closed = self._issue(40, state="closed")
+        mock_repo = self._publish(mock_github, searched=[stale], fresh=[closed])
+        stale.create_comment.assert_not_called()
+        closed.create_comment.assert_not_called()
+        mock_repo.create_issue.assert_called_once()
+
+    def test_finds_an_open_issue_search_has_not_indexed_yet(self, mock_github):
+        """A second put moments after the first must not open a duplicate."""
+        just_created = self._issue(41)
+        mock_repo = self._publish(
+            mock_github, recent=[just_created], update_in_place=True
+        )
+        mock_repo.create_issue.assert_not_called()
+        just_created.edit.assert_called_once_with(body="diff")
+
+    def test_ignores_a_search_hit_whose_title_only_shares_tokens(self, mock_github):
+        neighbour = self._issue(42, title=self.TITLE.replace("Production", "QA"))
+        mock_repo = self._publish(
+            mock_github, searched=[neighbour], update_in_place=True
+        )
+        neighbour.edit.assert_not_called()
+        mock_repo.create_issue.assert_called_once()
+
+    def test_ignores_a_pull_request_with_the_same_title(self, mock_github):
+        pull = self._issue(43)
+        pull.pull_request = MagicMock()
+        mock_repo = self._publish(mock_github, recent=[pull], update_in_place=True)
+        pull.edit.assert_not_called()
+        mock_repo.create_issue.assert_called_once()
+
+    def test_uses_the_newest_of_several_open_matches(self, mock_github):
+        older, newer = self._issue(44), self._issue(45)
+        self._publish(mock_github, searched=[older, newer], update_in_place=True)
+        older.edit.assert_not_called()
+        newer.edit.assert_called_once_with(body="diff")
+
+    def test_an_issue_in_both_search_and_the_newest_page_is_read_once(
+        self, mock_github
+    ):
+        issue = self._issue(46)
+        mock_repo = self._publish(
+            mock_github, searched=[issue], recent=[issue], update_in_place=True
+        )
+        mock_repo.get_issue.assert_called_once_with(46)
+        issue.edit.assert_called_once_with(body="diff")
+
+    def test_labels_are_left_alone_if_the_issue_closes_after_the_lookup(
+        self, mock_github
+    ):
+        """The lookup read it open; by the label read it was retired.
+
+        Removing `abandoned` from it then would let the gate ship an abandoned
+        release, so the label reconcile re-reads and leaves a closed issue be.
+        """
+        mock_gh_instance, mock_repo = mock_github
+        looked_up = create_mock_issue(
+            number=47, title=self.TITLE, state="open", created_at=T_MINUS_1
+        )
+        looked_up.body = ""
+        retired = create_mock_issue(
+            number=47,
+            title=self.TITLE,
+            state="closed",
+            created_at=T_MINUS_1,
+            closed_at=NOW,
+            labels=["abandoned"],
+        )
+        mock_gh_instance.search_issues.return_value = [looked_up]
+        mock_repo.get_issues.return_value = []
+        mock_repo.get_issue.side_effect = [looked_up, retired]
+        ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template=self.TITLE,
+            issue_body_template="diff",
+            update_in_place=True,
+        ).publish_new_version(
+            sources_dir="dummy",
+            build_metadata=mock_build_metadata(),
+            labels=["release"],
+        )
+        assert mock_repo.get_issue.call_count == 2
+        retired.remove_from_labels.assert_not_called()
+        retired.add_to_labels.assert_not_called()
