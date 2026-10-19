@@ -45,6 +45,7 @@ Usage example::
 import json
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 
 from concoursetools import BuildMetadata, ConcourseResource
 from concoursetools.version import SortableVersionMixin, Version
@@ -253,6 +254,7 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
         auto_merge: bool = False,
         required_contexts: list[str] | None = None,
         auto_inactive: bool = True,
+        comment_on_issue_file: str | None = None,
     ) -> tuple[GithubDeploymentVersion, dict[str, str]]:
         """Create or update a GitHub Deployment and Deployment Status.
 
@@ -286,6 +288,13 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
             settings; pass ``[]`` to bypass all checks.
         :param auto_inactive: Mark all older deployments in the same environment
             as ``inactive`` when this status is set (default: ``True``).
+        :param comment_on_issue_file: ``finish`` only. Path relative to
+            ``sources_dir`` to a ``gh_issue.json`` (written by the
+            ``github-issues`` resource's ``get``) naming an issue. When ``state``
+            is ``success``, a comment linking this deployment is posted on that
+            issue, so a closed release issue is not mistaken for "shipped": the
+            Deployments API is what says what is live. The comment is a pointer,
+            so failing to post it warns instead of failing the put.
         :returns: A :class:`GithubDeploymentVersion` representing the deployment
             and an empty metadata dict.
         :raises ValueError: If required parameters are missing or invalid.
@@ -311,6 +320,8 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
             environment_url=environment_url,
             description=description,
             auto_inactive=auto_inactive,
+            build_metadata=build_metadata,
+            comment_on_issue_file=comment_on_issue_file,
         )
 
     def _start(  # noqa: PLR0913
@@ -346,6 +357,53 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
         )
         return self._to_version(dep), {}
 
+    def _deployments_url(self) -> str:
+        """Link to this environment's deployment history in the GitHub UI."""
+        return (
+            f"{self.repo.html_url}/deployments/activity_log"
+            f"?environment={quote(self.environment)}"
+        )
+
+    def _comment_on_issue(
+        self,
+        dep,
+        sources_dir: Path,
+        issue_file: str,
+        build_metadata: BuildMetadata,
+    ) -> None:
+        """Post a comment linking *dep* on the issue named by *issue_file*.
+
+        Runs after the status is recorded, which is the part that matters, and
+        in a job whose next step merges the release back, so a failure here
+        warns and returns rather than raising. Posts once per deployment: a
+        re-run of the same finish finds the marker and does nothing.
+        """
+        marker = f"<!-- deployment:{self.environment}:{dep.id} -->"
+        try:
+            path = (sources_dir / issue_file).resolve()
+            if not path.is_relative_to(sources_dir.resolve()):
+                msg = f"{issue_file!r} resolves outside the workspace"
+                raise ValueError(msg)
+            number = int(json.loads(path.read_text())["issue_number"])
+            if number == 0:
+                return
+            issue = self.repo.get_issue(number)
+            if any(marker in (c.body or "") for c in issue.get_comments()):
+                return
+            issue.create_comment(
+                f"Deployed to **{self.environment}**: `{dep.ref}` "
+                f"(`{dep.sha[:7]}`), [Deployment #{dep.id}]"
+                f"({self._deployments_url()}), "
+                f"[build {build_metadata.BUILD_NAME}]({build_metadata.build_url()}). "
+                "The Deployments API, not this issue's state, says what is live."
+                f"\n\n{marker}"
+            )
+        except Exception as exc:
+            print(  # noqa: T201
+                f"WARNING: could not comment the {self.environment} deployment "
+                f"on the release issue from {issue_file!r}: {exc!r}"
+            )
+
     def _finish(  # noqa: PLR0913
         self,
         sources_dir: str,
@@ -354,6 +412,8 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
         environment_url: str | None,
         description: str | None,
         auto_inactive: bool,
+        build_metadata: BuildMetadata,
+        comment_on_issue_file: str | None = None,
     ) -> tuple[GithubDeploymentVersion, dict[str, str]]:
         """Read a deployment ID from a file and create a terminal status."""
         if not deployment_file:
@@ -387,4 +447,8 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
             environment_url=environment_url if environment_url is not None else NotSet,
             auto_inactive=auto_inactive,
         )
+        if comment_on_issue_file and state == "success":
+            self._comment_on_issue(
+                dep, Path(sources_dir), comment_on_issue_file, build_metadata
+            )
         return self._to_version(dep), {}

@@ -93,6 +93,13 @@ Reads the deployment ID from a JSON file (typically `deployment.json` written by
 | `description` | No | Human-readable description |
 | `environment_url` | No | URL of the deployed environment |
 | `auto_inactive` | No | Mark older deployments as `inactive` (default: `true`) |
+| `comment_on_issue_file` | No | Path to a `gh_issue.json` (as written by the `github-issues` resource's `get`), relative to the `put` step's input root. On `state: success`, comments a link to this deployment on the issue it names. |
+
+`comment_on_issue_file` exists so a closed release issue is not read as
+"shipped": closing it authorizes a promotion, and the Deployments API is what
+records what is live. The comment is posted once per deployment, after the
+status is recorded, and is only a pointer, so a failure to post it prints a
+warning and does not fail the put.
 
 ### Example: two-step deploy flow
 
