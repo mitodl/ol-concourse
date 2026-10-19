@@ -294,7 +294,9 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
             is ``success``, a comment linking this deployment is posted on that
             issue, so a closed release issue is not mistaken for "shipped": the
             Deployments API is what says what is live. The comment is a pointer,
-            so failing to post it warns instead of failing the put.
+            so failing to post it warns instead of failing the put. Posted once
+            per ``finish`` call; nothing dedupes across calls, since a rebuilt
+            job records a new Deployment anyway.
         :returns: A :class:`GithubDeploymentVersion` representing the deployment
             and an empty metadata dict.
         :raises ValueError: If required parameters are missing or invalid.
@@ -375,10 +377,8 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
 
         Runs after the status is recorded, which is the part that matters, and
         in a job whose next step merges the release back, so a failure here
-        warns and returns rather than raising. Posts once per deployment: a
-        re-run of the same finish finds the marker and does nothing.
+        warns and returns rather than raising.
         """
-        marker = f"<!-- deployment:{self.environment}:{dep.id} -->"
         try:
             path = (sources_dir / issue_file).resolve()
             if not path.is_relative_to(sources_dir.resolve()):
@@ -386,17 +386,17 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
                 raise ValueError(msg)
             number = int(json.loads(path.read_text())["issue_number"])
             if number == 0:
+                print(  # noqa: T201
+                    f"{issue_file!r} names the placeholder issue 0 -- there is "
+                    "no release issue to comment on"
+                )
                 return
-            issue = self.repo.get_issue(number)
-            if any(marker in (c.body or "") for c in issue.get_comments()):
-                return
-            issue.create_comment(
+            self.repo.get_issue(number).create_comment(
                 f"Deployed to **{self.environment}**: `{dep.ref}` "
-                f"(`{dep.sha[:7]}`), [Deployment #{dep.id}]"
-                f"({self._deployments_url()}), "
+                f"(`{dep.sha[:7]}`) as Deployment #{dep.id}, by "
                 f"[build {build_metadata.BUILD_NAME}]({build_metadata.build_url()}). "
-                "The Deployments API, not this issue's state, says what is live."
-                f"\n\n{marker}"
+                f"[{self.environment} deployment history]({self._deployments_url()}) "
+                "says what is live; this issue being closed does not."
             )
         except Exception as exc:
             print(  # noqa: T201

@@ -97,9 +97,13 @@ Reads the deployment ID from a JSON file (typically `deployment.json` written by
 
 `comment_on_issue_file` exists so a closed release issue is not read as
 "shipped": closing it authorizes a promotion, and the Deployments API is what
-records what is live. The comment is posted once per deployment, after the
-status is recorded, and is only a pointer, so a failure to post it prints a
-warning and does not fail the put.
+records what is live. The comment is posted after the status is recorded
+and is only a pointer, so a failure to post it prints a warning and does not
+fail the put.
+
+The image must be rebuilt and published before any pipeline passes this param:
+the resource's `put` takes its params as keyword arguments, so an older image
+fails the step on an unknown one.
 
 ### Example: two-step deploy flow
 

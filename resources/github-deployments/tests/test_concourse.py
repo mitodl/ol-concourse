@@ -387,7 +387,6 @@ def _finish_with_issue_file(mock_github, tmp_path, issue_json, state="success"):
     (tmp_path / "gate" / "gh_issue.json").write_text(issue_json)
 
     issue = MagicMock()
-    issue.get_comments.return_value = []
     mock_repo.get_issue.return_value = issue
 
     resource = make_resource(mock_github, environment="Production")
@@ -417,10 +416,11 @@ def test_publish_finish_comments_the_deployment_on_the_gate_issue(
     assert "`2026.10.15.1`" in body
     assert "`0123456`" in body
     assert (
-        "https://github.com/mitodl/my-app/deployments/activity_log"
-        "?environment=Production"
+        "[Production deployment history]"
+        "(https://github.com/mitodl/my-app/deployments/activity_log"
+        "?environment=Production)"
     ) in body
-    assert "<!-- deployment:Production:300 -->" in body
+    assert "Deployment #300" in body
 
 
 def test_publish_finish_comment_is_posted_after_the_status(mock_github, tmp_path):
@@ -431,7 +431,6 @@ def test_publish_finish_comment_is_posted_after_the_status(mock_github, tmp_path
 
     def get_issue(number):
         issue = real_get_issue(number)
-        issue.get_comments.return_value = []
         issue.create_comment.side_effect = lambda *a, **k: calls.comment()
         return issue
 
@@ -471,37 +470,13 @@ def test_publish_finish_does_not_comment_unless_success(
     issue.create_comment.assert_not_called()
 
 
-def test_publish_finish_does_not_comment_twice_for_one_deployment(
-    mock_github, tmp_path
-):
-    _, mock_repo = mock_github
-    prior = MagicMock()
-    prior.body = "Deployed.\n\n<!-- deployment:Production:300 -->"
-    _, _, _, issue = _finish_with_issue_file(
-        mock_github, tmp_path, json.dumps({"issue_number": "103"})
-    )
-    issue.get_comments.return_value = [prior]
-    issue.create_comment.reset_mock()
-
-    resource = make_resource(mock_github, environment="Production")
-    resource.publish_new_version(
-        sources_dir=str(tmp_path),
-        build_metadata=mock_build_metadata(),
-        action="finish",
-        deployment_file="dep/deployment.json",
-        state="success",
-        comment_on_issue_file="gate/gh_issue.json",
-    )
-
-    issue.create_comment.assert_not_called()
-
-
-def test_publish_finish_skips_the_placeholder_issue(mock_github, tmp_path):
+def test_publish_finish_skips_the_placeholder_issue(mock_github, tmp_path, capsys):
     _, _, mock_repo, issue = _finish_with_issue_file(
         mock_github, tmp_path, json.dumps({"issue_number": "0"})
     )
     mock_repo.get_issue.assert_not_called()
     issue.create_comment.assert_not_called()
+    assert "placeholder issue 0" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
