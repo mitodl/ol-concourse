@@ -371,6 +371,187 @@ def test_publish_finish_updates_status(mock_github, tmp_path):
     assert call_kwargs["environment_url"] == "https://rc.example.com"
 
 
+def _finish_with_issue_file(mock_github, tmp_path, issue_json, state="success"):
+    """Run an ``environment: Production`` finish that names a gate issue file."""
+    _, mock_repo = mock_github
+    mock_repo.html_url = "https://github.com/mitodl/my-app"
+    dep = make_mock_deployment(
+        300, sha="0123456789abcdef", ref="2026.10.15.1", environment="Production"
+    )
+    mock_repo.get_deployment.return_value = dep
+    (tmp_path / "dep").mkdir()
+    (tmp_path / "dep" / "deployment.json").write_text(
+        json.dumps({"deployment_id": "300"})
+    )
+    (tmp_path / "gate").mkdir()
+    (tmp_path / "gate" / "gh_issue.json").write_text(issue_json)
+
+    issue = MagicMock()
+    mock_repo.get_issue.return_value = issue
+
+    resource = make_resource(mock_github, environment="Production")
+    version, _ = resource.publish_new_version(
+        sources_dir=str(tmp_path),
+        build_metadata=mock_build_metadata(),
+        action="finish",
+        deployment_file="dep/deployment.json",
+        state=state,
+        comment_on_issue_file="gate/gh_issue.json",
+    )
+    return version, dep, mock_repo, issue
+
+
+def test_publish_finish_comments_the_deployment_on_the_gate_issue(
+    mock_github, tmp_path
+):
+    version, dep, mock_repo, issue = _finish_with_issue_file(
+        mock_github, tmp_path, json.dumps({"issue_number": "103"})
+    )
+
+    assert version.deployment_id == "300"
+    mock_repo.get_issue.assert_called_once_with(103)
+    issue.create_comment.assert_called_once()
+    body = issue.create_comment.call_args.args[0]
+    assert "**Production**" in body
+    assert "`2026.10.15.1`" in body
+    assert "`0123456`" in body
+    assert (
+        "[Production deployment history]"
+        "(https://github.com/mitodl/my-app/deployments/activity_log"
+        "?environment=Production)"
+    ) in body
+    assert "Deployment #300" in body
+
+
+def test_publish_finish_comment_is_posted_after_the_status(mock_github, tmp_path):
+    """A comment must never cite a deployment whose status was not recorded."""
+    _, mock_repo = mock_github
+    calls = MagicMock()
+    real_get_issue = mock_repo.get_issue
+
+    def get_issue(number):
+        issue = real_get_issue(number)
+        issue.create_comment.side_effect = lambda *a, **k: calls.comment()
+        return issue
+
+    mock_repo.get_issue = get_issue
+    dep = make_mock_deployment(300, environment="Production")
+    dep.create_status.side_effect = lambda *a, **k: calls.status()
+    mock_repo.get_deployment.return_value = dep
+    mock_repo.html_url = "https://github.com/mitodl/my-app"
+    (tmp_path / "dep").mkdir()
+    (tmp_path / "dep" / "deployment.json").write_text(
+        json.dumps({"deployment_id": "300"})
+    )
+    (tmp_path / "gate").mkdir()
+    (tmp_path / "gate" / "gh_issue.json").write_text(
+        json.dumps({"issue_number": "103"})
+    )
+
+    make_resource(mock_github, environment="Production").publish_new_version(
+        sources_dir=str(tmp_path),
+        build_metadata=mock_build_metadata(),
+        action="finish",
+        deployment_file="dep/deployment.json",
+        state="success",
+        comment_on_issue_file="gate/gh_issue.json",
+    )
+
+    assert [c[0] for c in calls.mock_calls] == ["status", "comment"]
+
+
+@pytest.mark.parametrize("bad_state", ["failure", "error", "inactive"])
+def test_publish_finish_does_not_comment_unless_success(
+    mock_github, tmp_path, bad_state
+):
+    _, _, _, issue = _finish_with_issue_file(
+        mock_github, tmp_path, json.dumps({"issue_number": "103"}), state=bad_state
+    )
+    issue.create_comment.assert_not_called()
+
+
+def test_publish_finish_skips_the_placeholder_issue(mock_github, tmp_path, capsys):
+    _, _, mock_repo, issue = _finish_with_issue_file(
+        mock_github, tmp_path, json.dumps({"issue_number": "0"})
+    )
+    mock_repo.get_issue.assert_not_called()
+    issue.create_comment.assert_not_called()
+    assert "placeholder issue 0" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "issue_json", ["not json", "{}", json.dumps({"issue_number": "x"})]
+)
+def test_publish_finish_survives_an_unreadable_issue_file(
+    mock_github, tmp_path, issue_json, capsys
+):
+    """The status is recorded; a bad pointer file must not fail the deploy."""
+    version, dep, _, issue = _finish_with_issue_file(mock_github, tmp_path, issue_json)
+
+    assert version.deployment_id == "300"
+    dep.create_status.assert_called_once()
+    issue.create_comment.assert_not_called()
+    assert "WARNING: could not comment" in capsys.readouterr().out
+
+
+def test_publish_finish_survives_a_failing_comment(mock_github, tmp_path, capsys):
+    _, mock_repo = mock_github
+    mock_repo.get_issue.side_effect = RuntimeError("boom")
+    mock_repo.html_url = "https://github.com/mitodl/my-app"
+    dep = make_mock_deployment(300, environment="Production")
+    mock_repo.get_deployment.return_value = dep
+    (tmp_path / "dep").mkdir()
+    (tmp_path / "dep" / "deployment.json").write_text(
+        json.dumps({"deployment_id": "300"})
+    )
+    (tmp_path / "gate").mkdir()
+    (tmp_path / "gate" / "gh_issue.json").write_text(
+        json.dumps({"issue_number": "103"})
+    )
+
+    resource = make_resource(mock_github, environment="Production")
+    version, _ = resource.publish_new_version(
+        sources_dir=str(tmp_path),
+        build_metadata=mock_build_metadata(),
+        action="finish",
+        deployment_file="dep/deployment.json",
+        state="success",
+        comment_on_issue_file="gate/gh_issue.json",
+    )
+
+    assert version.deployment_id == "300"
+    assert "WARNING: could not comment" in capsys.readouterr().out
+
+
+def test_publish_finish_will_not_read_an_issue_file_outside_the_workspace(
+    mock_github, tmp_path
+):
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"issue_number": "103"}))
+    sources = tmp_path / "sources"
+    sources.mkdir()
+    (sources / "dep").mkdir()
+    (sources / "dep" / "deployment.json").write_text(
+        json.dumps({"deployment_id": "300"})
+    )
+    _, mock_repo = mock_github
+    mock_repo.get_deployment.return_value = make_mock_deployment(
+        300, environment="Production"
+    )
+
+    resource = make_resource(mock_github, environment="Production")
+    resource.publish_new_version(
+        sources_dir=str(sources),
+        build_metadata=mock_build_metadata(),
+        action="finish",
+        deployment_file="dep/deployment.json",
+        state="success",
+        comment_on_issue_file="../outside.json",
+    )
+
+    mock_repo.get_issue.assert_not_called()
+
+
 def test_publish_finish_requires_deployment_file(mock_github):
     resource = make_resource(mock_github)
     with pytest.raises(ValueError, match="deployment_file is required"):

@@ -93,6 +93,17 @@ Reads the deployment ID from a JSON file (typically `deployment.json` written by
 | `description` | No | Human-readable description |
 | `environment_url` | No | URL of the deployed environment |
 | `auto_inactive` | No | Mark older deployments as `inactive` (default: `true`) |
+| `comment_on_issue_file` | No | Path to a `gh_issue.json` (as written by the `github-issues` resource's `get`), relative to the `put` step's input root. On `state: success`, comments a link to this deployment on the issue it names. Needs issue-write permission on top of the deployment permission — see [Authentication](#authentication). |
+
+`comment_on_issue_file` exists so a closed release issue is not read as
+"shipped": closing it authorizes a promotion, and the Deployments API is what
+records what is live. The comment is posted after the status is recorded
+and is only a pointer, so a failure to post it prints a warning and does not
+fail the put.
+
+The image must be rebuilt and published before any pipeline passes this param:
+the resource's `put` takes its params as keyword arguments, so an older image
+fails the step on an unknown one.
 
 ### Example: two-step deploy flow
 
@@ -128,13 +139,20 @@ jobs:
 
 | Method | Source fields |
 |--------|--------------|
-| Token | `access_token` (needs the `repo_deployments` scope) |
+| Token | `access_token` (needs the `repo_deployments` scope; see below for `comment_on_issue_file`) |
 | GitHub App | `auth_method: app`, `app_id`, `app_installation_id`, `private_ssh_key` |
 
 Prefer GitHub App auth. The resource mints an installation access token per run,
 so there is no PAT expiry to monitor — an expired fine-grained PAT fails a
 release pipeline with an opaque `401 Bad credentials`. Grant the App
 `deployments: write` on the target repositories.
+
+`comment_on_issue_file` posts an issue comment, which the deployment
+permissions do not authorize. To comment, grant a GitHub App or fine-grained
+personal access token `issues: write`, or give a classic token the `repo` scope
+(`public_repo` is enough for public repositories). With deployment permissions
+alone the deployment is still recorded, but the put prints a warning instead of
+commenting.
 
 The `release`, `github-issues`, and `github-deployments` resources are all meant
 to authenticate as the *same* GitHub App, so that a release workflow has one
