@@ -836,6 +836,7 @@ name = "ol-concourse-github-deployments"
 version = "0.2.0"
 source = { editable = "resources/github-deployments" }
 dependencies = [
+    { name = "certifi" },
     { name = "concoursetools" },
     { name = "pygithub" },
 ]
@@ -848,6 +849,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "certifi", specifier = ">=2026.10.19" },
     { name = "concoursetools", specifier = ">=0.8.0,<0.9" },
     { name = "pygithub", specifier = ">=2.0.0,<3" },
 ]
@@ -863,6 +865,7 @@ name = "ol-concourse-github-issues"
 version = "0.3.0"
 source = { editable = "resources/github-issues" }
 dependencies = [
+    { name = "certifi" },
     { name = "concoursetools" },
     { name = "pygithub" },
 ]
@@ -875,6 +878,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "certifi", specifier = ">=2026.10.19" },
     { name = "concoursetools", specifier = ">=0.8.0,<0.9" },
     { name = "pygithub", specifier = ">=2.0.0,<3" },
 ]
@@ -890,6 +894,7 @@ name = "ol-concourse-npm"
 version = "0.1.0"
 source = { editable = "resources/npm" }
 dependencies = [
+    { name = "certifi" },
     { name = "concoursetools" },
     { name = "requests" },
     { name = "semver" },
@@ -904,6 +909,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "certifi", specifier = ">=2026.10.19" },
     { name = "concoursetools", specifier = ">=0.8.0,<0.9" },
     { name = "requests", specifier = ">=2.32.0" },
     { name = "semver", specifier = ">=3.0.0,<4" },
@@ -963,6 +969,7 @@ name = "ol-concourse-pypi"
 version = "0.2.0"
 source = { editable = "resources/pypi" }
 dependencies = [
+    { name = "certifi" },
     { name = "concoursetools" },
     { name = "packaging" },
     { name = "requests" },
@@ -978,6 +985,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "certifi", specifier = ">=2026.10.19" },
     { name = "concoursetools", specifier = ">=0.8.0,<0.9" },
     { name = "packaging", specifier = ">=24.0" },
     { name = "requests", specifier = ">=2.32.0" },
@@ -996,6 +1004,7 @@ name = "ol-concourse-release"
 version = "0.2.0"
 source = { editable = "resources/release" }
 dependencies = [
+    { name = "certifi" },
     { name = "concoursetools" },
     { name = "pygithub" },
 ]
@@ -1008,6 +1017,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "certifi", specifier = ">=2026.10.19" },
     { name = "concoursetools", specifier = ">=0.8.0,<0.9" },
     { name = "pygithub", specifier = ">=2.0.0,<3" },
 ]
