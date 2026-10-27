@@ -25,14 +25,14 @@ repos:
     args: [-f, parsable, -d, relaxed]
 
 - repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: v0.16.9
+  rev: v0.17.3
   hooks:
   - id: ruff-format
   - id: ruff
     args: [--fix, --ignore, D1]
 
 - repo: https://github.com/pre-commit/mirrors-mypy
-  rev: v2.3.1
+  rev: v2.4.0
   hooks:
   - id: mypy
     # Narrowed to pipeline_lib: the resource packages each ship a top-level
