@@ -74,6 +74,10 @@ Clones the repository and compares HEAD of `branch` to the latest `YYYY.MM.DD.N`
 - If HEAD is already tagged, emits the existing version (no new commits).
 - If no tags exist, emits `YYYY.MM.DD.1` for today's date.
 
+The next version's `N` counts past every version ever cut today, including
+abandoned ones (see [`action: abandon`](#action-abandon)), so a version number
+is never offered twice.
+
 The version object carries lightweight metadata for use by the Slack release bot's
 `/release-notes` command without triggering the full pipeline:
 
@@ -264,6 +268,13 @@ already updated by `bump_version_task`.
 5. Pushes the branch.
 6. Creates and pushes the `YYYY.MM.DD.N` tag on the pre-bumpver HEAD.
 
+A superseded release whose tag is deleted is recorded the same way an
+abandoned one is (see [`action: abandon`](#action-abandon)).
+
+`create` refuses a version that was abandoned or superseded. `check` never
+offers one, but a re-run of an old build can still carry it, and cutting it
+again would push a new image under the abandoned release's tag.
+
 Only an **older** release is ever superseded. `create` binds the version
 Concourse resolved when the build was scheduled, so a delayed or concurrent
 build can carry a version older than the release now in flight; that is
@@ -356,7 +367,18 @@ an error raised here means a real, unfinished release.
 
 Cancels a release that was cut but never finished: deletes the
 `releases/YYYY.MM.DD.N` branch and the version tag from the remote, so the next
-`check` sees nothing in flight and recomputes the next version normally.
+`check` sees nothing in flight and offers the next version.
+
+That next version is never the abandoned one. Before deleting the version tag,
+`abandon` pushes an `abandoned/YYYY.MM.DD.N` tag at the same commit, and `check`
+counts those when it computes `N`. Re-using the number would re-use the
+abandoned build's image tag, so a deploy by that tag would change nothing and
+leave the abandoned build running. The record also says what was abandoned and
+from which commit. It does not match the version pattern, so nothing re-emits
+it. A version that was never tagged (a cut that failed before its tag was
+pushed) built no image and is not recorded. The record is pushed first, and a
+failed push fails the put with both refs in place, so the abandon can be run
+again.
 
 An abandon job cannot bind only a release that is in flight. A `put` publishes
 a version of this resource, and a job that gets it with no `passed` takes
