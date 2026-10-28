@@ -51,6 +51,11 @@ SEMVER_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 # ``action=create`` deletes when it cuts that hotfix.
 HOTFIX_TAG_PREFIX = "hotfix/"
 HOTFIX_REQUEST_PATTERN = re.compile(r"^hotfix/([0-9a-f]{40})$")
+# Abandoning a release that was tagged leaves an ``abandoned/<version>`` tag
+# at the commit the version tag named, so that version is never cut again.
+# Re-using it would re-use its image tag, and a deploy by that tag changes
+# nothing.  It does not match VERSION_PATTERN, so nothing re-emits it.
+ABANDONED_TAG_PREFIX = "abandoned/"
 # What ``cherry-pick -x`` appends to a hotfix commit.  The last one names the
 # commit picked; earlier ones were carried over from the fix's own message.
 CHERRY_PICK_TRAILER = re.compile(r"\(cherry picked from commit ([0-9a-f]{40})\)")
@@ -448,6 +453,8 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         # resource indefinitely: no new version, no new commits, no signal.
         # Superseding an in-flight release is `action=create`'s job.
         in_flight = _get_in_flight_release_version(repo_path, env=env) or ""
+        # Every number ever cut, including abandoned ones, so none is reused.
+        cut_versions = [*tags, *_get_abandoned_versions(repo_path, env=env)]
 
         # A pending hotfix request wins over the tracked branch.  It is how the
         # release bot tells the build job which commit to cherry-pick, since
@@ -456,7 +463,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             count, authors = _commit_info(repo_path, f"{hotfix}^!", env=env)
             return [
                 ReleaseVersion(
-                    version=_compute_next_version(tags),
+                    version=_compute_next_version(cut_versions),
                     head_sha=hotfix,
                     since=latest_tag or "",
                     commit_count=str(count),
@@ -508,7 +515,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             else:
                 count, authors = _commit_info_all(repo_path, head_sha, env=env)
 
-        next_version = _compute_next_version(tags)
+        next_version = _compute_next_version(cut_versions)
         return [
             ReleaseVersion(
                 version=next_version,
@@ -651,8 +658,9 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
           1. Refuse if nothing is in flight for the version but its tag is
              still on the remote.
           2. Delete the release branch, and the version tag unless the release
-             already reached production.
-          3. Subsequent check calls will recompute the next version normally.
+             already reached production.  A deleted tag leaves an
+             ``abandoned/<version>`` tag behind.
+          3. Subsequent check calls compute the next version past it.
 
         ``repo_dir`` is the path within the Concourse workspace to the
         checked-out git repository (i.e. the ``get`` output directory name).
@@ -679,6 +687,8 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             if token := self.github_token:
                 _configure_https_auth(repo_path, token, env=env)
 
+            if action == "create":
+                _refuse_abandoned_version(repo_path, version_str, env=env)
             if action == "create" and commit_hash:
                 head_sha, since, hotfix = self._create_hotfix(
                     repo_path, version_str, commit_hash, env=env
@@ -1193,8 +1203,10 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         """Delete the in-flight release branch, and by default its version tag.
 
         Cancels a release that was cut but never finalised.  After abandonment
-        ``check`` sees no in-flight branch and recomputes the next version
-        normally, allowing a corrected release to be cut from the same commits.
+        ``check`` sees no in-flight branch and offers the next version, allowing
+        a corrected release to be cut from the same commits.  That version is
+        never this one: a deleted tag is first recorded as
+        ``abandoned/<version>``, which ``check`` counts and ``create`` refuses.
 
         *delete_tag* is ``False`` when superseding a release that already
         reached production — its tag is the only marker of what is running
@@ -1223,6 +1235,9 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         # leaves both refs in place, so the release is still in flight and the
         # abandon can simply be run again.
         if delete_tag:
+            # Before anything is deleted, so a failed push leaves the release
+            # in flight and the abandon retryable.
+            _record_abandoned_version(repo_path, version, env=env)
             _delete_remote_ref(repo_path, f"refs/tags/{version}", env=env)
             if _remote_tag_exists(repo_path, version, env=env):
                 msg = (
@@ -1597,6 +1612,65 @@ def _get_semver_tags(repo_path: Path, *, env: dict[str, str]) -> list[str]:
     output = _run(["git", "tag", "--list"], cwd=repo_path, env=env)
     tags = [t.strip() for t in output.splitlines() if SEMVER_PATTERN.match(t.strip())]
     return sorted(tags, key=_parse_semver_tuple)
+
+
+def _get_abandoned_versions(repo_path: Path, *, env: dict[str, str]) -> list[str]:
+    """Return the versions recorded by ``abandoned/<version>`` tags."""
+    output = _run(
+        ["git", "tag", "--list", f"{ABANDONED_TAG_PREFIX}*"], cwd=repo_path, env=env
+    )
+    versions = []
+    for name in output.splitlines():
+        if not name.strip().startswith(ABANDONED_TAG_PREFIX):
+            continue
+        version = name.strip()[len(ABANDONED_TAG_PREFIX) :]
+        if VERSION_PATTERN.match(version):
+            versions.append(version)
+    return versions
+
+
+def _record_abandoned_version(
+    repo_path: Path, version: str, *, env: dict[str, str]
+) -> None:
+    """Push ``abandoned/<version>`` at the commit the *version* tag names.
+
+    Does nothing when the version was never tagged on the remote (a cut that
+    failed before its tag was pushed built no image, so its number is safe to
+    cut again) or is already recorded, which keeps a retried abandon
+    idempotent.  A failed push raises, before the caller deletes anything.
+    """
+    tombstone = f"{ABANDONED_TAG_PREFIX}{version}"
+    if _remote_tag_exists(repo_path, tombstone, env=env):
+        return
+    if not _remote_tag_exists(repo_path, version, env=env):
+        return
+    commit = _run(
+        ["git", "rev-parse", f"refs/tags/{version}^{{commit}}"], cwd=repo_path, env=env
+    ).strip()
+    _run(
+        ["git", "push", "origin", f"{commit}:refs/tags/{tombstone}"],
+        cwd=repo_path,
+        env=env,
+    )
+
+
+def _refuse_abandoned_version(
+    repo_path: Path, version: str, *, env: dict[str, str]
+) -> None:
+    """Raise if *version* was abandoned.
+
+    ``check`` never offers an abandoned version, but ``create`` binds the
+    version Concourse resolved when the build was scheduled, so a re-run of an
+    old build can still carry one.  Cutting it again would push a new image
+    under the abandoned release's tag.
+    """
+    if _remote_tag_exists(repo_path, f"{ABANDONED_TAG_PREFIX}{version}", env=env):
+        msg = (
+            f"Refusing to cut {version!r}: it was abandoned "
+            f"({ABANDONED_TAG_PREFIX}{version}), and re-using its number would "
+            "re-use its image tag. Re-run the build against a current check."
+        )
+        raise RuntimeError(msg)
 
 
 def _get_in_flight_release_version(

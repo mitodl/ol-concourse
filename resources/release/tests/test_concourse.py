@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from concourse import (
+    ABANDONED_TAG_PREFIX,
     ReleaseResource,
     ReleaseVersion,
     _PRODUCTION_SCAN_LIMIT,
@@ -450,6 +451,7 @@ def test_fetch_new_versions_semver_fallback_used_when_no_date_tags(
         "v1.2.3\nv1.3.0\nbad-tag",  # git tag --list (no date-format tags)
         head_sha,  # git rev-parse origin/main
         "",  # git branch -r (no in-flight)
+        "",  # git tag --list abandoned/* (none abandoned)
         "",  # for-each-ref refs/tags/hotfix/ (no pending hotfix)
         # semver fallback branch: git tag --list again for _get_semver_tags
         "v1.2.3\nv1.3.0\nbad-tag",
@@ -494,6 +496,7 @@ def test_fetch_new_versions_semver_fallback_ignored_when_date_tags_exist(
         "v1.3.0\n2026.4.14.1",  # both semver and date-format present
         head_sha,
         "",  # git branch -r (no in-flight)
+        "",  # git tag --list abandoned/* (none abandoned)
         "",  # for-each-ref refs/tags/hotfix/ (no pending hotfix)
         "dev@example.com|new work",  # git log 2026.4.14.1..HEAD
         tag_sha,  # _cut: rev-list -n1 2026.4.14.1
@@ -536,6 +539,7 @@ def test_fetch_new_versions_semver_fallback_disabled(mock_tmpdir, mock_run, tmp_
         "v1.2.3\nv1.3.0",  # only semver tags
         head_sha,
         "",  # git branch -r (no in-flight)
+        "",  # git tag --list abandoned/* (none abandoned)
         "",  # for-each-ref refs/tags/hotfix/ (no pending hotfix)
         "dev@example.com\nalice@example.com",  # _commit_info_all
     ]
@@ -695,9 +699,9 @@ def test_fetch_new_versions_no_tags(mock_tmpdir, mock_run, tmp_path):
 
     call_index = 0
     # 0: clone, 1: fetch --tags, 2: tag --list (empty), 3: rev-parse,
-    # 4: branch -r (no in-flight), 5: for-each-ref (no pending hotfix),
-    # 6: commit_info_all
-    outputs = ["", "", "", head_sha, "", "", "dev@example.com"]
+    # 4: branch -r (no in-flight), 5: tag --list abandoned/* (none),
+    # 6: for-each-ref (no pending hotfix), 7: commit_info_all
+    outputs = ["", "", "", head_sha, "", "", "", "dev@example.com"]
 
     def run_side_effect(cmd, **kwargs):
         nonlocal call_index
@@ -903,6 +907,7 @@ def test_publish_new_version_create(mock_run, tmp_path):
         [
             "",  # git config user.name
             "",  # git config user.email
+            "",  # git ls-remote abandoned/2026.4.14.1 (never abandoned)
             "",  # git fetch origin main --tags
             "",  # git ls-remote (no in-flight release to supersede)
             "",  # git status --porcelain (check dirty before reset — no dirty files)
@@ -990,7 +995,9 @@ def test_create_release_retrigger_with_matching_tag_is_idempotent(mock_run, tmp_
     ]
     assert not tag_create_calls, "Should not re-create an already-existing tag"
     push_tag_calls = [
-        c for c in mock_run.call_args_list if "refs/tags/" in " ".join(c.args[0])
+        c
+        for c in mock_run.call_args_list
+        if c.args[0][:2] == ["git", "push"] and "refs/tags/" in " ".join(c.args[0])
     ]
     assert not push_tag_calls, "Should not push a tag that already exists"
     branch_push_calls = [
@@ -1503,6 +1510,91 @@ def test_check_never_re_emits_an_abandoned_release(tmp_path, world, mocker):
     assert cut.in_flight == PROD
     assert cut.since == ""
     assert cut.hotfix == ""
+
+
+# ---------------------------------------------------------------------------
+# abandon: an abandoned version is recorded and never cut again
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def never_shipped(mocker):
+    return mocker.patch.object(
+        ReleaseResource, "_reached_production", return_value=False
+    )
+
+
+def _cut_and_abandon(tmp_path: Path, world: _World) -> str:
+    version = _check(world).version
+    _put(_workspace(tmp_path, world.origin, version=version))
+    _put(_workspace(tmp_path, world.origin, version=version), action="abandon")
+    return version
+
+
+def test_check_never_offers_an_abandoned_version_again(tmp_path, world, never_shipped):
+    """Its image tag was pushed, and a deploy by a re-used tag changes nothing."""
+    abandoned = _cut_and_abandon(tmp_path, world)
+
+    assert abandoned not in _remote_tags(world.origin)
+    assert f"{ABANDONED_TAG_PREFIX}{abandoned}" in _remote_tags(world.origin)
+    assert _git(
+        world.origin, "rev-list", "-n1", f"{ABANDONED_TAG_PREFIX}{abandoned}"
+    ) == (_git(world.origin, "rev-parse", "main")), (
+        "the record names the commit the abandoned release was cut from"
+    )
+    assert _check(world).version == _compute_next_version([abandoned])
+
+
+def test_a_superseded_version_is_recorded_too(tmp_path, world, never_shipped):
+    """Cutting over an unshipped release deletes its tag the same way."""
+    first = _check(world).version
+    _put(_workspace(tmp_path, world.origin, version=first))
+    _commit(world.dev, "More work", **{"more.txt": "more\n"})
+    _git(world.dev, "push", "-q", "origin", "main")
+    second = _check(world).version
+    assert second == _compute_next_version([first])
+
+    _, metadata = _put(_workspace(tmp_path, world.origin, version=second))
+    _put(_workspace(tmp_path, world.origin, version=second), action="abandon")
+
+    assert metadata["superseded"] == first
+    assert {f"{ABANDONED_TAG_PREFIX}{first}", f"{ABANDONED_TAG_PREFIX}{second}"} <= set(
+        _remote_tags(world.origin)
+    )
+    assert _check(world).version == _compute_next_version([first, second])
+
+
+def test_create_refuses_an_abandoned_version(tmp_path, world, never_shipped):
+    """A re-run of an old build can still carry one; check alone cannot stop it."""
+    abandoned = _cut_and_abandon(tmp_path, world)
+
+    with pytest.raises(RuntimeError, match="it was abandoned"):
+        _put(_workspace(tmp_path, world.origin, version=abandoned))
+
+    assert abandoned not in _remote_tags(world.origin)
+    assert not _git(world.origin, "branch", "--list", f"releases/{abandoned}")
+
+
+def test_abandoning_twice_is_still_a_no_op(tmp_path, world, never_shipped):
+    abandoned = _cut_and_abandon(tmp_path, world)
+
+    _put(_workspace(tmp_path, world.origin, version=abandoned), action="abandon")
+
+    assert f"{ABANDONED_TAG_PREFIX}{abandoned}" in _remote_tags(world.origin)
+
+
+def test_a_shipped_release_that_keeps_its_tag_is_not_recorded(
+    tmp_path, world, in_production
+):
+    """Its tag stays, and check already counts a tag that is there."""
+    version = _check(world).version
+    _put(_workspace(tmp_path, world.origin, version=version))
+    _put(_workspace(tmp_path, world.origin, version=version), action="abandon")
+
+    assert version in _remote_tags(world.origin)
+    assert not any(
+        tag.startswith(ABANDONED_TAG_PREFIX) for tag in _remote_tags(world.origin)
+    )
 
 
 def test_check_re_emits_the_semver_baseline_of_a_first_release(tmp_path, git_isolated):
@@ -2388,6 +2480,7 @@ def _abandon_run_stub(
     *,
     in_flight: bool,
     tag_delete_fails: bool = False,
+    tombstone_push_fails: bool = False,
 ):
     """Build an `_run` side effect for an abandon of *version_str*.
 
@@ -2398,13 +2491,23 @@ def _abandon_run_stub(
 
     With *tag_delete_fails* the tag's deletion push raises and the tag stays
     on the remote, which is the case that must not go on to delete the branch.
+    With *tombstone_push_fails* the push recording the abandoned version raises.
     """
     branch_line = f"brnchsha01{'0' * 30}\trefs/heads/releases/{version_str}\n"
     tag_line = f"tagsha0011{'0' * 30}\trefs/tags/{version_str}\n"
+    tombstone = f"refs/tags/{ABANDONED_TAG_PREFIX}{version_str}"
     deleted: set[str] = set()
+    pushed: set[str] = set()
 
-    def track_run(cmd, **kw):
+    def track_run(cmd, **kw):  # noqa: PLR0911
         calls.append(list(cmd))
+        if "push" in cmd and "--delete" not in cmd and cmd[-1].endswith(tombstone):
+            if tombstone_push_fails:
+                raise subprocess.CalledProcessError(1, cmd, "", "remote rejected")
+            pushed.add(tombstone)
+            return ""
+        if "ls-remote" in cmd and cmd[-1] == tombstone:
+            return f"tombsha001{'0' * 30}\t{tombstone}\n" if tombstone in pushed else ""
         if "push" in cmd and "--delete" in cmd:
             ref = cmd[-1]
             if tag_delete_fails and ref.startswith("refs/tags/"):
@@ -2526,6 +2629,41 @@ def test_publish_new_version_abandon_keeps_the_branch_when_the_tag_survives(
     assert not any(f"releases/{version_str}" in d for d in deletes), (
         "The branch must survive a tag deletion that did not take"
     )
+
+
+@patch("concourse.ReleaseResource._reached_production", return_value=False)
+@patch("concourse._run")
+def test_publish_new_version_abandon_records_the_version_before_deleting(
+    mock_run, _mock_reached, tmp_path
+):
+    """The record goes first, so a half-done abandon never frees the number."""
+    version_str = "2026.4.14.1"
+    calls: list[list[str]] = []
+    mock_run.side_effect = _abandon_run_stub(version_str, calls, in_flight=True)
+
+    _abandon_a_release(make_resource(), tmp_path, version_str)
+
+    pushes = [" ".join(c) for c in calls if "push" in c]
+    assert pushes[0].endswith(f":refs/tags/{ABANDONED_TAG_PREFIX}{version_str}")
+    assert "--delete" in pushes[1]
+
+
+@patch("concourse.ReleaseResource._reached_production", return_value=False)
+@patch("concourse._run")
+def test_publish_new_version_abandon_deletes_nothing_when_the_record_fails(
+    mock_run, _mock_reached, tmp_path
+):
+    """Both refs stay, so the release is still in flight and the abandon retryable."""
+    version_str = "2026.4.14.1"
+    calls: list[list[str]] = []
+    mock_run.side_effect = _abandon_run_stub(
+        version_str, calls, in_flight=True, tombstone_push_fails=True
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _abandon_a_release(make_resource(), tmp_path, version_str)
+
+    assert not [c for c in calls if "push" in c and "--delete" in c]
 
 
 @patch("concourse._run")
@@ -2956,6 +3094,10 @@ def test_create_does_not_supersede_itself(mock_run, tmp_path):
     pre_bump_sha = "prebump1" * 5
 
     def fake_run(cmd, **kw):
+        if cmd[:2] == ["git", "ls-remote"] and cmd[-1].startswith(
+            "refs/tags/abandoned/"
+        ):
+            return ""
         if cmd[:2] == ["git", "ls-remote"]:
             return f"abc\trefs/heads/releases/{version_str}\n"
         if cmd[:2] == ["git", "rev-parse"]:
