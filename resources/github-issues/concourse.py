@@ -51,6 +51,8 @@ def _fit_to_github_limit(body: str, max_chars: int = GITHUB_BODY_MAX_CHARS) -> s
 # works for any checklist-style issue body, not just the release resource's
 # specific "by <author>" format.
 _CHECKLIST_LINE_RE = re.compile(r"^- \[(?P<mark> |x)\](?P<rest>.*)$", re.IGNORECASE)
+# The tombstone a get prefixes to the title of an issue it consumed.
+_CONSUMED_PREFIX_RE = re.compile(r"^\[CONSUMED #[^\]]*\]")
 
 
 def _merge_checklist_preserving_checked(old_body: str, new_body: str) -> str:
@@ -349,16 +351,22 @@ class ConcourseGithubIssuesResource(ConcourseResource):
     def tombstone_version(
         self, version: ConcourseGithubIssuesVersion, build_metadata: BuildMetadata
     ):
-        """Rename the issue with a CONSUMED prefix so it is not re-triggered."""
-        current_title = self.get_title_from_build(build_metadata)
+        """Rename the issue with a CONSUMED prefix so it is not re-triggered.
+
+        The prefix goes on the issue's own title, not on one rendered from the
+        build: a put's ``title_template`` can name a release version that the
+        source's ``issue_title_template`` does not, and a later put with
+        ``carry_checks_unless_labeled`` finds this issue by that title. A
+        tombstone already there is replaced rather than stacked.
+        """
         job_number = build_metadata.BUILD_NAME
-        new_title = f"[CONSUMED #{job_number}]" + current_title
 
         # Check state from the version data first
         if version.issue_state == "closed":
             # Fetch the issue object only when we know we need to edit it
             issue = self.repo.get_issue(int(version.issue_number))  # API Call 1
-            issue.edit(title=new_title)
+            title = _CONSUMED_PREFIX_RE.sub("", issue.title, count=1)
+            issue.edit(title=f"[CONSUMED #{job_number}]{title}")
 
     def _refuse_if_skip_labeled(self, version: ConcourseGithubIssuesVersion) -> None:
         """Raise if the version's issue carries a ``skip_if_labeled`` label now."""
@@ -547,8 +555,14 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             ref.ref == wanted for ref in self.repo.get_git_matching_refs(f"tags/{tag}")
         )
 
-    def _issues_titled(self, title: str, *, open_only: bool) -> list[Issue]:
+    def _issues_titled(
+        self, title: str, *, open_only: bool, include_consumed: bool = False
+    ) -> list[Issue]:
         """Return every issue titled exactly *title*, read fresh, oldest first.
+
+        With *include_consumed*, an issue whose title is *title* behind a
+        ``[CONSUMED #n]`` tombstone counts too. Search finds those, since the
+        tombstone leaves *title* intact as a phrase.
 
         Search matches on tokens, not on the whole title, so only exact matches
         count: acting on a neighbour's issue is worse than acting on none. Its
@@ -560,21 +574,27 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         *open_only*, the search asks for open issues and any match the issues
         API calls closed is dropped.
         """
+
+        def matches(candidate: str) -> bool:
+            if include_consumed:
+                candidate = _CONSUMED_PREFIX_RE.sub("", candidate, count=1)
+            return candidate == title
+
         safe_title = title.replace('"', '\\"')
         state = "state:open " if open_only else ""
         query = f'repo:{self.repo.full_name} {state}"{safe_title}" in:title is:issue'
         numbers = {
             issue.number
             for issue in self.gh.search_issues(query)
-            if issue.title == title
+            if matches(issue.title)
         }
         numbers.update(
             issue.number
             for issue in self._recent_issues()
-            if issue.title == title and not issue.pull_request
+            if matches(issue.title) and not issue.pull_request
         )
         issues = [self.repo.get_issue(number) for number in sorted(numbers)]
-        issues = [issue for issue in issues if issue.title == title]
+        issues = [issue for issue in issues if matches(issue.title)]
         if open_only:
             issues = [issue for issue in issues if issue.state == "open"]
         return issues
@@ -634,6 +654,38 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             print(f"about to remove {stale=} from #{issue_number}")  # noqa: T201
             issue.remove_from_labels(stale)
 
+    def _carry_checks(self, title: str, body: str, unless_labeled: list[str]) -> str:
+        """Re-tick *body*'s lines ticked on the newest closed issue for *title*.
+
+        Only the newest closed issue is read. Falling back to an older one when
+        the newest is excluded would revive ticks from before a release was
+        abandoned. Ticking only ever replaces ``[ ]`` with ``[x]``, so the
+        result is no longer than *body*.
+        """
+        if isinstance(unless_labeled, str):
+            # A bare string would be read as a set of single characters,
+            # excluding nothing.
+            msg = "carry_checks_unless_labeled must be a list of label names"
+            raise TypeError(msg)
+        closed = [
+            issue
+            for issue in self._issues_titled(
+                title, open_only=False, include_consumed=True
+            )
+            if issue.state == "closed"
+        ]
+        if not closed:
+            return body
+        donor = max(closed, key=lambda issue: issue.number)
+        excluded = sorted(
+            {label.name for label in donor.labels}.intersection(unless_labeled)
+        )
+        if excluded:
+            print(f"not carrying checks from #{donor.number}: labelled {excluded}")  # noqa: T201
+            return body
+        print(f"carrying checked checklist lines over from #{donor.number}")  # noqa: T201
+        return _merge_checklist_preserving_checked(donor.body or "", body)
+
     def publish_new_version(  # noqa: PLR0913
         self,
         sources_dir,
@@ -648,8 +700,20 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         close_with_labels: list[str] | None = None,
         skip_if_branch_missing: str | None = None,
         skip_if_tag_missing: str | None = None,
+        carry_checks_unless_labeled: list[str] | None = None,
     ) -> tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
         """Create or comment on a GitHub Issue and return its version.
+
+        *carry_checks_unless_labeled* keeps review progress when a put has to
+        open a new issue because the last one for the same title was closed.
+        A QA re-run after an issue was approved does that, and its checklist
+        would otherwise start all unchecked. The newest closed issue whose
+        title is the rendered title, with or without a ``[CONSUMED #n]``
+        tombstone, gives its ticks to the new body, matched line by line as
+        ``update_in_place`` does. Nothing is carried when that issue has any
+        of the listed labels (e.g. ``abandoned``: a retired release's ticks
+        are not a review of its re-cut), or when there is no closed issue. An
+        empty list carries regardless of labels. Only a new issue is affected.
 
         *skip_if_tag_missing* is *skip_if_branch_missing* for a tag, and is the
         one to use when only an *abandoned* release should post nothing: the
@@ -773,6 +837,10 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             print("Warning: There are multiple matches for the desired issue title!")  # noqa: T201
 
         if not already_exists:
+            if carry_checks_unless_labeled is not None:
+                issue_body = self._carry_checks(
+                    candidate_issue_title, issue_body, carry_checks_unless_labeled
+                )
             # Pass label names (strings) directly, avoid fetching Label objects
             working_issue = self.repo.create_issue(
                 title=candidate_issue_title,

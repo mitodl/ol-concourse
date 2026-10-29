@@ -434,12 +434,9 @@ def test_download_version_tombstones(mock_open, mock_github, tmp_path):
     # Check tombstoning
     # Need to update the expected title based on the default build_meta name '42'
     mock_repo.get_issue.assert_called_once_with(5)
-    # Calculate the expected title exactly how the resource does it
-    current_title_from_build = resource.get_title_from_build(build_meta)
-    expected_tombstone_title = (
-        f"[CONSUMED #{build_meta.BUILD_NAME}]" + current_title_from_build
+    mock_issue.edit.assert_called_once_with(
+        title=f"[CONSUMED #{build_meta.BUILD_NAME}][bot] Ready Issue"
     )
-    mock_issue.edit.assert_called_once_with(title=expected_tombstone_title)
     # Check file writing
     mock_open.assert_called_once_with("w")
     # Verify the file handle's write method was called
@@ -2184,3 +2181,130 @@ class TestPublishFindsOnlyOpenIssues:
         assert mock_repo.get_issue.call_count == 2
         retired.remove_from_labels.assert_not_called()
         retired.add_to_labels.assert_not_called()
+
+
+class TestTombstoneKeepsTheIssueTitle:
+    """The tombstone must not lose what the title says, e.g. a version."""
+
+    def _consume(self, mock_github, title):
+        _, mock_repo = mock_github
+        issue = create_mock_issue(
+            number=5, title=title, state="closed", created_at=T_MINUS_2
+        )
+        mock_repo.get_issue.return_value = issue
+        resource = ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_title_template="Release app",
+        )
+        version = ConcourseGithubIssuesVersion(
+            issue_number=5,
+            issue_title=title,
+            issue_state="closed",
+            issue_created_at=T_MINUS_2.strftime(ISO_8601_FORMAT),
+            issue_closed_at=T_MINUS_1.strftime(ISO_8601_FORMAT),
+            issue_url="http://example.com/issue/5",
+        )
+        resource.tombstone_version(version, mock_build_metadata(build_name="121"))
+        return issue
+
+    def test_prefixes_the_issues_own_title_not_the_source_template(self, mock_github):
+        """Mitxonline #4204 became "[CONSUMED #121]Release mitxonline"."""
+        issue = self._consume(mock_github, "Release app 2026.10.28.1")
+        issue.edit.assert_called_once_with(
+            title="[CONSUMED #121]Release app 2026.10.28.1"
+        )
+
+    def test_replaces_an_existing_tombstone(self, mock_github):
+        issue = self._consume(mock_github, "[CONSUMED #120]Release app 2026.10.28.1")
+        issue.edit.assert_called_once_with(
+            title="[CONSUMED #121]Release app 2026.10.28.1"
+        )
+
+
+class TestCarryChecksUnlessLabeled:
+    """A new issue for a title whose last issue was closed keeps its ticks."""
+
+    TITLE = "Release app 2026.10.28.1"
+    NEW_BODY = "## Release 2026.10.28.1\n- [ ] **A** (#1) by a\n- [ ] **B** (#2) by b\n"
+
+    def _issue(self, number, *, state="closed", title=None, body="", labels=()):
+        issue = create_mock_issue(
+            number=number,
+            title=title or self.TITLE,
+            state=state,
+            created_at=T_MINUS_2,
+            closed_at=T_MINUS_1 if state == "closed" else None,
+            labels=list(labels),
+        )
+        issue.body = body
+        return issue
+
+    def _publish(self, mock_github, *existing, **params):
+        mock_gh_instance, mock_repo = mock_github
+        mock_gh_instance.search_issues.return_value = list(existing)
+        mock_repo.get_issues.return_value = []
+        mock_repo.get_issue.side_effect = lambda number: next(
+            issue for issue in existing if issue.number == number
+        )
+        mock_repo.create_issue.return_value = self._issue(99, state="open")
+        ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template=self.TITLE,
+            issue_body_template=self.NEW_BODY,
+            update_in_place=True,
+        ).publish_new_version(
+            sources_dir="dummy", build_metadata=mock_build_metadata(), **params
+        )
+        return mock_repo.create_issue.call_args.kwargs["body"]
+
+    def test_carries_ticks_from_the_closed_issue(self, mock_github):
+        """Mitxonline #4208 reopened #4204's release with nothing ticked."""
+        approved = self._issue(
+            4204, body="- [x] **A** (#1) by a\n- [ ] **B** (#2) by b\n"
+        )
+        body = self._publish(mock_github, approved, carry_checks_unless_labeled=[])
+        assert "- [x] **A** (#1) by a" in body
+        assert "- [ ] **B** (#2) by b" in body
+
+    def test_carries_ticks_from_a_consumed_issue(self, mock_github):
+        consumed = self._issue(
+            4204,
+            title=f"[CONSUMED #121]{self.TITLE}",
+            body="- [x] **B** (#2) by b\n",
+        )
+        body = self._publish(
+            mock_github, consumed, carry_checks_unless_labeled=["abandoned"]
+        )
+        assert "- [x] **B** (#2) by b" in body
+
+    def test_reads_only_the_newest_closed_issue(self, mock_github):
+        """An older approval is not revived past a newer abandoned issue."""
+        approved = self._issue(10, body="- [x] **A** (#1) by a\n")
+        abandoned = self._issue(
+            11, body="- [ ] **A** (#1) by a\n", labels=["release", "abandoned"]
+        )
+        body = self._publish(
+            mock_github, approved, abandoned, carry_checks_unless_labeled=["abandoned"]
+        )
+        assert body == self.NEW_BODY
+
+    def test_ignores_another_releases_issue(self, mock_github):
+        other = self._issue(
+            12, title="Release app 2026.10.27.1", body="- [x] **A** (#1) by a\n"
+        )
+        body = self._publish(mock_github, other, carry_checks_unless_labeled=[])
+        assert body == self.NEW_BODY
+
+    def test_off_by_default(self, mock_github):
+        approved = self._issue(4204, body="- [x] **A** (#1) by a\n")
+        assert self._publish(mock_github, approved) == self.NEW_BODY
+
+    def test_refuses_a_bare_string(self, mock_github):
+        approved = self._issue(4204, body="- [x] **A** (#1) by a\n")
+        with pytest.raises(TypeError, match="list of label names"):
+            self._publish(
+                mock_github, approved, carry_checks_unless_labeled="abandoned"
+            )
