@@ -1463,6 +1463,18 @@ class TestCloseWithLabels:
         assert {label.name for label in consumed.labels} == {"abandoned"}
         assert metadata == {"retired_issues": "#38"}
 
+    def test_labels_only_the_newest_consumed_issue(self, mock_github, tmp_path):
+        """An unversioned title must not abandon every release shipped under it."""
+        older = self._issue(39, title=f"[CONSUMED #120]{self.TITLE}", state="closed")
+        newer = self._issue(40, title=f"[CONSUMED #121]{self.TITLE}", state="closed")
+        self._found(mock_github, older, newer)
+
+        _, metadata = self._publish(tmp_path)
+
+        older.add_to_labels.assert_not_called()
+        assert {label.name for label in newer.labels} == {"abandoned"}
+        assert metadata == {"retired_issues": "#40"}
+
     def test_no_issue_is_not_an_error_and_creates_nothing(self, mock_github, tmp_path):
         _, mock_repo = mock_github
         self._found(mock_github)

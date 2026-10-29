@@ -499,6 +499,13 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         # open and able to ship the release, which is why the lookup reads the
         # issues API too.
         issues = self._issues_titled(title, open_only=False, include_consumed=True)
+        # Only the newest consumed issue: it is the only one a carry can read,
+        # and a title without a version would otherwise match, and label, every
+        # release ever consumed under it.
+        consumed = [i for i in issues if _CONSUMED_PREFIX_RE.match(i.title)]
+        if consumed:
+            newest = max(consumed, key=lambda issue: issue.number)
+            issues = [i for i in issues if i not in consumed or i is newest]
         for issue in issues:
             if issue.state == "open":
                 print(f"about to label {issue=} with {labels=} and close it")  # noqa: T201
@@ -750,11 +757,12 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         *close_with_labels* retires an issue instead of posting one: every issue
         whose title is exactly the rendered title gets these labels. An open one
         also gets a comment linking this build and is closed; one already
-        closed but not yet consumed by the gate (a consumed one has been
-        renamed) is only labelled. It never creates an issue, and finding none
-        is not an error. An open issue is labelled and closed in one edit: a
-        gate polling for *closed* issues skips one by ``skip_if_labeled``, so
-        it must never see the issue closed but unlabelled, and
+        closed is only labelled. Of the issues a gate consumed (renamed
+        ``[CONSUMED #n]`` + the title), only the newest is labelled. It never
+        creates an issue, and finding none is not an error. An open issue is
+        labelled and closed in one edit: a gate polling for *closed* issues
+        skips one by ``skip_if_labeled``, so it must never see the issue closed
+        but unlabelled, and
         ``update_in_place`` must never see it open but labelled. The labels are
         checked again afterwards, in case another writer replaced them. Like
         *skip_if_file* it returns :data:`SKIPPED_VERSION`, so the implicit get
