@@ -1448,6 +1448,21 @@ class TestCloseWithLabels:
         assert version == SKIPPED_VERSION
         assert metadata == {"retired_issues": "none"}
 
+    def test_labels_a_consumed_issue_for_the_same_release(self, mock_github, tmp_path):
+        """An approval Production consumed must not tick the re-cut's checklist.
+
+        Abandoning deletes the tag and the next cut reuses the version, so
+        `carry_checks_unless_labeled` would find this issue by title.
+        """
+        consumed = self._issue(38, title=f"[CONSUMED #121]{self.TITLE}", state="closed")
+        self._found(mock_github, consumed)
+
+        _, metadata = self._publish(tmp_path)
+
+        consumed.edit.assert_not_called()
+        assert {label.name for label in consumed.labels} == {"abandoned"}
+        assert metadata == {"retired_issues": "#38"}
+
     def test_no_issue_is_not_an_error_and_creates_nothing(self, mock_github, tmp_path):
         _, mock_repo = mock_github
         self._found(mock_github)
@@ -2279,6 +2294,42 @@ class TestCarryChecksUnlessLabeled:
             mock_github, consumed, carry_checks_unless_labeled=["abandoned"]
         )
         assert "- [x] **B** (#2) by b" in body
+
+    def test_finds_a_consumed_issue_search_has_not_indexed(self, mock_github):
+        """The newest page of issues is read too, as for every title lookup."""
+        mock_gh_instance, mock_repo = mock_github
+        consumed = self._issue(
+            4204, title=f"[CONSUMED #121]{self.TITLE}", body="- [x] **A** (#1) by a\n"
+        )
+        mock_gh_instance.search_issues.return_value = []
+        mock_repo.get_issues.return_value = [consumed]
+        mock_repo.get_issue.side_effect = lambda number: consumed
+        mock_repo.create_issue.return_value = self._issue(99, state="open")
+        ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template=self.TITLE,
+            issue_body_template=self.NEW_BODY,
+        ).publish_new_version(
+            sources_dir="dummy",
+            build_metadata=mock_build_metadata(),
+            carry_checks_unless_labeled=["abandoned"],
+        )
+        body = mock_repo.create_issue.call_args.kwargs["body"]
+        assert "- [x] **A** (#1) by a" in body
+
+    def test_does_not_carry_from_a_consumed_then_abandoned_release(self, mock_github):
+        consumed = self._issue(
+            4204,
+            title=f"[CONSUMED #121]{self.TITLE}",
+            body="- [x] **A** (#1) by a\n",
+            labels=["release", "abandoned"],
+        )
+        body = self._publish(
+            mock_github, consumed, carry_checks_unless_labeled=["abandoned"]
+        )
+        assert body == self.NEW_BODY
 
     def test_reads_only_the_newest_closed_issue(self, mock_github):
         """An older approval is not revived past a newer abandoned issue."""

@@ -490,12 +490,15 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         # Any state: a reviewer may have closed the issue after the release was
         # cut but before this build ran. A gate that has not polled yet would
         # still fire on it, and labelling it is what stops that. An issue the
-        # gate already consumed was renamed `[CONSUMED ...]` by its get, so the
-        # exact-title match never finds one. An abandon can also land moments
-        # after the QA put that opened the gate issue, before search has
-        # indexed it; finding nothing would leave that issue open and able to
-        # ship the release, which is why the lookup reads the issues API too.
-        issues = self._issues_titled(title, open_only=False)
+        # gate already consumed (its get renamed it `[CONSUMED ...]`) is
+        # labelled too: it can no longer fire the gate, but a put with
+        # `carry_checks_unless_labeled` would otherwise hand its ticks to a
+        # re-cut of the version, and the label is what it checks. An abandon
+        # can also land moments after the QA put that opened the gate issue,
+        # before search has indexed it; finding nothing would leave that issue
+        # open and able to ship the release, which is why the lookup reads the
+        # issues API too.
+        issues = self._issues_titled(title, open_only=False, include_consumed=True)
         for issue in issues:
             if issue.state == "open":
                 print(f"about to label {issue=} with {labels=} and close it")  # noqa: T201
