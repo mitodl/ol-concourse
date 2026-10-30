@@ -2542,12 +2542,13 @@ class TestCarryChecksUnlessLabeled:
         assert "- [ ] **A** (#1) by a" in body
         assert "- [x] **B** (#2) by b" in body
 
-    def test_carries_nothing_without_put_labels(self, mock_github):
+    def test_refuses_a_put_without_labels(self, mock_github):
+        """It could never carry anything, which would look like working."""
         approved = self._issue(4204, body="- [x] **A** (#1) by a\n")
-        body = self._publish(
-            mock_github, approved, labels=None, carry_checks_unless_labeled=[]
-        )
-        assert body == self.NEW_BODY
+        with pytest.raises(ValueError, match="needs the put to set labels"):
+            self._publish(
+                mock_github, approved, labels=None, carry_checks_unless_labeled=[]
+            )
 
     def test_off_by_default(self, mock_github):
         approved = self._issue(4204, body="- [x] **A** (#1) by a\n")

@@ -682,7 +682,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         Anyone who can open an issue in a public repository can open and close
         one with a predictable title and a ticked body, but only a
         collaborator can label it, so an unlabelled issue is not a review.
-        With no *labels*, nothing is carried.
+        A put with no *labels* is refused, since it could never carry.
 
         Of those, only the newest closed issue is read. Falling back to an
         older one when the newest is excluded would revive ticks from before a
@@ -694,6 +694,10 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             # excluding nothing.
             msg = "carry_checks_unless_labeled must be a list of label names"
             raise TypeError(msg)
+        if not labels:
+            # Nothing could ever be carried, which would look like working.
+            msg = "carry_checks_unless_labeled needs the put to set labels"
+            raise ValueError(msg)
         closed = [
             issue
             for issue in self._issues_titled(title, open_only=False)
