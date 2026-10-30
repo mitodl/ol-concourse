@@ -187,8 +187,20 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         skip_if_labeled: list[str] | None = None,
         timeout: int = 30,
         update_in_place: bool = False,
+        consume_with_label: str | None = None,
     ):
-        """Initialize with GitHub API credentials and issue configuration."""
+        """Initialize with GitHub API credentials and issue configuration.
+
+        *consume_with_label* names the label ``in`` adds to an issue it
+        consumes, in place of the ``[CONSUMED #n]`` title rewrite. The title,
+        which is part of the version and may carry a release version a put's
+        ``title_template`` set, is then left alone. ``check`` skips an issue
+        carrying the label, as it skips one carrying a ``skip_if_labeled``
+        label: adding it bumps the issue's ``updated_at``, so the issue comes
+        back inside the ``since`` window and its title still matches
+        ``issue_prefix``. ``in`` does not refuse it, so a retried build can
+        fetch an issue it already consumed.
+        """
         super().__init__(ConcourseGithubIssuesVersion)
         if auth_method == "token":
             auth = self.auth_token(access_token)
@@ -206,6 +218,10 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         self.limit_old_versions = limit_old_versions
         self.skip_if_labeled: list[str] = skip_if_labeled or []
         self.update_in_place = update_in_place
+        self.consume_with_label = consume_with_label
+        self._check_skip_labels = set(self.skip_if_labeled) | (
+            {consume_with_label} if consume_with_label else set()
+        )
 
     def auth_token(self, access_token):
         """Return a token-based GitHub Auth object."""
@@ -271,9 +287,9 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         for issue in all_pipeline_issues:
             if not issue.title.startswith(self.issue_prefix or ""):
                 continue
-            if self.skip_if_labeled:
+            if self._check_skip_labels:
                 issue_label_names = {lbl.name for lbl in issue.labels}
-                if issue_label_names.intersection(self.skip_if_labeled):
+                if issue_label_names.intersection(self._check_skip_labels):
                     continue
             matching_issues.append(issue)
             if (
@@ -295,9 +311,9 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         for issue in self.get_all_issues():
             if not issue.title.startswith(self.issue_prefix or ""):
                 continue
-            if self.skip_if_labeled:
+            if self._check_skip_labels:
                 issue_label_names = {lbl.name for lbl in issue.labels}
-                if issue_label_names.intersection(self.skip_if_labeled):
+                if issue_label_names.intersection(self._check_skip_labels):
                     continue
             return issue
         return None
@@ -349,16 +365,25 @@ class ConcourseGithubIssuesResource(ConcourseResource):
     def tombstone_version(
         self, version: ConcourseGithubIssuesVersion, build_metadata: BuildMetadata
     ):
-        """Rename the issue with a CONSUMED prefix so it is not re-triggered."""
+        """Mark the issue consumed so it is not re-triggered.
+
+        With ``consume_with_label`` the issue gets that label and keeps its
+        title. Adding a label is idempotent, so a retried build that fetches
+        the same issue again changes nothing. Without it, the title is
+        rewritten with a ``[CONSUMED #n]`` prefix, which stops ``check``
+        matching ``issue_prefix``.
+        """
+        # Check state from the version data first
+        if version.issue_state != "closed":
+            return
+        # Fetch the issue object only when we know we need to edit it
+        issue = self.repo.get_issue(int(version.issue_number))  # API Call 1
+        if self.consume_with_label:
+            issue.add_to_labels(self.consume_with_label)
+            return
         current_title = self.get_title_from_build(build_metadata)
         job_number = build_metadata.BUILD_NAME
-        new_title = f"[CONSUMED #{job_number}]" + current_title
-
-        # Check state from the version data first
-        if version.issue_state == "closed":
-            # Fetch the issue object only when we know we need to edit it
-            issue = self.repo.get_issue(int(version.issue_number))  # API Call 1
-            issue.edit(title=new_title)
+        issue.edit(title=f"[CONSUMED #{job_number}]" + current_title)
 
     def _refuse_if_skip_labeled(self, version: ConcourseGithubIssuesVersion) -> None:
         """Raise if the version's issue carries a ``skip_if_labeled`` label now."""
@@ -395,8 +420,9 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         self._refuse_if_skip_labeled(version)
         with Path(destination_dir).joinpath("gh_issue.json").open("w") as issue_file:
             issue_file.write(json.dumps(version.to_flat_dict() or {}))
-        # We've triggered a deploy and consumed this issue. Set a tombstone in the title
-        # so we'll ignore it in future and avoid duplicate triggering.
+        # We've triggered a deploy and consumed this issue. Tombstone it (a label,
+        # or a title prefix) so we'll ignore it in future and avoid duplicate
+        # triggering.
         self.tombstone_version(version, build_metadata)
         return version, {}
 
@@ -481,13 +507,21 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         title = self.get_title_from_build(build_metadata, title_template=title_template)
         # Any state: a reviewer may have closed the issue after the release was
         # cut but before this build ran. A gate that has not polled yet would
-        # still fire on it, and labelling it is what stops that. An issue the
-        # gate already consumed was renamed `[CONSUMED ...]` by its get, so the
-        # exact-title match never finds one. An abandon can also land moments
-        # after the QA put that opened the gate issue, before search has
-        # indexed it; finding nothing would leave that issue open and able to
-        # ship the release, which is why the lookup reads the issues API too.
+        # still fire on it, and labelling it is what stops that. An issue a
+        # gate already consumed can no longer fire it, but is labelled too, so
+        # `carry_checks_unless_labeled` does not hand its ticks to a re-cut of
+        # the same version. One renamed `[CONSUMED ...]` never matches the
+        # exact title; one labelled `consume_with_label` keeps its title, and
+        # only the newest of those is labelled, since a title without a version
+        # would otherwise match every release ever consumed under it. An
+        # abandon can also land moments after the QA put that opened the gate
+        # issue, before search has indexed it; finding nothing would leave that
+        # issue open and able to ship the release, which is why the lookup
+        # reads the issues API too.
         issues = self._issues_titled(title, open_only=False)
+        if consumed := [issue for issue in issues if self._is_consumed(issue)]:
+            newest = max(consumed, key=lambda issue: issue.number)
+            issues = [i for i in issues if i not in consumed or i is newest]
         for issue in issues:
             if issue.state == "open":
                 print(f"about to label {issue=} with {labels=} and close it")  # noqa: T201
@@ -497,8 +531,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
                     f"{', '.join(f'`{label}`' for label in labels)}."
                 )
                 # One PATCH, so no reader sees either half on its own: closed
-                # but unlabelled would ship the release, and open but labelled
-                # would let update_in_place remove the label as stale.
+                # but unlabelled would ship the release.
                 current = [label.name for label in issue.labels]
                 issue.edit(
                     state="closed",
@@ -593,14 +626,19 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             _RECENT_ISSUE_SCAN,
         )
 
+    def _is_consumed(self, issue: Issue) -> bool:
+        """Return whether a get labelled *issue* with ``consume_with_label``."""
+        return bool(self.consume_with_label) and self.consume_with_label in {
+            label.name for label in issue.labels
+        }
+
     def _ensure_labels(self, issue_number: int, labels: list[str]) -> None:
         """Re-add any of *labels* another writer removed from an issue.
 
-        ``update_in_place`` leaves a closed issue's labels alone and removes
-        only labels it read, but a human or another tool can still replace
-        them. Re-reading after the close is the only point at which the label
-        is known to have survived. A gate that polled in the gap between that
-        write and the re-add is the residual window.
+        This resource never removes a label, but a human or another tool can
+        still replace them. Re-reading after the close is the only point at
+        which the label is known to have survived. A gate that polled in the
+        gap between that write and the re-add is the residual window.
         """
         issue = self.repo.get_issue(issue_number)
         missing = [
@@ -613,14 +651,18 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             issue.add_to_labels(*missing)
 
     def _reconcile_labels(self, issue_number: int, desired: list[str]) -> None:
-        """Make an open issue's labels exactly *desired*, one label at a time.
+        """Add any of *desired* an open issue is missing. Never remove one.
+
+        Labels record that something happened -- a bot marked the issue
+        ready, a gate consumed it -- and other writers add them. A label this
+        put did not name is not stale, so nothing is removed. Every write is a
+        plain add by name, which is idempotent and needs no ordering with any
+        other writer.
 
         Reads the issue from the issues API, not search, whose index can still
         call a retired issue open. A closed issue is left alone: it has been
         approved or retired (``close_with_labels``), and either way its labels
-        are no longer this put's to correct. Labels are added and removed by
-        name rather than replaced as a list, so a label written after this read
-        -- ``close_with_labels``'s, say -- can never be removed by it.
+        are no longer this put's to correct.
         """
         issue = self.repo.get_issue(issue_number)
         if issue.state != "open":
@@ -630,9 +672,49 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         if missing := [name for name in desired if name not in current]:
             print(f"about to add {missing=} to #{issue_number}")  # noqa: T201
             issue.add_to_labels(*missing)
-        for stale in sorted(current.difference(desired)):
-            print(f"about to remove {stale=} from #{issue_number}")  # noqa: T201
-            issue.remove_from_labels(stale)
+
+    def _carry_checks(
+        self, title: str, body: str, unless_labeled: list[str], labels: list[str]
+    ) -> str:
+        """Re-tick *body*'s lines ticked on the newest closed issue for *title*.
+
+        Only an issue carrying one of this put's *labels* can give its ticks.
+        Anyone who can open an issue in a public repository can open and close
+        one with a predictable title and a ticked body, but only a
+        collaborator can label it, so an unlabelled issue is not a review.
+        A put with no *labels* is refused, since it could never carry.
+
+        Of those, only the newest closed issue is read. Falling back to an
+        older one when the newest is excluded would revive ticks from before a
+        release was abandoned. Ticking only ever replaces ``[ ]`` with
+        ``[x]``, so the result is no longer than *body*.
+        """
+        if isinstance(unless_labeled, str):
+            # A bare string would be read as a set of single characters,
+            # excluding nothing.
+            msg = "carry_checks_unless_labeled must be a list of label names"
+            raise TypeError(msg)
+        if not labels:
+            # Nothing could ever be carried, which would look like working.
+            msg = "carry_checks_unless_labeled needs the put to set labels"
+            raise ValueError(msg)
+        closed = [
+            issue
+            for issue in self._issues_titled(title, open_only=False)
+            if issue.state == "closed"
+            and {label.name for label in issue.labels}.intersection(labels)
+        ]
+        if not closed:
+            return body
+        donor = max(closed, key=lambda issue: issue.number)
+        excluded = sorted(
+            {label.name for label in donor.labels}.intersection(unless_labeled)
+        )
+        if excluded:
+            print(f"not carrying checks from #{donor.number}: labelled {excluded}")  # noqa: T201
+            return body
+        print(f"carrying checked checklist lines over from #{donor.number}")  # noqa: T201
+        return _merge_checklist_preserving_checked(donor.body or "", body)
 
     def publish_new_version(  # noqa: PLR0913
         self,
@@ -648,8 +730,22 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         close_with_labels: list[str] | None = None,
         skip_if_branch_missing: str | None = None,
         skip_if_tag_missing: str | None = None,
+        carry_checks_unless_labeled: list[str] | None = None,
     ) -> tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
         """Create or comment on a GitHub Issue and return its version.
+
+        *carry_checks_unless_labeled* keeps review progress when a put has to
+        open a new issue because the last one for the same title was closed.
+        A QA re-run after an issue was approved does that, and its checklist
+        would otherwise start all unchecked. The newest closed issue whose
+        title is the rendered title, and which carries one of this put's
+        *labels*, gives its ticks to the new body, matched
+        line by line as ``update_in_place`` does. An issue a gate consumed
+        with ``consume_with_label`` keeps its title and so counts; one renamed
+        ``[CONSUMED #n]`` does not. Nothing is carried when that issue has any
+        of the listed labels (e.g. ``ops:abandoned``: a retired release's
+        ticks are not a review of its re-cut), or when there is no closed
+        issue. An empty list excludes nothing. Only a new issue is affected.
 
         *skip_if_tag_missing* is *skip_if_branch_missing* for a tag, and is the
         one to use when only an *abandoned* release should post nothing: the
@@ -683,12 +779,12 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         *close_with_labels* retires an issue instead of posting one: every issue
         whose title is exactly the rendered title gets these labels. An open one
         also gets a comment linking this build and is closed; one already
-        closed but not yet consumed by the gate (a consumed one has been
-        renamed) is only labelled. It never creates an issue, and finding none
-        is not an error. An open issue is labelled and closed in one edit: a
-        gate polling for *closed* issues skips one by ``skip_if_labeled``, so
-        it must never see the issue closed but unlabelled, and
-        ``update_in_place`` must never see it open but labelled. The labels are
+        closed is only labelled. Of the issues a gate consumed with
+        ``consume_with_label``, only the newest is labelled; one renamed
+        ``[CONSUMED #n]`` never matches. It never creates an issue, and finding
+        none is not an error. An open issue is labelled and closed in one edit:
+        a gate polling for *closed* issues skips one by ``skip_if_labeled``, so
+        it must never see the issue closed but unlabelled. The labels are
         checked again afterwards, in case another writer replaced them. Like
         *skip_if_file* it returns :data:`SKIPPED_VERSION`, so the implicit get
         has nothing to tombstone. *skip_if_file* wins when both are set.
@@ -773,6 +869,13 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             print("Warning: There are multiple matches for the desired issue title!")  # noqa: T201
 
         if not already_exists:
+            if carry_checks_unless_labeled is not None:
+                issue_body = self._carry_checks(
+                    candidate_issue_title,
+                    issue_body,
+                    carry_checks_unless_labeled,
+                    labels or [],
+                )
             # Pass label names (strings) directly, avoid fetching Label objects
             working_issue = self.repo.create_issue(
                 title=candidate_issue_title,
@@ -802,18 +905,19 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             # later change to them -- a gate opened before the labels were
             # corrected keeps the wrong ones for its whole life, and a label is
             # what routing and queries actually read. update_in_place already
-            # means "this resource owns this issue", so reconcile them here.
+            # means "this resource owns this issue", so add any it is missing.
             #
-            # The result is exactly the put's list, unlike the body, which is
-            # merged to preserve a reviewer's ticked checkboxes. There is no
-            # equivalent of a ticked box for labels: nothing distinguishes one a
-            # human added from a stale one this resource wrote, and leaving a
-            # contradictory label in place is worse than dropping a hand-added
-            # one. Assignees are deliberately NOT reconciled -- someone
-            # assigning themselves to review a gate is a human workflow, and
-            # overwriting that would fight them.
+            # Only add: other writers label the issue too (a bot marking it
+            # ready to promote, say), and a label is a record that something
+            # happened, not a state this put owns. Removing one it did not name
+            # would erase that record and make its writer act again. Assignees
+            # are deliberately NOT reconciled -- someone assigning themselves to
+            # review a gate is a human workflow, and overwriting that would
+            # fight them.
             desired_labels = labels or []
-            if set(desired_labels) != {label.name for label in working_issue.labels}:
+            if not set(desired_labels).issubset(
+                {label.name for label in working_issue.labels}
+            ):
                 self._reconcile_labels(working_issue.number, desired_labels)
         else:
             working_issue = already_exists[-1]
