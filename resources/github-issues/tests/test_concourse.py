@@ -5,6 +5,7 @@ import pytest
 from unittest.mock import MagicMock, call, patch
 from datetime import datetime, timedelta
 import json
+from typing import Any
 
 from concourse import (
     ConcourseGithubIssuesResource,
@@ -1931,13 +1932,11 @@ def _publish_onto_existing(
     return issue
 
 
-def test_update_in_place_reconciles_stale_labels(mock_github):
-    """An issue outlives a change to its labels.
+def test_update_in_place_adds_missing_labels_and_removes_none(mock_github):
+    """An issue outlives a change to its labels, so a missing one is added.
 
-    A gate opened before the label semantics were corrected kept
-    `promotion-to-production` on a QA gate for the issue's whole life, because
-    labels were applied at creation only -- and a label is what routing and
-    queries actually read.
+    A label the put did not name is left alone: labels record that something
+    happened, and removing one erases that record.
     """
     issue = _publish_onto_existing(
         mock_github,
@@ -1945,13 +1944,26 @@ def test_update_in_place_reconciles_stale_labels(mock_github):
         desired_labels=["DevOps", "promotion-to-qa"],
     )
     issue.fresh.add_to_labels.assert_called_once_with("promotion-to-qa")
-    issue.fresh.remove_from_labels.assert_called_once_with("promotion-to-production")
+    issue.fresh.remove_from_labels.assert_not_called()
+
+
+def test_update_in_place_keeps_a_label_another_writer_added(mock_github):
+    """A QA re-run stripped the bot's `promote-ready`, so the bot re-announced."""
+    issue = _publish_onto_existing(
+        mock_github,
+        existing_labels=["ops:release", "ops:promote-ready"],
+        desired_labels=["ops:release"],
+    )
+    issue.fresh.remove_from_labels.assert_not_called()
+    issue.fresh.add_to_labels.assert_not_called()
+    for written in (issue, issue.fresh):
+        assert not [c for c in written.edit.call_args_list if "labels" in c.kwargs]
 
 
 def test_update_in_place_never_replaces_the_whole_label_list(mock_github):
     """A replace would drop a label added after the read, e.g. `abandoned`.
 
-    Adding and removing by name only touches the labels this put read, so a
+    Adding by name never touches a label this put did not name, so a
     retirement label that lands in between survives.
     """
     issue = _publish_onto_existing(
@@ -2184,3 +2196,347 @@ class TestPublishFindsOnlyOpenIssues:
         assert mock_repo.get_issue.call_count == 2
         retired.remove_from_labels.assert_not_called()
         retired.add_to_labels.assert_not_called()
+
+
+CONSUMED = "ops:consumed"
+
+
+def _version_of(issue: MagicMock) -> ConcourseGithubIssuesVersion:
+    return ConcourseGithubIssuesVersion(
+        issue_number=issue.number,
+        issue_title=issue.title,
+        issue_state=issue.state,
+        issue_created_at=issue.created_at.strftime(ISO_8601_FORMAT),
+        issue_closed_at=issue.closed_at.strftime(ISO_8601_FORMAT)
+        if issue.closed_at
+        else None,
+        issue_url=issue.url,
+    )
+
+
+class TestConsumeWithLabel:
+    """A gate that consumes an issue labels it and leaves its title alone."""
+
+    TITLE = "Release my-app 2026.10.28.1"
+
+    def _resource(self, **kwargs):
+        defaults: dict[str, Any] = {
+            "repository": "test/repo",
+            "access_token": "dummy_token",
+            "issue_state": "closed",
+            "issue_prefix": "Release my-app",
+            "issue_title_template": "Release my-app",
+            "skip_if_labeled": ["ops:abandoned"],
+            "consume_with_label": CONSUMED,
+        }
+        defaults.update(kwargs)
+        return ConcourseGithubIssuesResource(**defaults)
+
+    def _issue(self, number, title=None, labels=None, closed_at=T_MINUS_1):
+        return create_mock_issue(
+            number=number,
+            title=title or self.TITLE,
+            state="closed",
+            created_at=T_MINUS_2,
+            closed_at=closed_at,
+            labels=labels,
+        )
+
+    def test_get_labels_the_issue_and_keeps_its_title(self, mock_github, tmp_path):
+        """Mitxonline #4204 lost its version to `[CONSUMED #121]Release mitxonline`."""
+        _, mock_repo = mock_github
+        issue = self._issue(5, labels=["ops:release"])
+        mock_repo.get_issue.return_value = issue
+
+        self._resource().download_version(
+            _version_of(issue), str(tmp_path), mock_build_metadata(build_name="121")
+        )
+
+        issue.add_to_labels.assert_called_once_with(CONSUMED)
+        issue.edit.assert_not_called()
+        assert (tmp_path / "gh_issue.json").exists()
+
+    def test_a_retried_get_of_a_consumed_issue_succeeds(self, mock_github, tmp_path):
+        """The consumed label is not a refusal label; a retried build re-runs `in`."""
+        _, mock_repo = mock_github
+        issue = self._issue(5, labels=["ops:release", CONSUMED])
+        mock_repo.get_issue.return_value = issue
+
+        self._resource().download_version(
+            _version_of(issue), str(tmp_path), mock_build_metadata()
+        )
+
+        assert (tmp_path / "gh_issue.json").exists()
+        issue.edit.assert_not_called()
+
+    def test_get_still_refuses_an_abandoned_issue(self, mock_github, tmp_path):
+        _, mock_repo = mock_github
+        issue = self._issue(5, labels=[CONSUMED, "ops:abandoned"])
+        mock_repo.get_issue.return_value = issue
+
+        with pytest.raises(RuntimeError, match="ops:abandoned"):
+            self._resource().download_version(
+                _version_of(issue), str(tmp_path), mock_build_metadata()
+            )
+
+        issue.add_to_labels.assert_not_called()
+
+    def test_check_skips_a_consumed_issue_whose_title_still_matches(self, mock_github):
+        """Labelling bumps `updated_at`, so the issue is back inside `since`."""
+        _, mock_repo = mock_github
+        previous = self._issue(4, closed_at=T_MINUS_2)
+        consumed = self._issue(5, labels=[CONSUMED])
+        fresh = self._issue(6, title="Release my-app 2026.10.29.1", closed_at=NOW)
+        mock_repo.get_issues.return_value = [fresh, consumed]
+
+        versions = SimpleTestResourceWrapper(self._resource()).fetch_new_versions(
+            _version_of(previous)
+        )
+
+        assert {v.issue_number for v in versions} == {6}
+
+    def test_first_check_skips_a_consumed_issue(self, mock_github):
+        _, mock_repo = mock_github
+        mock_repo.get_issues.return_value = [
+            self._issue(6, labels=[CONSUMED]),
+            self._issue(5),
+        ]
+
+        versions = SimpleTestResourceWrapper(self._resource()).fetch_new_versions(None)
+
+        assert {v.issue_number for v in versions} == {5}
+
+    def test_check_still_skips_a_title_consumed_before_the_label(self, mock_github):
+        """No migration: `[CONSUMED #n]` titles never match `issue_prefix`."""
+        _, mock_repo = mock_github
+        previous = self._issue(4, closed_at=T_MINUS_2)
+        mock_repo.get_issues.return_value = [
+            self._issue(5, title=f"[CONSUMED #120]{self.TITLE}"),
+        ]
+
+        versions = SimpleTestResourceWrapper(self._resource()).fetch_new_versions(
+            _version_of(previous)
+        )
+
+        assert versions == set()
+
+    def test_unset_still_renames_the_title(self, mock_github, tmp_path):
+        """Pipelines that do not set it keep today's tombstone exactly."""
+        _, mock_repo = mock_github
+        issue = self._issue(5)
+        mock_repo.get_issue.return_value = issue
+
+        self._resource(consume_with_label=None).download_version(
+            _version_of(issue), str(tmp_path), mock_build_metadata(build_name="121")
+        )
+
+        issue.edit.assert_called_once_with(title="[CONSUMED #121]Release my-app")
+        issue.add_to_labels.assert_not_called()
+
+    def test_unset_does_not_skip_on_the_label(self, mock_github):
+        _, mock_repo = mock_github
+        mock_repo.get_issues.return_value = [self._issue(5, labels=[CONSUMED])]
+
+        versions = SimpleTestResourceWrapper(
+            self._resource(consume_with_label=None)
+        ).fetch_new_versions(None)
+
+        assert {v.issue_number for v in versions} == {5}
+
+    def test_an_open_version_is_not_consumed(self, mock_github, tmp_path):
+        """A put's implicit get hands back the open issue it just wrote."""
+        _, mock_repo = mock_github
+        issue = create_mock_issue(
+            number=5, title=self.TITLE, state="open", created_at=T_MINUS_2
+        )
+
+        self._resource(issue_state="open", skip_if_labeled=[]).download_version(
+            _version_of(issue), str(tmp_path), mock_build_metadata()
+        )
+
+        mock_repo.get_issue.assert_not_called()
+
+
+class TestCloseWithLabelsConsumedByLabel(TestCloseWithLabels):
+    """An abandon labels the newest issue a gate consumed, keyed on the label."""
+
+    def _resource(self) -> ConcourseGithubIssuesResource:
+        return ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_prefix="Release my-app",
+            issue_title_template="Release my-app",
+            consume_with_label=CONSUMED,
+        )
+
+    def test_labels_a_consumed_issue_for_the_same_release(self, mock_github, tmp_path):
+        """An approval Production consumed must not tick the re-cut's checklist.
+
+        Abandoning deletes the tag and the next cut reuses the version, so
+        `carry_checks_unless_labeled` would find this issue by title.
+        """
+        consumed = self._issue(38, state="closed", labels=[CONSUMED])
+        self._found(mock_github, consumed)
+
+        _, metadata = self._publish(tmp_path)
+
+        consumed.edit.assert_not_called()
+        assert {label.name for label in consumed.labels} == {CONSUMED, "abandoned"}
+        assert metadata == {"retired_issues": "#38"}
+
+    def test_labels_only_the_newest_consumed_issue(self, mock_github, tmp_path):
+        """An unversioned title must not abandon every release shipped under it."""
+        older = self._issue(39, state="closed", labels=[CONSUMED])
+        newer = self._issue(40, state="closed", labels=[CONSUMED])
+        self._found(mock_github, older, newer)
+
+        _, metadata = self._publish(tmp_path)
+
+        older.add_to_labels.assert_not_called()
+        assert {label.name for label in newer.labels} == {CONSUMED, "abandoned"}
+        assert metadata == {"retired_issues": "#40"}
+
+    def test_still_retires_every_unconsumed_issue(self, mock_github, tmp_path):
+        older = self._issue(39, state="closed", labels=[CONSUMED])
+        newer = self._issue(40, state="closed", labels=[CONSUMED])
+        pending = self._issue(41)
+        self._found(mock_github, older, newer, pending)
+
+        _, metadata = self._publish(tmp_path)
+
+        older.add_to_labels.assert_not_called()
+        pending.edit.assert_called_once_with(state="closed", labels=["abandoned"])
+        assert metadata == {"retired_issues": "#40, #41"}
+
+
+class TestCarryChecksUnlessLabeled:
+    """A new issue for a title whose last issue was closed keeps its ticks."""
+
+    TITLE = "Release app 2026.10.28.1"
+    NEW_BODY = "## Release 2026.10.28.1\n- [ ] **A** (#1) by a\n- [ ] **B** (#2) by b\n"
+
+    def _issue(self, number, *, state="closed", title=None, body="", labels=()):
+        issue = create_mock_issue(
+            number=number,
+            title=title or self.TITLE,
+            state=state,
+            created_at=T_MINUS_2,
+            closed_at=T_MINUS_1 if state == "closed" else None,
+            labels=list(labels),
+        )
+        issue.body = body
+        return issue
+
+    def _publish(self, mock_github, *existing, **params):
+        mock_gh_instance, mock_repo = mock_github
+        mock_gh_instance.search_issues.return_value = list(existing)
+        mock_repo.get_issues.return_value = []
+        mock_repo.get_issue.side_effect = lambda number: next(
+            issue for issue in existing if issue.number == number
+        )
+        mock_repo.create_issue.return_value = self._issue(99, state="open")
+        ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template=self.TITLE,
+            issue_body_template=self.NEW_BODY,
+            update_in_place=True,
+            consume_with_label=CONSUMED,
+        ).publish_new_version(
+            sources_dir="dummy", build_metadata=mock_build_metadata(), **params
+        )
+        return mock_repo.create_issue.call_args.kwargs["body"]
+
+    def test_carries_ticks_from_the_closed_issue(self, mock_github):
+        """Mitxonline #4208 reopened #4204's release with nothing ticked."""
+        approved = self._issue(
+            4204, body="- [x] **A** (#1) by a\n- [ ] **B** (#2) by b\n"
+        )
+        body = self._publish(mock_github, approved, carry_checks_unless_labeled=[])
+        assert "- [x] **A** (#1) by a" in body
+        assert "- [ ] **B** (#2) by b" in body
+
+    def test_carries_ticks_from_a_consumed_issue(self, mock_github):
+        consumed = self._issue(
+            4204, body="- [x] **B** (#2) by b\n", labels=["ops:release", CONSUMED]
+        )
+        body = self._publish(
+            mock_github, consumed, carry_checks_unless_labeled=["ops:abandoned"]
+        )
+        assert "- [x] **B** (#2) by b" in body
+
+    def test_finds_a_consumed_issue_search_has_not_indexed(self, mock_github):
+        """The newest page of issues is read too, as for every title lookup."""
+        mock_gh_instance, mock_repo = mock_github
+        consumed = self._issue(
+            4204, body="- [x] **A** (#1) by a\n", labels=["ops:release", CONSUMED]
+        )
+        mock_gh_instance.search_issues.return_value = []
+        mock_repo.get_issues.return_value = [consumed]
+        mock_repo.get_issue.side_effect = lambda number: consumed
+        mock_repo.create_issue.return_value = self._issue(99, state="open")
+        ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template=self.TITLE,
+            issue_body_template=self.NEW_BODY,
+        ).publish_new_version(
+            sources_dir="dummy",
+            build_metadata=mock_build_metadata(),
+            carry_checks_unless_labeled=["ops:abandoned"],
+        )
+        body = mock_repo.create_issue.call_args.kwargs["body"]
+        assert "- [x] **A** (#1) by a" in body
+
+    def test_does_not_carry_from_a_consumed_then_abandoned_release(self, mock_github):
+        consumed = self._issue(
+            4204,
+            body="- [x] **A** (#1) by a\n",
+            labels=["ops:release", CONSUMED, "ops:abandoned"],
+        )
+        body = self._publish(
+            mock_github, consumed, carry_checks_unless_labeled=["ops:abandoned"]
+        )
+        assert body == self.NEW_BODY
+
+    def test_reads_only_the_newest_closed_issue(self, mock_github):
+        """An older approval is not revived past a newer abandoned issue."""
+        approved = self._issue(10, body="- [x] **A** (#1) by a\n")
+        abandoned = self._issue(
+            11, body="- [ ] **A** (#1) by a\n", labels=["ops:release", "ops:abandoned"]
+        )
+        body = self._publish(
+            mock_github,
+            approved,
+            abandoned,
+            carry_checks_unless_labeled=["ops:abandoned"],
+        )
+        assert body == self.NEW_BODY
+
+    def test_ignores_another_releases_issue(self, mock_github):
+        other = self._issue(
+            12, title="Release app 2026.10.27.1", body="- [x] **A** (#1) by a\n"
+        )
+        body = self._publish(mock_github, other, carry_checks_unless_labeled=[])
+        assert body == self.NEW_BODY
+
+    def test_ignores_an_issue_renamed_consumed_before_the_label(self, mock_github):
+        legacy = self._issue(
+            4204, title=f"[CONSUMED #121]{self.TITLE}", body="- [x] **A** (#1) by a\n"
+        )
+        body = self._publish(mock_github, legacy, carry_checks_unless_labeled=[])
+        assert body == self.NEW_BODY
+
+    def test_off_by_default(self, mock_github):
+        approved = self._issue(4204, body="- [x] **A** (#1) by a\n")
+        assert self._publish(mock_github, approved) == self.NEW_BODY
+
+    def test_refuses_a_bare_string(self, mock_github):
+        approved = self._issue(4204, body="- [x] **A** (#1) by a\n")
+        with pytest.raises(TypeError, match="list of label names"):
+            self._publish(
+                mock_github, approved, carry_checks_unless_labeled="ops:abandoned"
+            )
