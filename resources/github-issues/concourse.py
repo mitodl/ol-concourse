@@ -673,13 +673,21 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             print(f"about to add {missing=} to #{issue_number}")  # noqa: T201
             issue.add_to_labels(*missing)
 
-    def _carry_checks(self, title: str, body: str, unless_labeled: list[str]) -> str:
+    def _carry_checks(
+        self, title: str, body: str, unless_labeled: list[str], labels: list[str]
+    ) -> str:
         """Re-tick *body*'s lines ticked on the newest closed issue for *title*.
 
-        Only the newest closed issue is read. Falling back to an older one when
-        the newest is excluded would revive ticks from before a release was
-        abandoned. Ticking only ever replaces ``[ ]`` with ``[x]``, so the
-        result is no longer than *body*.
+        Only an issue carrying one of this put's *labels* can give its ticks.
+        Anyone who can open an issue in a public repository can open and close
+        one with a predictable title and a ticked body, but only a
+        collaborator can label it, so an unlabelled issue is not a review.
+        With no *labels*, nothing is carried.
+
+        Of those, only the newest closed issue is read. Falling back to an
+        older one when the newest is excluded would revive ticks from before a
+        release was abandoned. Ticking only ever replaces ``[ ]`` with
+        ``[x]``, so the result is no longer than *body*.
         """
         if isinstance(unless_labeled, str):
             # A bare string would be read as a set of single characters,
@@ -690,6 +698,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             issue
             for issue in self._issues_titled(title, open_only=False)
             if issue.state == "closed"
+            and {label.name for label in issue.labels}.intersection(labels)
         ]
         if not closed:
             return body
@@ -725,14 +734,14 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         open a new issue because the last one for the same title was closed.
         A QA re-run after an issue was approved does that, and its checklist
         would otherwise start all unchecked. The newest closed issue whose
-        title is the rendered title gives its ticks to the new body, matched
+        title is the rendered title, and which carries one of this put's
+        *labels*, gives its ticks to the new body, matched
         line by line as ``update_in_place`` does. An issue a gate consumed
         with ``consume_with_label`` keeps its title and so counts; one renamed
         ``[CONSUMED #n]`` does not. Nothing is carried when that issue has any
         of the listed labels (e.g. ``ops:abandoned``: a retired release's
         ticks are not a review of its re-cut), or when there is no closed
-        issue. An empty list carries regardless of labels. Only a new issue is
-        affected.
+        issue. An empty list excludes nothing. Only a new issue is affected.
 
         *skip_if_tag_missing* is *skip_if_branch_missing* for a tag, and is the
         one to use when only an *abandoned* release should post nothing: the
@@ -858,7 +867,10 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         if not already_exists:
             if carry_checks_unless_labeled is not None:
                 issue_body = self._carry_checks(
-                    candidate_issue_title, issue_body, carry_checks_unless_labeled
+                    candidate_issue_title,
+                    issue_body,
+                    carry_checks_unless_labeled,
+                    labels or [],
                 )
             # Pass label names (strings) directly, avoid fetching Label objects
             working_issue = self.repo.create_issue(

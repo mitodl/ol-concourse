@@ -1359,9 +1359,7 @@ class TestCloseWithLabels:
 
         issue.create_comment.assert_called_once()
         assert "abandoned" in issue.create_comment.call_args.args[0]
-        # One PATCH: the gate must never see the issue closed but unlabelled,
-        # and update_in_place must never see it open but labelled, or it
-        # would remove the label as stale.
+        # One PATCH: the gate must never see the issue closed but unlabelled.
         assert calls == [
             ("edit", 31, {"state": "closed", "labels": ["abandoned"]}),
         ]
@@ -2416,7 +2414,9 @@ class TestCarryChecksUnlessLabeled:
     TITLE = "Release app 2026.10.28.1"
     NEW_BODY = "## Release 2026.10.28.1\n- [ ] **A** (#1) by a\n- [ ] **B** (#2) by b\n"
 
-    def _issue(self, number, *, state="closed", title=None, body="", labels=()):
+    def _issue(
+        self, number, *, state="closed", title=None, body="", labels=("ops:release",)
+    ):
         issue = create_mock_issue(
             number=number,
             title=title or self.TITLE,
@@ -2429,6 +2429,7 @@ class TestCarryChecksUnlessLabeled:
         return issue
 
     def _publish(self, mock_github, *existing, **params):
+        params.setdefault("labels", ["ops:release"])
         mock_gh_instance, mock_repo = mock_github
         mock_gh_instance.search_issues.return_value = list(existing)
         mock_repo.get_issues.return_value = []
@@ -2486,6 +2487,7 @@ class TestCarryChecksUnlessLabeled:
         ).publish_new_version(
             sources_dir="dummy",
             build_metadata=mock_build_metadata(),
+            labels=["ops:release"],
             carry_checks_unless_labeled=["ops:abandoned"],
         )
         body = mock_repo.create_issue.call_args.kwargs["body"]
@@ -2528,6 +2530,23 @@ class TestCarryChecksUnlessLabeled:
             4204, title=f"[CONSUMED #121]{self.TITLE}", body="- [x] **A** (#1) by a\n"
         )
         body = self._publish(mock_github, legacy, carry_checks_unless_labeled=[])
+        assert body == self.NEW_BODY
+
+    def test_ignores_an_issue_without_the_puts_labels(self, mock_github):
+        """Anyone can open and close an issue with this title; only we label it."""
+        approved = self._issue(10, body="- [x] **B** (#2) by b\n")
+        forged = self._issue(11, body="- [x] **A** (#1) by a\n", labels=())
+        body = self._publish(
+            mock_github, approved, forged, carry_checks_unless_labeled=[]
+        )
+        assert "- [ ] **A** (#1) by a" in body
+        assert "- [x] **B** (#2) by b" in body
+
+    def test_carries_nothing_without_put_labels(self, mock_github):
+        approved = self._issue(4204, body="- [x] **A** (#1) by a\n")
+        body = self._publish(
+            mock_github, approved, labels=None, carry_checks_unless_labeled=[]
+        )
         assert body == self.NEW_BODY
 
     def test_off_by_default(self, mock_github):
