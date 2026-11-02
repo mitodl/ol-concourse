@@ -2005,7 +2005,7 @@ def test_update_in_place_does_not_rewrite_labels_that_already_match(mock_github)
 
 def test_update_in_place_still_edits_the_body(mock_github):
     issue = _publish_onto_existing(
-        mock_github, existing_labels=[], desired_labels=["DevOps"]
+        mock_github, existing_labels=["DevOps"], desired_labels=["DevOps"]
     )
     assert [c for c in issue.fresh.edit.call_args_list if "body" in c.kwargs]
 
@@ -2013,8 +2013,9 @@ def test_update_in_place_still_edits_the_body(mock_github):
 def test_update_in_place_leaves_assignees_alone(mock_github):
     """Someone assigning themselves to review a gate is a human workflow."""
     issue = _publish_onto_existing(
-        mock_github, existing_labels=[], desired_labels=["DevOps"]
+        mock_github, existing_labels=["DevOps"], desired_labels=["DevOps"]
     )
+    assert [c for c in issue.fresh.edit.call_args_list if "body" in c.kwargs]
     for written in (issue, issue.fresh):
         assert not [c for c in written.edit.call_args_list if "assignees" in c.kwargs]
 
@@ -2027,7 +2028,7 @@ def test_comment_path_does_not_touch_labels(mock_github):
         title="[bot] Pulumi proj QA ready to deploy.",
         state="open",
         created_at=T_MINUS_1,
-        labels=["promotion-to-production"],
+        labels=["DevOps", "promotion-to-production"],
     )
     issue.body = ""
     issue.edit = MagicMock()
@@ -2044,9 +2045,10 @@ def test_comment_path_does_not_touch_labels(mock_github):
         build_metadata=mock_build_metadata(
             pipeline_name="p", job_name="j", build_name="b1"
         ),
-        labels=["promotion-to-qa"],
+        labels=["DevOps", "promotion-to-qa"],
     )
     issue.edit.assert_not_called()
+    issue.add_to_labels.assert_not_called()
     issue.create_comment.assert_called_once()
 
 
@@ -2165,7 +2167,11 @@ class TestPublishFindsOnlyOpenIssues:
         """
         mock_gh_instance, mock_repo = mock_github
         looked_up = create_mock_issue(
-            number=47, title=self.TITLE, state="open", created_at=T_MINUS_1
+            number=47,
+            title=self.TITLE,
+            state="open",
+            created_at=T_MINUS_1,
+            labels=["release"],
         )
         looked_up.body = ""
         retired = create_mock_issue(
@@ -2189,7 +2195,7 @@ class TestPublishFindsOnlyOpenIssues:
         ).publish_new_version(
             sources_dir="dummy",
             build_metadata=mock_build_metadata(),
-            labels=["release"],
+            labels=["release", "ops:release"],
         )
         assert mock_repo.get_issue.call_count == 2
         retired.remove_from_labels.assert_not_called()
@@ -2620,3 +2626,89 @@ class TestCarryChecksUnlessLabeled:
             self._publish(
                 mock_github, approved, carry_checks_unless_labeled="ops:abandoned"
             )
+
+
+class TestPutReusesOnlyALabelledIssue:
+    """An outsider can open an issue with the gate's title, but cannot label it."""
+
+    TITLE = "Release app 2026.11.2.1"
+
+    def _issue(self, number, labels=()):
+        issue = create_mock_issue(
+            number=number,
+            title=self.TITLE,
+            state="open",
+            created_at=T_MINUS_1,
+            labels=list(labels),
+        )
+        issue.body = ""
+        return issue
+
+    def _publish(self, mock_github, *existing, update_in_place=True, **params):
+        mock_gh_instance, mock_repo = mock_github
+        mock_gh_instance.search_issues.return_value = list(existing)
+        mock_repo.get_issues.return_value = []
+        mock_repo.get_issue.side_effect = lambda number: next(
+            issue for issue in existing if issue.number == number
+        )
+        mock_repo.create_issue.return_value = self._issue(99, labels=["ops:release"])
+        ConcourseGithubIssuesResource(
+            repository="test/repo",
+            access_token="dummy_token",
+            issue_state="open",
+            issue_title_template=self.TITLE,
+            issue_body_template="checklist",
+            update_in_place=update_in_place,
+        ).publish_new_version(
+            sources_dir="dummy", build_metadata=mock_build_metadata(), **params
+        )
+        return mock_repo
+
+    def test_does_not_write_the_checklist_into_an_outsiders_issue(self, mock_github):
+        outsider = self._issue(50)
+        mock_repo = self._publish(mock_github, outsider, labels=["ops:release"])
+        outsider.edit.assert_not_called()
+        outsider.add_to_labels.assert_not_called()
+        mock_repo.create_issue.assert_called_once_with(
+            title=self.TITLE, assignees=[], labels=["ops:release"], body="checklist"
+        )
+
+    def test_does_not_comment_on_an_outsiders_issue(self, mock_github):
+        outsider = self._issue(50)
+        mock_repo = self._publish(
+            mock_github, outsider, update_in_place=False, labels=["ops:release"]
+        )
+        outsider.create_comment.assert_not_called()
+        mock_repo.create_issue.assert_called_once()
+
+    def test_an_issue_labelled_by_a_template_is_not_enough(self, mock_github):
+        """Only the put's own labels count, not just any label."""
+        templated = self._issue(50, labels=["bug"])
+        mock_repo = self._publish(mock_github, templated, labels=["ops:release"])
+        templated.edit.assert_not_called()
+        mock_repo.create_issue.assert_called_once()
+
+    def test_reuses_the_put_issue_past_a_newer_outsiders_one(self, mock_github):
+        """Opening a newer copy must not push the real issue aside."""
+        real, outsider = self._issue(50, labels=["ops:release"]), self._issue(51)
+        mock_repo = self._publish(mock_github, real, outsider, labels=["ops:release"])
+        outsider.edit.assert_not_called()
+        real.edit.assert_called_once_with(body="checklist")
+        mock_repo.create_issue.assert_not_called()
+
+    def test_one_of_several_put_labels_is_enough(self, mock_github):
+        """An issue opened before a label was added to the put is still reused."""
+        older = self._issue(50, labels=["DevOps"])
+        mock_repo = self._publish(
+            mock_github, older, labels=["DevOps", "promotion-to-qa"]
+        )
+        older.edit.assert_called_once_with(body="checklist")
+        older.add_to_labels.assert_called_once_with("promotion-to-qa")
+        mock_repo.create_issue.assert_not_called()
+
+    def test_a_put_without_labels_reuses_any_open_match(self, mock_github):
+        """Nothing to tell the put's issues apart by, so the rule does not apply."""
+        unlabelled = self._issue(50)
+        mock_repo = self._publish(mock_github, unlabelled)
+        unlabelled.edit.assert_called_once_with(body="checklist")
+        mock_repo.create_issue.assert_not_called()
