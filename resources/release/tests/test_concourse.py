@@ -400,6 +400,79 @@ def test_update_cumulative_changelog_prepends_to_existing(tmp_path):
     assert new_pos < old_pos, "New entry should appear before old entry"
 
 
+OLD_ENTRY = "## [2026.4.10.1] - 2026-04-10\n\n### Changes\n\n- Old fix\n"
+NEW_ENTRY = "## [2026.4.14.1] - 2026-04-14\n\n### Changes\n\n- New fix\n"
+
+
+def test_update_cumulative_changelog_keeps_one_blank_line_between_blocks(tmp_path):
+    """One blank line after the preamble and between entries, not two.
+
+    Every learn-ai release left two blank lines before its new heading, which
+    the next pull request then had to remove (mitodl/learn-ai#151).
+    """
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(CHANGELOG_HEADER + "\n" + OLD_ENTRY)
+
+    _update_cumulative_changelog(changelog, NEW_ENTRY)
+
+    assert changelog.read_text() == (
+        CHANGELOG_HEADER + "\n" + NEW_ENTRY + "\n" + OLD_ENTRY
+    )
+
+
+def test_update_cumulative_changelog_stays_clean_over_releases(tmp_path):
+    changelog = tmp_path / "CHANGELOG.md"
+    entries = [
+        f"## [2026.4.{day}.1] - 2026-04-{day}\n\n### Changes\n\n- Fix {day}\n"
+        for day in (10, 11, 12)
+    ]
+    for entry in entries:
+        _update_cumulative_changelog(changelog, entry)
+
+    assert changelog.read_text() == CHANGELOG_HEADER + "\n" + "\n".join(
+        reversed(entries)
+    )
+    assert "\n\n\n" not in changelog.read_text()
+
+
+def test_update_cumulative_changelog_headerless_file(tmp_path):
+    """A file that starts with a version entry gets the new one above it."""
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(OLD_ENTRY)
+
+    _update_cumulative_changelog(changelog, NEW_ENTRY)
+
+    assert changelog.read_text() == NEW_ENTRY + "\n" + OLD_ENTRY
+
+
+@pytest.mark.parametrize(
+    "gap",
+    ["\n", "\n\n\n", "\n \n", "\n\t\n\n"],
+    ids=["one", "several", "space-only", "tab-only"],
+)
+def test_update_cumulative_changelog_normalizes_the_gap_after_the_preamble(
+    tmp_path, gap
+):
+    """Blank or whitespace-only lines before the first entry become one."""
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(CHANGELOG_HEADER + gap + OLD_ENTRY)
+
+    _update_cumulative_changelog(changelog, NEW_ENTRY)
+
+    assert changelog.read_text() == (
+        CHANGELOG_HEADER + "\n" + NEW_ENTRY + "\n" + OLD_ENTRY
+    )
+
+
+def test_update_cumulative_changelog_headerless_file_with_leading_blanks(tmp_path):
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text("\n\n" + OLD_ENTRY)
+
+    _update_cumulative_changelog(changelog, NEW_ENTRY)
+
+    assert changelog.read_text() == NEW_ENTRY + "\n" + OLD_ENTRY
+
+
 def test_update_cumulative_changelog_header_only_file(tmp_path):
     changelog = tmp_path / "CHANGELOG.md"
     changelog.write_text(CHANGELOG_HEADER)
