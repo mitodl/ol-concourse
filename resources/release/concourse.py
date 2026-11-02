@@ -2285,8 +2285,8 @@ def _update_cumulative_changelog(changelog_path: Path, entry: str) -> None:
         # version header at the very start of the file too, since
         # find("\n## ") would return -1 for headerless changelogs that begin
         # directly with a version entry.
-        if existing.startswith("## "):
-            new_content = entry + "\n" + existing
+        if existing.lstrip().startswith("## "):
+            new_content = entry + "\n" + existing.lstrip()
         else:
             header_end = existing.find("\n## ")
             if header_end == -1:
@@ -2296,7 +2296,7 @@ def _update_cumulative_changelog(changelog_path: Path, entry: str) -> None:
                 # header_end is the newline before "## ", so the header keeps
                 # its own trailing newlines unless they are stripped first.
                 new_content = (
-                    existing[:header_end].rstrip("\n")
+                    existing[:header_end].rstrip()
                     + "\n\n"
                     + entry
                     + existing[header_end:]

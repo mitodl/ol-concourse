@@ -445,6 +445,34 @@ def test_update_cumulative_changelog_headerless_file(tmp_path):
     assert changelog.read_text() == NEW_ENTRY + "\n" + OLD_ENTRY
 
 
+@pytest.mark.parametrize(
+    "gap",
+    ["\n", "\n\n\n", "\n \n", "\n\t\n\n"],
+    ids=["one", "several", "space-only", "tab-only"],
+)
+def test_update_cumulative_changelog_normalizes_the_gap_after_the_preamble(
+    tmp_path, gap
+):
+    """Blank or whitespace-only lines before the first entry become one."""
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(CHANGELOG_HEADER + gap + OLD_ENTRY)
+
+    _update_cumulative_changelog(changelog, NEW_ENTRY)
+
+    assert changelog.read_text() == (
+        CHANGELOG_HEADER + "\n" + NEW_ENTRY + "\n" + OLD_ENTRY
+    )
+
+
+def test_update_cumulative_changelog_headerless_file_with_leading_blanks(tmp_path):
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text("\n\n" + OLD_ENTRY)
+
+    _update_cumulative_changelog(changelog, NEW_ENTRY)
+
+    assert changelog.read_text() == NEW_ENTRY + "\n" + OLD_ENTRY
+
+
 def test_update_cumulative_changelog_header_only_file(tmp_path):
     changelog = tmp_path / "CHANGELOG.md"
     changelog.write_text(CHANGELOG_HEADER)
