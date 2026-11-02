@@ -2279,21 +2279,27 @@ def _update_cumulative_changelog(changelog_path: Path, entry: str) -> None:
     """
     if changelog_path.exists():
         existing = changelog_path.read_text()
-        # Insert the new entry after the header (two blank lines after the last
-        # header paragraph) and before the first existing ## version entry.
-        # Check for a version header at the very start of the file too, since
+        # Insert the new entry after the header and before the first existing
+        # ## version entry, with one blank line on each side. *entry* ends with
+        # a newline, so one more makes the blank line after it. Check for a
+        # version header at the very start of the file too, since
         # find("\n## ") would return -1 for headerless changelogs that begin
         # directly with a version entry.
         if existing.startswith("## "):
-            new_content = entry + "\n\n" + existing
+            new_content = entry + "\n" + existing
         else:
             header_end = existing.find("\n## ")
             if header_end == -1:
                 # No existing version entries — append after header
                 new_content = existing.rstrip("\n") + "\n\n" + entry
             else:
+                # header_end is the newline before "## ", so the header keeps
+                # its own trailing newlines unless they are stripped first.
                 new_content = (
-                    existing[:header_end] + "\n\n" + entry + existing[header_end:]
+                    existing[:header_end].rstrip("\n")
+                    + "\n\n"
+                    + entry
+                    + existing[header_end:]
                 )
     else:
         new_content = CHANGELOG_HEADER + "\n" + entry
