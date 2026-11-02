@@ -863,7 +863,13 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         # approval that was already given -- for a release gate, a QA re-run
         # replacing the body of a closed Production gate. A closed issue means
         # this put needs a new one. The newest open match is the one used.
-        already_exists = self._issues_titled(candidate_issue_title, open_only=True)
+        # One a gate consumed and someone reopened is skipped too: it keeps
+        # its consume label, so the gate would never fire on it again.
+        already_exists = [
+            issue
+            for issue in self._issues_titled(candidate_issue_title, open_only=True)
+            if not self._is_consumed(issue)
+        ]
 
         if len(already_exists) > 1:
             print("Warning: There are multiple matches for the desired issue title!")  # noqa: T201

@@ -2341,6 +2341,66 @@ class TestConsumeWithLabel:
 
         assert {v.issue_number for v in versions} == {5}
 
+    def _publish_onto(self, mock_github, existing, **kwargs):
+        mock_gh_instance, mock_repo = mock_github
+        mock_gh_instance.search_issues.return_value = [existing]
+        mock_repo.get_issues.return_value = []
+        mock_repo.get_issue.return_value = existing
+        mock_repo.create_issue.return_value = create_mock_issue(
+            number=99, title=self.TITLE, state="open", created_at=NOW
+        )
+        self._resource(
+            issue_state="open",
+            issue_title_template=self.TITLE,
+            issue_body_template="diff",
+            **kwargs,
+        ).publish_new_version(sources_dir="dummy", build_metadata=mock_build_metadata())
+        return mock_repo
+
+    @pytest.mark.parametrize("update_in_place", [True, False])
+    def test_put_opens_a_new_issue_instead_of_reusing_a_reopened_consumed_one(
+        self, mock_github, update_in_place
+    ):
+        """Its label survives the reopen, so `check` would skip it once closed.
+
+        A `[CONSUMED #n]` title never matched the put's title, so this could
+        not happen before the label replaced it.
+        """
+        reopened = create_mock_issue(
+            number=5,
+            title=self.TITLE,
+            state="open",
+            created_at=T_MINUS_2,
+            labels=["ops:release", CONSUMED],
+        )
+        reopened.body = ""
+
+        mock_repo = self._publish_onto(
+            mock_github, reopened, update_in_place=update_in_place
+        )
+
+        mock_repo.create_issue.assert_called_once()
+        reopened.edit.assert_not_called()
+        reopened.create_comment.assert_not_called()
+
+    def test_unset_put_still_reuses_an_open_issue_carrying_the_label(self, mock_github):
+        """Without consume_with_label the label means nothing to the put."""
+        existing = create_mock_issue(
+            number=5,
+            title=self.TITLE,
+            state="open",
+            created_at=T_MINUS_2,
+            labels=[CONSUMED],
+        )
+        existing.body = ""
+
+        mock_repo = self._publish_onto(
+            mock_github, existing, consume_with_label=None, update_in_place=True
+        )
+
+        mock_repo.create_issue.assert_not_called()
+        existing.edit.assert_called_once_with(body="diff")
+
     def test_an_open_version_is_not_consumed(self, mock_github, tmp_path):
         """A put's implicit get hands back the open issue it just wrote."""
         _, mock_repo = mock_github

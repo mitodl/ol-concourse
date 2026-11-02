@@ -66,7 +66,10 @@ newest 100 issues, and open by the issues API. Search alone lags issue state in
 both directions: it can miss an issue created moments ago, which would open a
 duplicate, and still list one closed moments ago as open, which would write to
 an issue someone has already acted on (for a gate, an approval already given).
-When several open issues match, the newest is used. If a matching open
+When several open issues match, the newest is used. With `consume_with_label`
+set, an open issue carrying that label is not a match: a gate consumed it and
+someone reopened it, and `check` would skip it again once it is closed, so the
+put opens a new one instead. If a matching open
 issue already exists, the default behavior is to **comment** on it -- for
 most consumers of this resource, a fresh comment on an already-open issue
 *is* the useful signal: it means this gate has been hit again (e.g. deploys
