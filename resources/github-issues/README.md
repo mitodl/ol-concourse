@@ -73,7 +73,9 @@ put opens a new one instead. When the put sets `labels`, an open issue that
 carries none of them is not a match either. Anyone can open an issue with a
 predictable title in a public repository, but only a collaborator can label
 one, so an unlabelled issue was not opened by this put. Without this rule the
-put would write into an outsider's issue. Changing a put's `labels` therefore
+put would write into an outsider's issue. The rule holds only while no issue
+template or labelling workflow applies any of the put's `labels`, since that
+labels an outsider's issue for them. Changing a put's `labels` therefore
 needs its open issues relabelled first; otherwise each one gets a duplicate.
 If a matching open
 issue already exists, the default behavior is to **comment** on it -- for
