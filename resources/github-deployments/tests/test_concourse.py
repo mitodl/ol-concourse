@@ -13,6 +13,7 @@ from concourse import (
     ISO_8601_FORMAT,
 )
 from concoursetools import BuildMetadata
+from github import GithubException
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -335,6 +336,180 @@ def test_publish_start_passes_required_contexts_when_given(mock_github):
 
     call_kwargs = mock_repo.create_deployment.call_args.kwargs
     assert call_kwargs["required_contexts"] == ["ci/tests"]
+
+
+def checks_conflict(**states: str) -> GithubException:
+    """Build the 409 GitHub returns when required checks on the ref are not green."""
+    return GithubException(
+        409,
+        {
+            "message": "Conflict: Commit status checks failed for 2026.11.3.1.",
+            "errors": [
+                {
+                    "contexts": [
+                        {"context": name, "state": state}
+                        for name, state in states.items()
+                    ],
+                    "resource": "Deployment",
+                    "field": "required_contexts",
+                    "code": "invalid",
+                }
+            ],
+        },
+        None,
+    )
+
+
+@pytest.fixture
+def fake_clock():
+    """Replace time.sleep/time.monotonic in the resource with a manual clock."""
+    now = [0.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    with patch("concourse.time") as mock_time:
+        mock_time.monotonic.side_effect = lambda: now[0]
+        mock_time.sleep.side_effect = sleep
+        yield mock_time
+
+
+def test_publish_start_waits_for_running_checks(mock_github, fake_clock, capsys):
+    """A tag whose CI is still running is retried, not failed (mitxonline 417)."""
+    _, mock_repo = mock_github
+    mock_repo.create_deployment.side_effect = [
+        checks_conflict(prek="success", **{"python-tests (2)": "in_progress"}),
+        checks_conflict(
+            prek="success", lint="skipped", **{"python-tests (2)": "queued"}
+        ),
+        make_mock_deployment(302),
+    ]
+
+    resource = make_resource(mock_github)
+    version, _ = resource.publish_new_version(
+        sources_dir="/workspace",
+        build_metadata=mock_build_metadata(),
+        action="start",
+        ref="2026.11.3.1",
+    )
+
+    assert version.deployment_id == "302"
+    assert mock_repo.create_deployment.call_count == 3
+    assert fake_clock.sleep.call_count == 2
+    assert "python-tests (2)" in capsys.readouterr().out
+
+
+def test_publish_start_refuses_failed_checks_without_waiting(mock_github, fake_clock):
+    _, mock_repo = mock_github
+    conflict = checks_conflict(prek="failure", **{"python-tests (2)": "in_progress"})
+    mock_repo.create_deployment.side_effect = conflict
+
+    resource = make_resource(mock_github)
+    with pytest.raises(GithubException) as raised:
+        resource.publish_new_version(
+            sources_dir="/workspace",
+            build_metadata=mock_build_metadata(),
+            action="start",
+            ref="2026.11.3.1",
+        )
+
+    assert raised.value is conflict
+    assert mock_repo.create_deployment.call_count == 1
+    fake_clock.sleep.assert_not_called()
+
+
+def test_publish_start_gives_up_after_checks_timeout(mock_github, fake_clock):
+    _, mock_repo = mock_github
+    mock_repo.create_deployment.side_effect = checks_conflict(
+        **{"python-tests (2)": "in_progress"}
+    )
+
+    resource = make_resource(mock_github)
+    with pytest.raises(TimeoutError, match=r"python-tests \(2\)"):
+        resource.publish_new_version(
+            sources_dir="/workspace",
+            build_metadata=mock_build_metadata(),
+            action="start",
+            ref="2026.11.3.1",
+            checks_timeout=90,
+        )
+
+    # 30s polls: tries at t=0, 30, 60 and 90, then the deadline has passed.
+    assert mock_repo.create_deployment.call_count == 4
+
+
+def test_publish_start_checks_timeout_zero_does_not_wait(mock_github, fake_clock):
+    _, mock_repo = mock_github
+    mock_repo.create_deployment.side_effect = checks_conflict(
+        **{"python-tests (2)": "in_progress"}
+    )
+
+    resource = make_resource(mock_github)
+    with pytest.raises(TimeoutError):
+        resource.publish_new_version(
+            sources_dir="/workspace",
+            build_metadata=mock_build_metadata(),
+            action="start",
+            ref="2026.11.3.1",
+            checks_timeout=0,
+        )
+
+    assert mock_repo.create_deployment.call_count == 1
+    fake_clock.sleep.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"errors": {"field": "required_contexts"}},
+        {"errors": [{"field": "required_contexts", "contexts": ["ci/tests"]}]},
+        {"errors": [{"field": "required_contexts", "contexts": {"a": "b"}}]},
+        {"errors": 3},
+    ],
+)
+def test_publish_start_reraises_malformed_conflict(mock_github, fake_clock, data):
+    """An unexpected 409 shape surfaces GitHub's error, not a parsing error."""
+    _, mock_repo = mock_github
+    conflict = GithubException(409, data, None)
+    mock_repo.create_deployment.side_effect = conflict
+
+    resource = make_resource(mock_github)
+    with pytest.raises(GithubException) as raised:
+        resource.publish_new_version(
+            sources_dir="/workspace",
+            build_metadata=mock_build_metadata(),
+            action="start",
+            ref="2026.11.3.1",
+        )
+
+    assert raised.value is conflict
+    assert mock_repo.create_deployment.call_count == 1
+    fake_clock.sleep.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        GithubException(404, {"message": "Not Found"}, None),
+        GithubException(409, {"message": "Conflict: merge conflict"}, None),
+        GithubException(409, "not json", None),
+    ],
+)
+def test_publish_start_does_not_retry_other_errors(mock_github, fake_clock, error):
+    _, mock_repo = mock_github
+    mock_repo.create_deployment.side_effect = error
+
+    resource = make_resource(mock_github)
+    with pytest.raises(GithubException):
+        resource.publish_new_version(
+            sources_dir="/workspace",
+            build_metadata=mock_build_metadata(),
+            action="start",
+            ref="2026.11.3.1",
+        )
+
+    assert mock_repo.create_deployment.call_count == 1
+    fake_clock.sleep.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

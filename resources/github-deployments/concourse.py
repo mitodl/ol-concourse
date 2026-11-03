@@ -43,6 +43,7 @@ Usage example::
 """
 
 import json
+import time
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
@@ -50,13 +51,26 @@ from urllib.parse import quote
 from concoursetools import BuildMetadata, ConcourseResource
 from concoursetools.version import SortableVersionMixin, Version
 from github import Auth, Consts
-from github import Github
+from github import Github, GithubException
 from github.GithubObject import NotSet
 
 ISO_8601_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
 VALID_START_STATES = frozenset({"in_progress", "queued", "pending"})
 VALID_FINISH_STATES = frozenset({"success", "failure", "error", "inactive"})
+
+# States GitHub reports for a status check or check run that has not finished.
+# A 409 from create_deployment naming only these (and passing ones) means CI is
+# still running on the ref -- typically the workflow a release tag push starts,
+# which can outlast the release image build -- not that the ref is broken.
+UNFINISHED_CHECK_STATES = frozenset(
+    {"pending", "queued", "in_progress", "requested", "waiting", "expected"}
+)
+# Conclusions that do not block a merge. Listing them here only decides whether
+# waiting is worthwhile; GitHub still judges the ref on every retry.
+PASSING_CHECK_STATES = frozenset({"success", "neutral", "skipped"})
+DEFAULT_CHECKS_TIMEOUT = 1800
+CHECKS_POLL_INTERVAL = 30
 
 
 class GithubDeploymentVersion(Version, SortableVersionMixin):
@@ -255,6 +269,7 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
         required_contexts: list[str] | None = None,
         auto_inactive: bool = True,
         comment_on_issue_file: str | None = None,
+        checks_timeout: int = DEFAULT_CHECKS_TIMEOUT,
     ) -> tuple[GithubDeploymentVersion, dict[str, str]]:
         """Create or update a GitHub Deployment and Deployment Status.
 
@@ -284,8 +299,13 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
         :param auto_merge: Whether GitHub should auto-merge the default branch
             into ``ref`` before creating the deployment (default: ``False``).
         :param required_contexts: Status check contexts that must pass before
-            the deployment is allowed.  Omit to inherit the branch protection
-            settings; pass ``[]`` to bypass all checks.
+            the deployment is allowed.  Omit to require every context reported
+            on the ref; pass ``[]`` to bypass all checks.
+        :param checks_timeout: ``start`` only. Seconds to keep retrying while
+            GitHub refuses the deployment because required checks on ``ref``
+            are still running (default: 1800), then raise ``TimeoutError``. A
+            check that has failed is never waited on: GitHub's error is raised
+            at once. ``0`` raises ``TimeoutError`` on the first refusal.
         :param auto_inactive: Mark all older deployments in the same environment
             as ``inactive`` when this status is set (default: ``True``).
         :param comment_on_issue_file: ``finish`` only. Path relative to
@@ -313,6 +333,7 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
                 required_contexts=required_contexts,
                 environment_url=environment_url,
                 auto_inactive=auto_inactive,
+                checks_timeout=checks_timeout,
             )
 
         return self._finish(
@@ -334,22 +355,48 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
         required_contexts: list[str] | None,
         environment_url: str | None,
         auto_inactive: bool,
+        checks_timeout: int = DEFAULT_CHECKS_TIMEOUT,
     ) -> tuple[GithubDeploymentVersion, dict[str, str]]:
-        """Create a new deployment and set its status to ``in_progress``."""
+        """Create a new deployment and set its status to ``in_progress``.
+
+        GitHub refuses a deployment (409) while any required check on ``ref``
+        is unfinished, so a deploy that starts before CI on a fresh release tag
+        completes would fail. That refusal is retried until the checks finish
+        or *checks_timeout* runs out. A failed check is refused at once.
+        """
         if not ref:
             msg = "ref is required for action=start"
             raise ValueError(msg)
 
-        dep = self.repo.create_deployment(
-            ref=ref,
-            environment=self.environment,
-            description=description if description is not None else NotSet,
-            auto_merge=auto_merge,
-            required_contexts=(
-                required_contexts if required_contexts is not None else NotSet
-            ),
-            task="deploy",
-        )
+        deadline = time.monotonic() + checks_timeout
+        while True:
+            try:
+                dep = self.repo.create_deployment(
+                    ref=ref,
+                    environment=self.environment,
+                    description=description if description is not None else NotSet,
+                    auto_merge=auto_merge,
+                    required_contexts=(
+                        required_contexts if required_contexts is not None else NotSet
+                    ),
+                    task="deploy",
+                )
+                break
+            except GithubException as exc:
+                unfinished = _unfinished_checks(exc)
+                if not unfinished:
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    msg = (
+                        f"Checks on {ref} still unfinished after {checks_timeout}s: "
+                        f"{', '.join(unfinished)}"
+                    )
+                    raise TimeoutError(msg) from exc
+                print(  # noqa: T201
+                    f"Waiting for checks on {ref} to finish: {', '.join(unfinished)}"
+                )
+                time.sleep(min(CHECKS_POLL_INTERVAL, remaining))
         dep.create_status(
             state="in_progress",
             description=description if description is not None else NotSet,
@@ -452,3 +499,36 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
                 dep, Path(sources_dir), comment_on_issue_file, build_metadata
             )
         return self._to_version(dep), {}
+
+
+def _unfinished_checks(exc: GithubException) -> list[str]:
+    """Return the checks a create_deployment refusal is waiting on, if any.
+
+    GitHub answers 409 with the ref's required contexts and their states when
+    any of them is not ``success``. The names of the unfinished ones are
+    returned only when every other context passed; for any other error, a
+    failed check, or a payload of any other shape, the list is empty, so the
+    caller re-raises GitHub's error rather than a parsing one.
+    """
+    if exc.status != 409 or not isinstance(exc.data, dict):  # noqa: PLR2004
+        return []
+    errors = exc.data.get("errors")
+    if not isinstance(errors, list):
+        return []
+    contexts: list[dict] = []
+    for error in errors:
+        if not isinstance(error, dict) or error.get("field") != "required_contexts":
+            continue
+        entries = error.get("contexts")
+        if not isinstance(entries, list) or not all(
+            isinstance(c, dict) and isinstance(c.get("state"), str) for c in entries
+        ):
+            return []
+        contexts.extend(entries)
+    unfinished = [
+        str(c.get("context")) for c in contexts if c["state"] in UNFINISHED_CHECK_STATES
+    ]
+    passing_or_unfinished = UNFINISHED_CHECK_STATES | PASSING_CHECK_STATES
+    if any(c["state"] not in passing_or_unfinished for c in contexts):
+        return []
+    return unfinished

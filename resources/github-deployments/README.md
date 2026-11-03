@@ -78,8 +78,18 @@ Creates a new GitHub Deployment for the given `ref` and immediately sets its sta
 | `description` | No | Human-readable description shown in the GitHub UI |
 | `environment_url` | No | URL of the deployed environment |
 | `auto_merge` | No | Whether GitHub should auto-merge the default branch into `ref` (default: `false`) |
-| `required_contexts` | No | Status check contexts that must pass; omit to use branch protection settings; pass `[]` to bypass all checks |
+| `required_contexts` | No | Status check contexts that must pass; omit to require every context reported on `ref`; pass `[]` to bypass all checks |
+| `checks_timeout` | No | Seconds to keep retrying while GitHub refuses the deployment because checks on `ref` are still running (default: `1800`), then fail with `TimeoutError`. A failed check fails at once with GitHub's error; `0` never waits |
 | `auto_inactive` | No | Mark older deployments in the same environment as `inactive` (default: `true`) |
+
+GitHub refuses to create a deployment (HTTP 409) while any required context
+on `ref` is not `success`, including one that is still running. A release tag
+push starts its own CI run on the tagged commit, and that run can outlast the
+release image build, so a deploy job that follows the build would fail before
+the tests finish. `start` therefore polls every 30 seconds while every
+context is either passing (`success`, `neutral`, `skipped`) or unfinished, up
+to `checks_timeout`. If any context has
+failed, it fails straight away with GitHub's error, as it did before.
 
 ### `action: finish`
 
