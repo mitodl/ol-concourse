@@ -673,6 +673,43 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             print(f"about to add {missing=} to #{issue_number}")  # noqa: T201
             issue.add_to_labels(*missing)
 
+    def _open_issues_to_reuse(
+        self, title: str, labels: list[str] | None
+    ) -> list[Issue]:
+        """Return the open issues titled *title* a put may write to, oldest first.
+
+        Only an issue the issues API calls open counts. Search can still
+        return one closed seconds ago, and editing that would rewrite an
+        approval that was already given -- for a release gate, a QA re-run
+        replacing the body of a closed Production gate. A closed issue means
+        the put needs a new one. One a gate consumed and someone reopened is
+        skipped too: it keeps its consume label, so the gate would never fire
+        on it again.
+
+        With *labels*, only an issue carrying one of them counts. Anyone can
+        open an issue with a predictable title in a public repository, but
+        only a collaborator can label it, the rule :meth:`_carry_checks`
+        applies to a donor. Reusing an outsider's issue would write the real
+        checklist into it, and a gate that refuses issues the put's own
+        identity did not open would then block the release. That only holds
+        while none of *labels* is applied automatically: an issue template or
+        a labelling workflow labels an outsider's issue for them.
+        """
+        issues = [
+            issue
+            for issue in self._issues_titled(title, open_only=True)
+            if not self._is_consumed(issue)
+        ]
+        if not labels:
+            return issues
+        reusable = []
+        for issue in issues:
+            if {label.name for label in issue.labels}.intersection(labels):
+                reusable.append(issue)
+            else:
+                print(f"not reusing #{issue.number}: it carries none of {labels=}")  # noqa: T201
+        return reusable
+
     def _carry_checks(
         self, title: str, body: str, unless_labeled: list[str], labels: list[str]
     ) -> str:
@@ -733,6 +770,15 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         carry_checks_unless_labeled: list[str] | None = None,
     ) -> tuple[ConcourseGithubIssuesVersion, dict[str, str]]:
         """Create or comment on a GitHub Issue and return its version.
+
+        An open issue with the rendered title is reused (commented on, or
+        edited with ``update_in_place``) rather than a new one opened. When
+        *labels* is set, only an open issue carrying at least one of them is
+        reused; any other is passed over and a new issue is opened. An
+        outsider can open an issue with the title, but cannot label it,
+        unless an issue template or workflow applies one of *labels*. A put
+        whose *labels* change needs its open issues relabelled first, or each
+        gets a duplicate.
 
         *carry_checks_unless_labeled* keeps review progress when a put has to
         open a new issue because the last one for the same title was closed.
@@ -858,18 +904,8 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         candidate_issue_title = self.get_title_from_build(
             build_metadata, title_template=title_template
         )
-        # Only an issue the issues API calls open counts. Search can still
-        # return one closed seconds ago, and editing that would rewrite an
-        # approval that was already given -- for a release gate, a QA re-run
-        # replacing the body of a closed Production gate. A closed issue means
-        # this put needs a new one. The newest open match is the one used.
-        # One a gate consumed and someone reopened is skipped too: it keeps
-        # its consume label, so the gate would never fire on it again.
-        already_exists = [
-            issue
-            for issue in self._issues_titled(candidate_issue_title, open_only=True)
-            if not self._is_consumed(issue)
-        ]
+        # The newest of these is the one used.
+        already_exists = self._open_issues_to_reuse(candidate_issue_title, labels)
 
         if len(already_exists) > 1:
             print("Warning: There are multiple matches for the desired issue title!")  # noqa: T201

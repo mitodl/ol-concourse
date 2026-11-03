@@ -45,7 +45,7 @@ When the resource is configured with `skip_if_labeled`, the issue's labels are r
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `assignees` | No | List of GitHub usernames to assign |
-| `labels` | No | List of label names to apply |
+| `labels` | No | List of label names to apply. When set, an existing open issue is reused only if it carries at least one of them (see below). |
 | `body_file` | No | Path to a file whose contents are used as the issue body, overriding `issue_body_template` |
 | `body_files` | No | List of paths whose contents are concatenated **in the order given** to form the issue body, overriding `issue_body_template`. Use this when the body is assembled from more than one step's artifact -- a Concourse `put` emits no artifact of its own, so each fragment arrives via its own implicit `get`. Takes precedence over `body_file` if both are set. Unlike `body_file`, a **missing** entry does not fail the put: it is replaced by a visible warning naming the absent path, because a fragment's producing step may be allowed to fail without failing the build. |
 | `close_if_file` | No | Path to a file whose presence means there is nothing to review (e.g. an empty Pulumi preview). The issue is created or updated as normal, then closed, so a gate that advances on a *closed* issue does not wait for a human. A missing file is the same as not setting this. |
@@ -69,7 +69,15 @@ an issue someone has already acted on (for a gate, an approval already given).
 When several open issues match, the newest is used. With `consume_with_label`
 set, an open issue carrying that label is not a match: a gate consumed it and
 someone reopened it, and `check` would skip it again once it is closed, so the
-put opens a new one instead. If a matching open
+put opens a new one instead. When the put sets `labels`, an open issue that
+carries none of them is not a match either. Anyone can open an issue with a
+predictable title in a public repository, but only a collaborator can label
+one, so an unlabelled issue was not opened by this put. Without this rule the
+put would write into an outsider's issue. The rule holds only while no issue
+template or labelling workflow applies any of the put's `labels`, since that
+labels an outsider's issue for them. Changing a put's `labels` therefore
+needs its open issues relabelled first; otherwise each one gets a duplicate.
+If a matching open
 issue already exists, the default behavior is to **comment** on it -- for
 most consumers of this resource, a fresh comment on an already-open issue
 *is* the useful signal: it means this gate has been hit again (e.g. deploys
