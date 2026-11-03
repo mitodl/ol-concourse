@@ -459,6 +459,35 @@ def test_publish_start_checks_timeout_zero_does_not_wait(mock_github, fake_clock
 
 
 @pytest.mark.parametrize(
+    "data",
+    [
+        {"errors": {"field": "required_contexts"}},
+        {"errors": [{"field": "required_contexts", "contexts": ["ci/tests"]}]},
+        {"errors": [{"field": "required_contexts", "contexts": {"a": "b"}}]},
+        {"errors": 3},
+    ],
+)
+def test_publish_start_reraises_malformed_conflict(mock_github, fake_clock, data):
+    """An unexpected 409 shape surfaces GitHub's error, not a parsing error."""
+    _, mock_repo = mock_github
+    conflict = GithubException(409, data, None)
+    mock_repo.create_deployment.side_effect = conflict
+
+    resource = make_resource(mock_github)
+    with pytest.raises(GithubException) as raised:
+        resource.publish_new_version(
+            sources_dir="/workspace",
+            build_metadata=mock_build_metadata(),
+            action="start",
+            ref="2026.11.3.1",
+        )
+
+    assert raised.value is conflict
+    assert mock_repo.create_deployment.call_count == 1
+    fake_clock.sleep.assert_not_called()
+
+
+@pytest.mark.parametrize(
     "error",
     [
         GithubException(404, {"message": "Not Found"}, None),

@@ -506,23 +506,29 @@ def _unfinished_checks(exc: GithubException) -> list[str]:
 
     GitHub answers 409 with the ref's required contexts and their states when
     any of them is not ``success``. The names of the unfinished ones are
-    returned only when every other context passed; for any other error, or
-    when a check failed, the list is empty, so the caller re-raises.
+    returned only when every other context passed; for any other error, a
+    failed check, or a payload of any other shape, the list is empty, so the
+    caller re-raises GitHub's error rather than a parsing one.
     """
     if exc.status != 409 or not isinstance(exc.data, dict):  # noqa: PLR2004
         return []
-    contexts = [
-        context
-        for error in exc.data.get("errors") or []
-        if isinstance(error, dict) and error.get("field") == "required_contexts"
-        for context in error.get("contexts") or []
-    ]
+    errors = exc.data.get("errors")
+    if not isinstance(errors, list):
+        return []
+    contexts: list[dict] = []
+    for error in errors:
+        if not isinstance(error, dict) or error.get("field") != "required_contexts":
+            continue
+        entries = error.get("contexts")
+        if not isinstance(entries, list) or not all(
+            isinstance(c, dict) and isinstance(c.get("state"), str) for c in entries
+        ):
+            return []
+        contexts.extend(entries)
     unfinished = [
-        str(c.get("context"))
-        for c in contexts
-        if c.get("state") in UNFINISHED_CHECK_STATES
+        str(c.get("context")) for c in contexts if c["state"] in UNFINISHED_CHECK_STATES
     ]
     passing_or_unfinished = UNFINISHED_CHECK_STATES | PASSING_CHECK_STATES
-    if any(c.get("state") not in passing_or_unfinished for c in contexts):
+    if any(c["state"] not in passing_or_unfinished for c in contexts):
         return []
     return unfinished
