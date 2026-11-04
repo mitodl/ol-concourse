@@ -91,6 +91,12 @@ context is either passing (`success`, `neutral`, `skipped`) or unfinished, up
 to `checks_timeout`. If any context has
 failed, it fails straight away with GitHub's error, as it did before.
 
+GitHub does not count `neutral` or `skipped` as `success` here either, so a
+ref with a skipped conditional job (for example `lighthouse`) is refused even
+when CI is done. When nothing is unfinished and `required_contexts` was not
+given, `start` retries once requiring only the contexts that succeeded. A
+`required_contexts` you pass is never narrowed.
+
 ### `action: finish`
 
 Reads the deployment ID from a JSON file (typically `deployment.json` written by a prior `get` step) and creates a terminal Deployment Status.

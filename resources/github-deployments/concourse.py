@@ -66,8 +66,9 @@ VALID_FINISH_STATES = frozenset({"success", "failure", "error", "inactive"})
 UNFINISHED_CHECK_STATES = frozenset(
     {"pending", "queued", "in_progress", "requested", "waiting", "expected"}
 )
-# Conclusions that do not block a merge. Listing them here only decides whether
-# waiting is worthwhile; GitHub still judges the ref on every retry.
+# Conclusions that do not block a merge. GitHub's deployment check still treats
+# neutral and skipped as not passing, so start narrows required_contexts past
+# them (see _start) rather than retrying them.
 PASSING_CHECK_STATES = frozenset({"success", "neutral", "skipped"})
 DEFAULT_CHECKS_TIMEOUT = 1800
 CHECKS_POLL_INTERVAL = 30
@@ -363,7 +364,15 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
         is unfinished, so a deploy that starts before CI on a fresh release tag
         completes would fail. That refusal is retried until the checks finish
         or *checks_timeout* runs out. A failed check is refused at once.
+
+        GitHub also refuses while a check is neutral or skipped (a conditional
+        job that did not run, such as lighthouse), because without
+        *required_contexts* it demands every context be ``success``. Once
+        nothing is unfinished, the deployment is retried once requiring only
+        the contexts that succeeded. A caller's own *required_contexts* are
+        never narrowed.
         """
+        narrowed = False
         if not ref:
             msg = "ref is required for action=start"
             raise ValueError(msg)
@@ -383,9 +392,28 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
                 )
                 break
             except GithubException as exc:
-                unfinished = _unfinished_checks(exc)
-                if not unfinished:
+                contexts = _blocking_contexts(exc)
+                if contexts is None:
                     raise
+                unfinished = [
+                    str(c.get("context"))
+                    for c in contexts
+                    if c["state"] in UNFINISHED_CHECK_STATES
+                ]
+                if not unfinished:
+                    if required_contexts is not None or narrowed:
+                        raise
+                    narrowed = True
+                    required_contexts = [
+                        str(c.get("context"))
+                        for c in contexts
+                        if c["state"] == "success"
+                    ]
+                    print(  # noqa: T201
+                        f"Checks on {ref} passed, but some were neutral or skipped; "
+                        f"requiring only: {', '.join(required_contexts) or 'none'}"
+                    )
+                    continue
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     msg = (
@@ -501,20 +529,20 @@ class ConcourseGithubDeploymentsResource(ConcourseResource):
         return self._to_version(dep), {}
 
 
-def _unfinished_checks(exc: GithubException) -> list[str]:
-    """Return the checks a create_deployment refusal is waiting on, if any.
+def _blocking_contexts(exc: GithubException) -> list[dict] | None:
+    """Return the ref's contexts from a create_deployment refusal worth retrying.
 
     GitHub answers 409 with the ref's required contexts and their states when
-    any of them is not ``success``. The names of the unfinished ones are
-    returned only when every other context passed; for any other error, a
-    failed check, or a payload of any other shape, the list is empty, so the
-    caller re-raises GitHub's error rather than a parsing one.
+    any of them is not ``success``. The contexts are returned only when every
+    one is success, neutral, skipped or unfinished; for any other error, a
+    failed check, or a payload of any other shape the result is ``None``, so
+    the caller re-raises GitHub's error rather than a parsing one.
     """
     if exc.status != 409 or not isinstance(exc.data, dict):  # noqa: PLR2004
-        return []
+        return None
     errors = exc.data.get("errors")
     if not isinstance(errors, list):
-        return []
+        return None
     contexts: list[dict] = []
     for error in errors:
         if not isinstance(error, dict) or error.get("field") != "required_contexts":
@@ -523,12 +551,9 @@ def _unfinished_checks(exc: GithubException) -> list[str]:
         if not isinstance(entries, list) or not all(
             isinstance(c, dict) and isinstance(c.get("state"), str) for c in entries
         ):
-            return []
+            return None
         contexts.extend(entries)
-    unfinished = [
-        str(c.get("context")) for c in contexts if c["state"] in UNFINISHED_CHECK_STATES
-    ]
-    passing_or_unfinished = UNFINISHED_CHECK_STATES | PASSING_CHECK_STATES
-    if any(c["state"] not in passing_or_unfinished for c in contexts):
-        return []
-    return unfinished
+    acceptable = UNFINISHED_CHECK_STATES | PASSING_CHECK_STATES
+    if any(c["state"] not in acceptable for c in contexts):
+        return None
+    return contexts
