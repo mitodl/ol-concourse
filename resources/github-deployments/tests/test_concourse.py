@@ -14,6 +14,7 @@ from concourse import (
 )
 from concoursetools import BuildMetadata
 from github import GithubException
+from github.GithubObject import NotSet
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -304,8 +305,6 @@ def test_publish_start_requires_ref(mock_github):
 
 def test_publish_start_omits_required_contexts_when_not_given(mock_github):
     """required_contexts should not default to [] which bypasses all status checks."""
-    from github.GithubObject import NotSet
-
     _, mock_repo = mock_github
     mock_repo.create_deployment.return_value = make_mock_deployment(300)
 
@@ -416,6 +415,91 @@ def test_publish_start_refuses_failed_checks_without_waiting(mock_github, fake_c
     assert raised.value is conflict
     assert mock_repo.create_deployment.call_count == 1
     fake_clock.sleep.assert_not_called()
+
+
+def test_publish_start_narrows_past_skipped_checks(mock_github, fake_clock, capsys):
+    """CI finished but a conditional job was skipped (ocw-hugo-themes 2026.11.4.1)."""
+    _, mock_repo = mock_github
+    skipped = checks_conflict(
+        Netlify="success", build="success", lighthouse="skipped", prek="neutral"
+    )
+    mock_repo.create_deployment.side_effect = [skipped, make_mock_deployment(303)]
+
+    resource = make_resource(mock_github)
+    version, _ = resource.publish_new_version(
+        sources_dir="/workspace",
+        build_metadata=mock_build_metadata(),
+        action="start",
+        ref="2026.11.4.1",
+    )
+
+    assert version.deployment_id == "303"
+    first, second = mock_repo.create_deployment.call_args_list
+    assert first.kwargs["required_contexts"] is NotSet
+    assert second.kwargs["required_contexts"] == ["Netlify", "build"]
+    fake_clock.sleep.assert_not_called()
+    assert "lighthouse" not in capsys.readouterr().out.split("requiring only:")[1]
+
+
+def test_publish_start_narrows_only_after_checks_finish(mock_github, fake_clock):
+    _, mock_repo = mock_github
+    mock_repo.create_deployment.side_effect = [
+        checks_conflict(build="success", lighthouse="skipped", e2e="in_progress"),
+        checks_conflict(build="success", lighthouse="skipped", e2e="success"),
+        make_mock_deployment(304),
+    ]
+
+    resource = make_resource(mock_github)
+    resource.publish_new_version(
+        sources_dir="/workspace",
+        build_metadata=mock_build_metadata(),
+        action="start",
+        ref="2026.11.4.1",
+    )
+
+    calls = mock_repo.create_deployment.call_args_list
+    assert fake_clock.sleep.call_count == 1
+    assert calls[1].kwargs["required_contexts"] is NotSet
+    assert calls[2].kwargs["required_contexts"] == ["build", "e2e"]
+
+
+def test_publish_start_does_not_narrow_callers_required_contexts(
+    mock_github, fake_clock
+):
+    _, mock_repo = mock_github
+    conflict = checks_conflict(build="success", lighthouse="skipped")
+    mock_repo.create_deployment.side_effect = conflict
+
+    resource = make_resource(mock_github)
+    with pytest.raises(GithubException) as raised:
+        resource.publish_new_version(
+            sources_dir="/workspace",
+            build_metadata=mock_build_metadata(),
+            action="start",
+            ref="2026.11.4.1",
+            required_contexts=["lighthouse"],
+        )
+
+    assert raised.value is conflict
+    assert mock_repo.create_deployment.call_count == 1
+
+
+def test_publish_start_narrows_only_once(mock_github, fake_clock):
+    _, mock_repo = mock_github
+    conflict = checks_conflict(build="success", lighthouse="skipped")
+    mock_repo.create_deployment.side_effect = conflict
+
+    resource = make_resource(mock_github)
+    with pytest.raises(GithubException) as raised:
+        resource.publish_new_version(
+            sources_dir="/workspace",
+            build_metadata=mock_build_metadata(),
+            action="start",
+            ref="2026.11.4.1",
+        )
+
+    assert raised.value is conflict
+    assert mock_repo.create_deployment.call_count == 2
 
 
 def test_publish_start_gives_up_after_checks_timeout(mock_github, fake_clock):
