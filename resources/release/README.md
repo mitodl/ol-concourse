@@ -295,6 +295,12 @@ a non-fast-forward and every retry fails identically. That branch is deleted
 before re-cutting. A cut with **both** branch and tag present is a true
 retrigger and is left completely alone.
 
+The pushes in `create`, `finish` and the partial-cut cleanup are retried (three
+attempts, 5 s apart) when git's error shows GitHub's servers failed, such as
+`remote: fatal error in commit_refs_rules` or an HTTP 5xx, so one such error no
+longer strands the release between its branch and its tag. A refusal (a 403, a
+non-fast-forward) is never retried and fails at once.
+
 ### `action: create` with `commit_hash` (hotfix)
 
 A hotfix is requested by pushing a `hotfix/<full commit SHA>` tag to the
