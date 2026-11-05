@@ -363,6 +363,14 @@ finished (or abandoned), so this returns the current tip of the tracked branch
 instead of failing. Callers should therefore **not** wrap this put in a `try` —
 an error raised here means a real, unfinished release.
 
+The version it returns has `head_sha` at the merge commit and `since` at that
+commit's first parent. Concourse runs `in` on it straight after the put, and
+the release notes it writes are never read, so the range is kept to the merge
+commit instead of the newest 50 commits, each looked up on GitHub (about 80
+seconds on xpro). `in` still clones and reads Production's deploy status. The
+parent has to be in the `in` clone, so `clone_depth` must be at least 2; the
+default is 200.
+
 ### `action: abandon`
 
 Cancels a release that was cut but never finished: deletes the

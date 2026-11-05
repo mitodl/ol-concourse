@@ -702,7 +702,13 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 ) = self._create_release(repo_path, version_str, env=env)
             elif action == "finish":
                 head_sha = self._finish_release(repo_path, version_str, env=env)
-                since = ""
+                # Concourse runs `in` on this version right after the put. An
+                # empty `since` makes it list, and look up on GitHub, up to
+                # the 50 newest commits on the tracked branch (about 80s on
+                # xpro, for a result nothing reads). The parent bounds the
+                # range to the merge commit, so a Concourse restart has far
+                # less time to land mid-step and error a finished deploy.
+                since = _first_parent_of(repo_path, head_sha, env=env)
             else:  # abandon
                 head_sha, abandoned_tag_kept = self._abandon_requested_release(
                     repo_path, version_str, env=env
@@ -2018,6 +2024,18 @@ def _configure_https_auth(
 # ---------------------------------------------------------------------------
 # Commit log parsing
 # ---------------------------------------------------------------------------
+
+
+def _first_parent_of(repo_path: Path, sha: str, *, env: dict[str, str]) -> str:
+    """Return *sha*'s first parent, or an empty string when it has none."""
+    try:
+        return _run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{sha}^1"],
+            cwd=repo_path,
+            env=env,
+        ).strip()
+    except subprocess.CalledProcessError:
+        return ""
 
 
 def _first_parent_commits(

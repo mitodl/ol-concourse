@@ -1392,6 +1392,66 @@ def test_hotfix_finishes_back_into_the_tracked_branch(tmp_path, world, in_produc
     assert not _git(world.origin, "branch", "--list", f"releases/{HOTFIX}")
 
 
+def test_finish_bounds_the_follow_up_in_to_the_merge_commit(tmp_path, world, mocker):
+    """Concourse runs `in` on the finish version; it must not look up commits.
+
+    An empty ``since`` listed, and looked up on GitHub one by one, the newest 50
+    commits on the tracked branch: about 80s on xpro for notes nothing reads,
+    long enough for a Concourse restart to land mid-step and error a deploy that
+    had finished. The clone and the Production status read still run.
+    """
+    _put(_workspace(tmp_path, world.origin, version=CUT))
+    finished, metadata = _put(
+        _workspace(tmp_path, world.origin, version=CUT), action="finish"
+    )
+
+    merge = _git(world.origin, "rev-parse", "main")
+    assert metadata["action"] == "finish"
+    assert finished.in_flight == ""
+    assert finished.head_sha == merge
+    assert finished.since == _git(world.origin, "rev-parse", f"{merge}^1")
+
+    enrich = mocker.patch(
+        "concourse._enrich_with_github", side_effect=lambda commits, *a, **k: commits
+    )
+    dest = tmp_path / "get"
+    make_resource(
+        uri=f"file://{world.origin}", repository="mitodl/my-app", access_token="t"
+    ).download_version(finished, dest, MagicMock())
+
+    # The range is the merge commit alone, which is release bookkeeping and is
+    # dropped from the notes, so there is no commit to look up.
+    assert json.loads((dest / "commits.json").read_text()) == []
+    enrich.assert_called_once()
+    assert enrich.call_args.args[0] == []
+
+
+def test_finish_with_no_parent_commit_leaves_since_empty(tmp_path, mocker):
+    """A tip with no first parent cannot bound the range; it must not fail the put."""
+    mocker.patch.object(ReleaseResource, "_finish_release", return_value="root" * 10)
+
+    def fake_run(cmd, **kw):
+        if "--verify" in cmd:
+            raise subprocess.CalledProcessError(1, cmd)
+        return ""
+
+    mocker.patch("concourse._run", side_effect=fake_run)
+    (tmp_path / "release").mkdir()
+    (tmp_path / "release" / "version").write_text(CUT)
+    (tmp_path / "app-source").mkdir()
+
+    finished, _ = make_resource().publish_new_version(
+        tmp_path,
+        MagicMock(),
+        action="finish",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    assert finished.since == ""
+    assert finished.head_sha == "root" * 10
+
+
 def test_hotfix_refuses_while_another_release_is_in_flight(
     tmp_path, world, in_production
 ):
