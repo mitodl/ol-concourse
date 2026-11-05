@@ -32,6 +32,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -84,6 +85,20 @@ _PRODUCTION_SCAN_LIMIT = 20
 # How many of the newest release tags ``check`` re-emits the cut of.  See
 # ``ReleaseResource._recent_cuts``.
 _RECUT_TAGS = 3
+
+# A ``git push`` that GitHub's own servers fail is retried this many times in
+# all, ``_PUSH_RETRY_DELAY`` seconds apart.  See ``_run_push``.
+_PUSH_ATTEMPTS = 3
+_PUSH_RETRY_DELAY = 5
+
+# What git prints when the remote, rather than the request, is at fault, e.g.
+# ``remote: fatal error in commit_refs_rules`` or an HTTP 502 from the proxy.
+# A permission error or a non-fast-forward is not transient and never matches.
+_TRANSIENT_PUSH_ERROR = re.compile(
+    r"fatal error in|internal (?:server )?error|returned error: 5\d\d|HTTP 5\d\d"
+    r"|bad gateway|service unavailable|gateway time-?out",
+    re.IGNORECASE,
+)
 
 CHANGELOG_HEADER = """\
 # Changelog
@@ -896,13 +911,13 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 env=env,
             )
 
-        _run(["git", "push", "origin", branch_name], cwd=repo_path, env=env)
+        _run_push(["git", "push", "origin", branch_name], cwd=repo_path, env=env)
         _run(
             ["git", "tag", "-a", version, "-m", f"Release {version}", tag_sha],
             cwd=repo_path,
             env=env,
         )
-        _run(
+        _run_push(
             ["git", "push", "origin", f"refs/tags/{version}"],
             cwd=repo_path,
             env=env,
@@ -1188,10 +1203,10 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             cwd=repo_path,
             env=env,
         )
-        _run(["git", "push", "origin", self.branch], cwd=repo_path, env=env)
+        _run_push(["git", "push", "origin", self.branch], cwd=repo_path, env=env)
         # Remove the release branch so subsequent check calls no longer
         # see a release as in-flight.
-        _run(
+        _run_push(
             ["git", "push", "origin", "--delete", branch_name],
             cwd=repo_path,
             env=env,
@@ -1327,7 +1342,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             "partially-created release before re-cutting it",
             file=sys.stderr,
         )
-        _run(
+        _run_push(
             ["git", "push", "origin", "--delete", branch_name],
             cwd=repo_path,
             env=env,
@@ -1569,6 +1584,43 @@ def _run(
             result.returncode, error_cmd, stdout, stderr
         )
     return result.stdout
+
+
+def _run_push(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    """Run a ``git push``, retrying when GitHub itself fails it.
+
+    A release's pushes are not cheap to lose: a cut that dies between the
+    branch and the tag push leaves a stranded ``releases/<version>`` branch
+    and a release nobody sees until someone re-runs it.  GitHub sometimes
+    rejects a push with ``remote: fatal error in commit_refs_rules`` or a 5xx,
+    so a push whose stderr says the *remote* failed is tried again, up to
+    ``_PUSH_ATTEMPTS`` times in all.  Any other failure (a 403, a rejected
+    non-fast-forward) is raised at once, as is the last attempt's.
+
+    Repeating a push is safe: one the remote did apply before it reported the
+    error comes back as up to date, and a ref delete that already happened
+    fails with "unable to delete", which is not retried.
+    """
+    for attempt in range(1, _PUSH_ATTEMPTS + 1):
+        try:
+            return _run(cmd, cwd=cwd, env=env)
+        except subprocess.CalledProcessError as exc:
+            if attempt == _PUSH_ATTEMPTS or not _TRANSIENT_PUSH_ERROR.search(
+                str(exc.stderr or "")
+            ):
+                raise
+            print(  # noqa: T201
+                f"[release] push failed on the remote (attempt {attempt} of "
+                f"{_PUSH_ATTEMPTS}); retrying in {_PUSH_RETRY_DELAY}s",
+                file=sys.stderr,
+            )
+            time.sleep(_PUSH_RETRY_DELAY)
+    raise AssertionError  # pragma: no cover - the loop returns or raises
 
 
 def _clone(

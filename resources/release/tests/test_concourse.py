@@ -33,7 +33,9 @@ from concourse import (
     _parse_commit_log,
     _parse_semver_tuple,
     _parse_version_tuple,
+    _PUSH_ATTEMPTS,
     _run,
+    _run_push,
     _update_cumulative_changelog,
     CHANGELOG_HEADER,
 )
@@ -3752,3 +3754,115 @@ def test_create_refuses_to_supersede_a_newer_release(mock_run, tmp_path):
     assert not any("--delete" in c for c in remote.commands), (
         "Must not delete the newer release's refs before refusing"
     )
+
+
+# ---------------------------------------------------------------------------
+# _run_push: a push GitHub fails is retried, one it refuses is not
+# ---------------------------------------------------------------------------
+
+_GITHUB_PUSH_FAILURE = (
+    "remote: fatal error in commit_refs_rules\n"
+    " ! [remote rejected] 2026.11.5.1 -> 2026.11.5.1 (fatal error in "
+    "commit_refs_rules)"
+)
+
+
+def _push_failing(times: int, stderr: str):
+    """Return a ``_run`` double whose first *times* calls fail with *stderr*."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kw):
+        calls.append(list(cmd))
+        if len(calls) <= times:
+            raise subprocess.CalledProcessError(1, cmd, "", stderr)
+        return "pushed"
+
+    fake_run.calls = calls  # type: ignore[attr-defined]
+    return fake_run
+
+
+@patch("concourse.time.sleep")
+@patch("concourse._run")
+def test_run_push_retries_a_github_side_failure_then_succeeds(mock_run, mock_sleep):
+    """The mitxonline 2026.11.5.1 cut died on one 'fatal error in commit_refs_rules'."""
+    fake = _push_failing(1, _GITHUB_PUSH_FAILURE)
+    mock_run.side_effect = fake
+
+    out = _run_push(["git", "push", "origin", "refs/tags/2026.11.5.1"])
+
+    assert out == "pushed"
+    assert len(fake.calls) == 2
+    mock_sleep.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "remote: Permission denied to ol-release-bot[bot].\nfatal: unable to access",
+        " ! [rejected] main -> main (non-fast-forward)",
+        "error: failed to push some refs ([remote rejected] protected branch)",
+    ],
+)
+@patch("concourse.time.sleep")
+@patch("concourse._run")
+def test_run_push_does_not_retry_a_refusal(mock_run, mock_sleep, stderr):
+    """A 403 or a non-fast-forward will fail the same way again; surface it now."""
+    fake = _push_failing(5, stderr)
+    mock_run.side_effect = fake
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_push(["git", "push", "origin", "main"])
+
+    assert len(fake.calls) == 1
+    mock_sleep.assert_not_called()
+
+
+@patch("concourse.time.sleep")
+@patch("concourse._run")
+def test_run_push_gives_up_after_the_attempt_limit(mock_run, mock_sleep):
+    fake = _push_failing(99, _GITHUB_PUSH_FAILURE)
+    mock_run.side_effect = fake
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_push(["git", "push", "origin", "main"])
+
+    assert len(fake.calls) == _PUSH_ATTEMPTS
+    assert mock_sleep.call_count == _PUSH_ATTEMPTS - 1
+
+
+@patch("concourse.time.sleep")
+@patch("concourse._run")
+def test_run_push_retries_an_http_5xx(mock_run, mock_sleep):
+    mock_run.side_effect = _push_failing(
+        1,
+        "fatal: unable to access 'https://github.com/x/y/': The requested URL "
+        "returned error: 502",
+    )
+
+    assert _run_push(["git", "push", "origin", "main"]) == "pushed"
+
+
+@patch("concourse.time.sleep")
+@patch("concourse._run")
+def test_cut_survives_a_transient_tag_push_failure(mock_run, mock_sleep, tmp_path):
+    """The branch is pushed once and the tag push is retried, not the whole cut."""
+    version = "2026.11.5.1"
+    tag_push = ["git", "push", "origin", f"refs/tags/{version}"]
+    calls: list[list[str]] = []
+    tag_failures = []
+
+    def fake_run(cmd, **kw):
+        calls.append(list(cmd))
+        if cmd == tag_push and not tag_failures:
+            tag_failures.append(cmd)
+            raise subprocess.CalledProcessError(1, cmd, "", _GITHUB_PUSH_FAILURE)
+        return ""
+
+    mock_run.side_effect = fake_run
+
+    make_resource()._commit_and_push_cut(
+        tmp_path, version, f"releases/{version}", "abc1234" * 5, [], env={}
+    )
+
+    assert calls.count(tag_push) == 2
+    assert calls.count(["git", "push", "origin", f"releases/{version}"]) == 1
