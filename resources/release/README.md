@@ -136,7 +136,7 @@ tags:
 - `since` is the tag before it, or the semver fallback.
 - `in_flight` is the tag itself.
 - `commit_count` is `"0"`, and `authors` is empty.
-- For a hotfix, `hotfix` is the commit named by the `cherry-pick -x` trailer.
+- For a hotfix, `hotfix` is the commits named by the `cherry-pick -x` trailers, oldest first, separated by whitespace.
 
 Concourse keeps a resource's versions per resource config, and a custom type's
 config includes the type's image version. After this image is rebuilt, the
@@ -176,7 +176,7 @@ Clones the repository and generates release artefacts from `version.since..versi
 |------|-------------|
 | `version` | Plain version string, e.g. `2026.4.14.1` |
 | `in_flight` | Version of a release cut but not yet finished, or empty (may already be in production — see below) |
-| `hotfix` | Commit SHA of a pending hotfix request, or empty (see [hotfix](#action-create-with-commit_hash-hotfix)) |
+| `hotfix` | Commit SHAs of the pending hotfix requests in pick order, separated by whitespace, or empty (see [hotfix](#action-create-with-commit_hash-hotfix)) |
 | `production_version` | The release production is running, or empty when unknown (see below) |
 | `production_state` | Why `production_version` is empty, or `known`: `known`, `none` or `unknown` (see below) |
 | `commits.json` | Structured list of `{sha, author, author_name, pr_number, pr_title, message}` -- `author` is the commit email (matched against `auto_check_authors` by the `github-issues` resource), `author_name` is the git-configured display name |
@@ -304,13 +304,16 @@ non-fast-forward) is never retried and fails at once.
 ### `action: create` with `commit_hash` (hotfix)
 
 A hotfix is requested by pushing a `hotfix/<full commit SHA>` tag to the
-repository; the release bot's `/doof hotfix` does this. While one is pending,
-`check` emits the next version with `hotfix` and `head_sha` set to that SHA and
-`since` set to the latest release. `in` writes the SHA to a `hotfix` file
-(empty otherwise) and lists only that commit in `commits.json`,
-`checklist.md` and `changelog_entry.md`. A pipeline turns this into a hotfix
-cut by passing the file's content as `commit_hash`, which is empty, and so a
-normal release, when no request is pending:
+repository for each commit of the fix; the release bot's `/doof hotfix` does
+this. Every pending request is one hotfix. `check` emits the next version with
+`hotfix` set to their SHAs, separated by whitespace, in the order they are
+picked (below), `head_sha` set to the last of them, and `since` set to the
+latest release. A single commit reads exactly as it always did. `in` writes the
+same value to a `hotfix` file (empty otherwise) and lists only those commits,
+newest first, in `commits.json`, `checklist.md` and `changelog_entry.md`. A
+pipeline turns this into a hotfix cut by passing the file's content as
+`commit_hash`, which is empty, and so a normal release, when no request is
+pending:
 
 ```yaml
 - load_var: hotfix
@@ -323,36 +326,55 @@ normal release, when no request is pending:
     commit_hash: ((.:hotfix))
 ```
 
-`create` deletes the request tag before anything else, whether or not the cut
-then succeeds, so a refused or failed request cannot turn later releases into
-hotfixes. Tags under `hotfix/` whose name is not a full SHA are ignored.
+`commit_hash` is one or more commit SHAs separated by whitespace, at most 10.
+The pipeline does not change with the number of commits.
 
-A hotfix is **production plus one commit**, not the tracked branch plus one
-commit. The tracked branch almost always holds unreleased work, and the fix is
-usually already merged there, so cherry-picking onto its HEAD would either ship
-everything unreleased or fail on an empty cherry-pick.
+`create` deletes every request tag once all the commits are found, whether or
+not the cut then succeeds, so a refused or failed request cannot turn later
+releases into hotfixes. A failed cut therefore needs all of its commits
+requested again. Tags under `hotfix/` whose name is not a full SHA are ignored.
 
-1. **Refuses if any other release is in flight.** Finish or abandon it first.
+A hotfix is **production plus the requested commits**, not the tracked branch
+plus them. The tracked branch almost always holds unreleased work, and the fix
+is usually already merged there, so cherry-picking onto its HEAD would either
+ship everything unreleased or fail on an empty cherry-pick.
+
+1. **Refuses unless every commit is found.** All of them are resolved before
+   any request is deleted or any pick starts, and every one that cannot be found
+   is named, so a typo in one cannot leave the others half done.
+2. **Refuses if any other release is in flight.** Finish or abandon it first.
    A normal `create` supersedes an in-flight release; a hotfix does not, because
    the in-flight release is usually the one being worked around.
-2. Takes the latest release tag as the base and **refuses unless GitHub
+3. Takes the latest release tag as the base and **refuses unless GitHub
    confirms** a successful `production_environment` deployment of it. Unlike
    supersede, an unanswerable check is a refusal, not a guess.
-3. Branches `releases/YYYY.MM.DD.N` from that release's `Release <version>`
+4. Branches `releases/YYYY.MM.DD.N` from that release's `Release <version>`
    commit (the tag plus its version bump, which is what the production image
    was built from), falling back to the tag itself when that commit is not on
    the tracked branch.
-4. Refuses if `commit_hash` is already contained in production.
-5. Cherry-picks `commit_hash` with `-x`, using `-m 1` for a merge commit.
-6. Tags the cherry-picked commit, applies the `bump_version_task` changes on top
-   as the `Release YYYY.MM.DD.N` commit, and pushes branch and tag.
+5. **Refuses the whole request if any commit is already contained in
+   production**, naming them. It does not drop them and cut the rest.
+6. Cherry-picks each commit with `-x`, using `-m 1` for a merge commit, **in
+   ancestry order** whatever order they were given in: a later commit of a fix
+   often changes lines an earlier one did, and does not apply without it.
+   Commits with no ancestry between them are picked in SHA order, so the same
+   request is always the same hotfix. Ancestry is read from the checkout, so two
+   commits related only beyond its `clone_depth` read as unrelated.
+7. A pick that conflicts is refused, and so is one that comes out empty, which
+   means production plus the picks before it already has its change. Neither is
+   skipped, because a skipped commit would leave the request and what was cut
+   disagreeing about what the hotfix contains. The message names the commit and
+   its place in the order. With a single commit it is the same message as ever.
+8. Tags the last cherry-picked commit, applies the `bump_version_task` changes
+   on top as the `Release YYYY.MM.DD.N` commit, and pushes branch and tag.
 
 `since` is the production release, so the release notes list only the hotfix.
 `finish` merges the branch back as usual. The put metadata carries `hotfix`.
 
-A retriggered hotfix whose tag already exists is left alone if the tagged
-commit records the same `commit_hash` in its `cherry picked from` trailer, and
-fails otherwise.
+A retriggered hotfix whose tag already exists is left alone if the commits
+below the tag record exactly the requested commits in their `cherry picked
+from` trailers, and fails otherwise: a request for only some of the commits, or
+for more, is not the hotfix that was cut.
 
 The version bump is computed against the tracked branch's files and applied to
 production's. That is clean whenever the version files are only changed by
@@ -429,7 +451,7 @@ so the abandon can simply be run again.
 | `action` | Yes | `"create"`, `"finish"`, or `"abandon"` |
 | `repo_dir` | Yes | Name of the workspace directory containing the checked-out repo |
 | `version_file` | Yes | Path to the `version` file (relative to workspace root), e.g. `release/version` |
-| `commit_hash` | No | Commit SHA to cherry-pick (`create` only; hotfix support) |
+| `commit_hash` | No | Commit SHAs to cherry-pick onto production, separated by whitespace, at most 10 (`create` only; hotfix support) |
 
 ### The create job must not trigger on this resource
 
