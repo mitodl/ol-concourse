@@ -3988,12 +3988,56 @@ def test_hotfix_names_the_commit_that_does_not_apply(tmp_path, world, in_product
     other = _commit(world.dev, "Unrelated fix", **{"late.txt": "fix\n"})
     _git(world.dev, "push", "-q", "origin", "main")
 
+    _request_hotfix(world, follow, follow)
+    _request_hotfix(world, other, other)
+
     with pytest.raises(RuntimeError, match=f"Cherry-picking {follow}") as e:
         _put(_workspace(tmp_path, world.origin), commit_hash=f"{follow} {other}")
 
-    assert "conflicts" in str(e.value)
+    assert "(commit 1 of 2)" in str(e.value)
+    assert "it conflicts with what production runs." in str(e.value)
     assert "add that commit" in str(e.value)
     assert HOTFIX not in _remote_tags(world.origin)
+    assert not [t for t in _remote_tags(world.origin) if t.startswith("hotfix/")], (
+        "a failed pick spends every request, or check offers it again"
+    )
+
+
+def test_hotfix_refuses_a_commit_hash_of_only_whitespace(
+    tmp_path, world, in_production
+):
+    """A put that meant a hotfix must not quietly cut the tracked branch instead."""
+    with pytest.raises(RuntimeError, match="needs at least one commit"):
+        _put(_workspace(tmp_path, world.origin), commit_hash="  \n")
+
+    assert HOTFIX not in _remote_tags(world.origin)
+
+
+def test_hotfix_tries_every_request_before_stopping_on_one_it_cannot_delete(
+    tmp_path, world, in_production
+):
+    follow = _follow_up_fix(world)
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+    _request_hotfix(world, follow, follow)
+    hook = world.origin / "hooks" / "pre-receive"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "while read -r _old _new ref; do\n"
+        f'  [ "$ref" = refs/tags/hotfix/{world.fix_sha} ] && exit 1\n'
+        "done\n"
+        "exit 0\n"
+    )
+    hook.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="Could not delete the hotfix request"):
+        _put(
+            _workspace(tmp_path, world.origin),
+            commit_hash=f"{world.fix_sha} {follow}",
+        )
+
+    tags = _remote_tags(world.origin)
+    assert f"hotfix/{world.fix_sha}" in tags
+    assert f"hotfix/{follow}" not in tags
 
 
 def test_a_single_commit_that_does_not_apply_keeps_its_message(

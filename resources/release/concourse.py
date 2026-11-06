@@ -679,8 +679,6 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
         version_str = (sources_dir / version_file).read_text().strip()
         repo_path = sources_dir / repo_dir
-        # Whitespace alone is no hotfix: an empty `hotfix` file is a normal cut.
-        commit_hash = (commit_hash or "").strip() or None
 
         superseded = ""
         superseded_tag_kept = False
@@ -959,8 +957,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         commit_shas = _resolve_hotfix_commits(repo_path, commit_hash, env=env)
         # Every request is spent, whether or not the cut then succeeds: one
         # left behind would make every later check offer this hotfix again.
-        for commit_sha in commit_shas:
-            _consume_hotfix_request(repo_path, commit_sha, env=env)
+        _consume_hotfix_requests(repo_path, commit_shas, env=env)
         if len(commit_shas) > MAX_HOTFIX_COMMITS:
             msg = (
                 f"A hotfix carries at most {MAX_HOTFIX_COMMITS} commits and "
@@ -993,17 +990,9 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             tag_sha = _run(
                 ["git", "rev-list", "-n1", version], cwd=repo_path, env=env
             ).strip()
-            # One more than was asked for, so a request for only the last of
-            # the commits does not read as the hotfix it was cut from.
-            picked = _picked_commits(
-                repo_path,
-                tag_sha,
-                len(commit_shas) + 1,
-                stop_at=_run(
-                    ["git", "rev-list", "-n1", base_tag], cwd=repo_path, env=env
-                ).strip(),
-                env=env,
-            )
+            # Every pick between the base and the tag, so a request for only
+            # some of them does not read as the hotfix that was cut.
+            picked = _picks_on_base(repo_path, tag_sha, base_tag, env=env)
             if len(picked) != len(commit_shas) or set(picked) != set(commit_shas):
                 msg = (
                     f"Tag {version!r} already exists at {tag_sha}, which is not a "
@@ -1983,67 +1972,38 @@ def _hotfix_commit_info(
     return count, ",".join(sorted(authors))
 
 
-def _picked_commits(
-    repo_path: Path,
-    tag_sha: str,
-    count: int,
-    *,
-    stop_at: str,
-    env: dict[str, str],
-) -> list[str]:
-    """Return what up to *count* commits ending at *tag_sha* were cherry-picked from.
-
-    Newest first.  ``cherry-pick -x`` ends each message with the commit it
-    picked, so this reads one trailer per commit and stops at one without, or
-    on reaching *stop_at*, the commit the run of picks was made on.  That commit
-    can itself be a pick, when it is the tag of an earlier hotfix.
-    """
-    picked: list[str] = []
-    current = tag_sha
-    for _ in range(count):
-        if current == stop_at:
-            break
-        message = _run(
-            ["git", "log", "-1", "--format=%B", current], cwd=repo_path, env=env
-        )
-        trailers = CHERRY_PICK_TRAILER.findall(message)
-        if not trailers:
-            break
-        picked.append(trailers[-1])
-        try:
-            current = _run(
-                ["git", "rev-parse", f"{current}^"], cwd=repo_path, env=env
-            ).strip()
-        except subprocess.CalledProcessError:
-            break
-    return picked
-
-
-def _consume_hotfix_request(
-    repo_path: Path, commit_sha: str, *, env: dict[str, str]
+def _consume_hotfix_requests(
+    repo_path: Path, commit_shas: list[str], *, env: dict[str, str]
 ) -> None:
-    """Delete the ``hotfix/<commit_sha>`` request tag from the remote.
+    """Delete the ``hotfix/<sha>`` request tag of every commit from the remote.
 
-    The request is spent whether or not the cut then succeeds.  Left behind,
+    The requests are spent whether or not the cut then succeeds.  Left behind,
     a refused or failed request would make every later check offer this hotfix
-    again instead of a normal release.  The delete itself is best-effort,
-    because there may be no request at all (a pipeline passing ``commit_hash``
-    directly), so the remote is re-read afterwards: a request that survives,
-    e.g. behind a protected-tag rule, stops the cut here.
+    again instead of a normal release.  Each delete is best-effort, because
+    there may be no request at all (a pipeline passing ``commit_hash``
+    directly), so the remote is re-read afterwards.  Every delete is tried
+    before that, so one request that survives, e.g. behind a protected-tag
+    rule, does not leave the others in place too; any survivor stops the cut.
 
-    :raises RuntimeError: If the request tag is still on the remote.
+    :raises RuntimeError: If any request tag is still on the remote.
     """
-    ref = f"refs/tags/{HOTFIX_TAG_PREFIX}{commit_sha}"
-    with suppress(subprocess.CalledProcessError):
-        _run(["git", "push", "origin", "--delete", ref], cwd=repo_path, env=env)
-    survivor = _run(
-        ["git", "ls-remote", "--tags", "origin", ref], cwd=repo_path, env=env
-    )
-    if survivor.strip():
+    refs = [f"refs/tags/{HOTFIX_TAG_PREFIX}{sha}" for sha in commit_shas]
+    for ref in refs:
+        with suppress(subprocess.CalledProcessError):
+            _run(["git", "push", "origin", "--delete", ref], cwd=repo_path, env=env)
+    survivors = [
+        ref
+        for ref in refs
+        if _run(
+            ["git", "ls-remote", "--tags", "origin", ref], cwd=repo_path, env=env
+        ).strip()
+    ]
+    if survivors:
+        names = ", ".join(survivors)
         msg = (
-            f"Could not delete the hotfix request {ref} from the remote. Refusing "
-            "to continue: left in place, every later check would offer this "
-            "hotfix again."
+            f"Could not delete the hotfix request {names} from the remote. "
+            "Refusing to continue: left in place, every later check would "
+            "offer this hotfix again."
         )
         raise RuntimeError(msg)
 
@@ -2163,6 +2123,11 @@ def _cherry_pick(
         with suppress(subprocess.CalledProcessError):
             _run(["git", "cherry-pick", "--abort"], cwd=repo_path, env=env)
         index, total = position
+        applied_to = (
+            "what production runs"
+            if index == 1
+            else f"what production runs plus the {index - 1} commit(s) picked before it"
+        )
         if total == 1:
             msg = (
                 f"Cherry-picking {commit_sha} onto {onto} failed. It does not apply "
@@ -2171,8 +2136,7 @@ def _cherry_pick(
         elif conflicted:
             msg = (
                 f"Cherry-picking {commit_sha} (commit {index} of {total}) onto "
-                f"{onto} failed: it conflicts with what production runs plus the "
-                f"{index - 1} commit(s) picked before it. Commits are picked in "
+                f"{onto} failed: it conflicts with {applied_to}. Commits are picked in "
                 "the order they landed on the branch, so it may depend on a "
                 "commit that is not in the request; add that commit, or release "
                 "normally instead."
@@ -2180,8 +2144,7 @@ def _cherry_pick(
         else:
             msg = (
                 f"Cherry-picking {commit_sha} (commit {index} of {total}) onto "
-                f"{onto} changed nothing: what production runs plus the "
-                f"{index - 1} commit(s) picked before it already has its change. "
+                f"{onto} changed nothing: {applied_to} already has its change. "
                 "Drop it from the request."
             )
         raise RuntimeError(msg) from exc
