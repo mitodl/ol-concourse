@@ -430,7 +430,13 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
             ValueError: on missing required params or invalid ``mode`` /
                 ``soft`` combinations.
         """
-        soft_header: int = 1 if soft else 0
+        # Fastly reads the presence of the Fastly-Soft-Purge header as the soft
+        # flag and ignores its value ("Typically set to \"1\" when used, but the
+        # value is not important"), so a hard purge has to leave the header out
+        # entirely. fastly-py sends every header kwarg it receives and rejects
+        # None as a non-int, so the only way to omit it is to not pass the kwarg.
+        # https://www.fastly.com/documentation/reference/api/purging/#purge-tag
+        soft_kwargs: dict[str, int] = {"fastly_soft_purge": 1} if soft else {}
 
         if soft and mode == "purge_all":
             msg = (
@@ -463,7 +469,7 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
                     purge_client.purge_tag(
                         resolved,
                         surrogate_key,
-                        fastly_soft_purge=soft_header,
+                        **soft_kwargs,
                     )
                     metadata["service_id"] = resolved
                     metadata["surrogate_key"] = surrogate_key
@@ -489,7 +495,7 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
                     purge_client.bulk_purge_tag(
                         resolved,
                         surrogate_key=" ".join(surrogate_keys),
-                        fastly_soft_purge=soft_header,
+                        **soft_kwargs,
                     )
                     metadata["service_id"] = resolved
                     metadata["surrogate_keys"] = " ".join(surrogate_keys)
@@ -502,7 +508,7 @@ class FastlyResource(ConcourseResource[FastlyVersion]):
                     if not url:
                         msg = "url param is required when mode='url'"
                         raise ValueError(msg)
-                    purge_client.purge_single_url(url, fastly_soft_purge=soft_header)
+                    purge_client.purge_single_url(url, **soft_kwargs)
                     metadata["url"] = url
                     metadata["purged"] = f"{purge_kind} URL purge of {url}"
 
