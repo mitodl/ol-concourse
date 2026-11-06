@@ -4095,6 +4095,21 @@ def test_hotfix_of_several_commits_retrigger_is_a_noop(tmp_path, world, in_produ
     assert _git(world.origin, "rev-list", "-n1", HOTFIX) == first.head_sha
 
 
+def test_hotfix_retrigger_still_finds_its_base_after_a_later_release(
+    tmp_path, world, in_production
+):
+    """The newest release is not this hotfix's base once another has been cut."""
+    first, _ = _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+    _put(_workspace(tmp_path, world.origin), action="finish")
+    _put(_workspace(tmp_path, world.origin, version=CUT))
+    _put(_workspace(tmp_path, world.origin, version=CUT), action="finish")
+
+    again, _ = _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+
+    assert again.head_sha == first.head_sha
+    assert again.since == PROD
+
+
 def test_hotfix_retrigger_for_part_of_the_commits_fails(tmp_path, world, in_production):
     follow = _follow_up_fix(world)
     _put(_workspace(tmp_path, world.origin), commit_hash=f"{world.fix_sha} {follow}")

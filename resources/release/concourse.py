@@ -986,7 +986,11 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         if version in tags:
             # A retrigger of a cut that completed.  Re-cherry-picking would
             # mint a new SHA, so identify the tagged commit by the trailer
-            # `cherry-pick -x` wrote instead.
+            # `cherry-pick -x` wrote instead.  Its base is the release just
+            # before it, as when it was cut, not the newest: a release cut
+            # since would be no base of it.
+            index = tags.index(version)
+            base_tag = tags[index - 1] if index > 0 else base_tag
             tag_sha = _run(
                 ["git", "rev-list", "-n1", version], cwd=repo_path, env=env
             ).strip()
