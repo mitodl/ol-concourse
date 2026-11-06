@@ -354,7 +354,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             semver_tags = _get_semver_tags(repo_path, env=env)
             since = semver_tags[-1] if semver_tags else ""
 
-        hotfix = self._hotfix_source(repo_path, tag_sha, since, env=env)
+        hotfix = self._hotfix_source(repo_path, version, tag_sha, since, env=env)
         if hotfix is None:
             return None
         return ReleaseVersion(
@@ -368,7 +368,13 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         )
 
     def _hotfix_source(
-        self, repo_path: Path, tag_sha: str, base_tag: str, *, env: dict[str, str]
+        self,
+        repo_path: Path,
+        version: str,
+        tag_sha: str,
+        base_tag: str,
+        *,
+        env: dict[str, str],
     ) -> str | None:
         """Return the commits a hotfix tag was cherry-picked from, or empty.
 
@@ -385,13 +391,93 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         :meth:`_create_hotfix` put in the version.  ``None`` when the clone
         cannot be deepened far enough to tell.
         """
-        picks = _picks_on_base(repo_path, tag_sha, base_tag, env=env)
+        picks = self._recorded_picks(repo_path, version, tag_sha, base_tag, env=env)
+        if picks is None:
+            return None
         if not picks:
             return ""
         on_mainline = self._on_first_parent_line(repo_path, tag_sha, env=env)
         if on_mainline is None:
             return None
         return "" if on_mainline else " ".join(picks)
+
+    def _existing_hotfix(
+        self,
+        repo_path: Path,
+        version: str,
+        base_tag: str,
+        commit_shas: list[str],
+        *,
+        env: dict[str, str],
+    ) -> tuple[str, str, str]:
+        """Return what :meth:`_create_hotfix` returned when it cut *version*.
+
+        Re-cherry-picking would mint a new SHA, so the tagged commit is
+        identified by the trailers ``cherry-pick -x`` wrote instead: every pick
+        between *base_tag* and the tag, so a request for only some of them
+        does not read as the hotfix that was cut.
+
+        :raises RuntimeError: If the tag is not a hotfix of exactly
+            *commit_shas*, or the clone cannot be deepened far enough to tell.
+        """
+        tag_sha = _run(
+            ["git", "rev-list", "-n1", version], cwd=repo_path, env=env
+        ).strip()
+        picked = self._recorded_picks(repo_path, version, tag_sha, base_tag, env=env)
+        if picked is None:
+            msg = (
+                f"Tag {version!r} already exists at {tag_sha}, and the clone "
+                "cannot be deepened far enough to tell which commits it was cut "
+                "from. Refusing to overwrite it."
+            )
+            raise RuntimeError(msg)
+        if len(picked) != len(commit_shas) or set(picked) != set(commit_shas):
+            msg = (
+                f"Tag {version!r} already exists at {tag_sha}, which is not a "
+                f"hotfix of {', '.join(commit_shas)}. Refusing to overwrite it."
+            )
+            raise RuntimeError(msg)
+        # The order they were picked in, which is what the version named and
+        # what check rebuilds; ordering them again could differ.
+        return tag_sha, base_tag, " ".join(picked)
+
+    def _recorded_picks(
+        self,
+        repo_path: Path,
+        version: str,
+        tag_sha: str,
+        base_tag: str,
+        *,
+        env: dict[str, str],
+    ) -> list[str] | None:
+        """Return :func:`_picks_on_base` for tag *version*, deepening until it can tell.
+
+        A hotfix of several commits reaches further below its tag than the
+        clone may hold, and reading the run as no hotfix there would rebuild
+        its version without them.  ``None`` if deepening gets no further.
+        """
+        boundary: set[str] | None = None
+        while (picks := _picks_on_base(repo_path, tag_sha, base_tag, env=env)) is None:
+            shallow = _shallow_commits(repo_path, env=env)
+            if shallow == boundary:
+                return None
+            boundary = shallow
+            # Enough for the whole run below the tag in one go.  The tag itself
+            # is fetched, since an unfinished hotfix is on no branch, and
+            # deepening the branch with --tags does not reach below a tag the
+            # clone already has.
+            _run(
+                [
+                    "git",
+                    "fetch",
+                    f"--deepen={MAX_HOTFIX_COMMITS + 1}",
+                    "origin",
+                    f"refs/tags/{version}",
+                ],
+                cwd=repo_path,
+                env=env,
+            )
+        return picks
 
     def _on_first_parent_line(
         self, repo_path: Path, sha: str, *, env: dict[str, str]
@@ -404,13 +490,6 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         clone is deepened until it does.  ``None`` if deepening gets no
         further.
         """
-        shallow = Path(
-            _run(
-                ["git", "rev-parse", "--path-format=absolute", "--git-path", "shallow"],
-                cwd=repo_path,
-                env=env,
-            ).strip()
-        )
         oldest = ""
         while True:
             mainline = _run(
@@ -420,12 +499,14 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             ).split()
             if sha in mainline:
                 return True
+            # Checked before giving up: deepening at the repository's first
+            # commit adds nothing to the line but unshallows that commit.
+            boundary = mainline[-1] in _shallow_commits(repo_path, env=env)
+            if not boundary or _is_ancestor(repo_path, mainline[-1], sha, env=env):
+                return False
             if mainline[-1] == oldest:
                 return None
             oldest = mainline[-1]
-            boundary = shallow.exists() and oldest in shallow.read_text().split()
-            if not boundary or _is_ancestor(repo_path, oldest, sha, env=env):
-                return False
             _run(
                 ["git", "fetch", f"--deepen={self.clone_depth}", "origin", self.branch],
                 cwd=repo_path,
@@ -984,26 +1065,14 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         base_tag = prior_tags[-1]
 
         if version in tags:
-            # A retrigger of a cut that completed.  Re-cherry-picking would
-            # mint a new SHA, so identify the tagged commit by the trailer
-            # `cherry-pick -x` wrote instead.  Its base is the release just
-            # before it, as when it was cut, not the newest: a release cut
-            # since would be no base of it.
+            # A retrigger of a cut that completed.  Its base is the release
+            # just before it, as when it was cut, not the newest: a release
+            # cut since would be no base of it.
             index = tags.index(version)
             base_tag = tags[index - 1] if index > 0 else base_tag
-            tag_sha = _run(
-                ["git", "rev-list", "-n1", version], cwd=repo_path, env=env
-            ).strip()
-            # Every pick between the base and the tag, so a request for only
-            # some of them does not read as the hotfix that was cut.
-            picked = _picks_on_base(repo_path, tag_sha, base_tag, env=env)
-            if len(picked) != len(commit_shas) or set(picked) != set(commit_shas):
-                msg = (
-                    f"Tag {version!r} already exists at {tag_sha}, which is not a "
-                    f"hotfix of {', '.join(commit_shas)}. Refusing to overwrite it."
-                )
-                raise RuntimeError(msg)
-            return tag_sha, base_tag, hotfix
+            return self._existing_hotfix(
+                repo_path, version, base_tag, commit_shas, env=env
+            )
         if in_flight == version:
             self._clear_partial_cut(repo_path, version, env=env)
 
@@ -1783,24 +1852,39 @@ def _get_in_flight_release_version(
     return sorted(versions, key=_parse_version_tuple)[-1]
 
 
+def _shallow_commits(repo_path: Path, *, env: dict[str, str]) -> set[str]:
+    """Return the commits at the clone's boundary, whose parents it lacks."""
+    shallow = Path(
+        _run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-path", "shallow"],
+            cwd=repo_path,
+            env=env,
+        ).strip()
+    )
+    return set(shallow.read_text().split()) if shallow.exists() else set()
+
+
 def _picks_on_base(
     repo_path: Path, tag_sha: str, base_tag: str, *, env: dict[str, str]
-) -> list[str]:
+) -> list[str] | None:
     """Return what the run of cherry-picks ending at *tag_sha* picked, oldest first.
 
     Empty unless *tag_sha* ends a run of at most :data:`MAX_HOTFIX_COMMITS`
     ``cherry-pick -x`` commits that starts on what *base_tag*'s release was
-    built from: its ``Release <base>`` commit, or the tag itself.  Also empty
-    where the clone is too shallow to tell.
+    built from: its ``Release <base>`` commit, or the tag itself.  ``None``
+    where the clone's boundary hides what is needed to tell.
     """
-    if not VERSION_PATTERN.match(base_tag):
-        return []
     try:
-        base_sha = _run(
-            ["git", "rev-list", "-n1", base_tag], cwd=repo_path, env=env
-        ).strip()
+        base_sha = (
+            _run(["git", "rev-list", "-n1", base_tag], cwd=repo_path, env=env).strip()
+            if VERSION_PATTERN.match(base_tag)
+            else ""
+        )
     except subprocess.CalledProcessError:
+        base_sha = ""
+    if not base_sha:
         return []
+    shallow = _shallow_commits(repo_path, env=env)
     picks: list[str] = []
     current = tag_sha
     for _ in range(MAX_HOTFIX_COMMITS):
@@ -1823,9 +1907,14 @@ def _picks_on_base(
                 .partition("\t")
             )
         except subprocess.CalledProcessError:
-            # Outside the shallow clone: not provably a hotfix.
-            return []
+            # Its parent is past the clone, or it is the repository's first
+            # commit and not provably a hotfix.
+            return None if current in shallow else []
         parent, *grandparents = shas.split() or [""]
+        if parent != base_sha and parent in shallow:
+            # The clone shows no parents of it, so it cannot be told from the
+            # base's Release commit, nor walked past.
+            return None
         if parent == base_sha or (
             grandparents[:1] == [base_sha] and subject == f"Release {base_tag}"
         ):

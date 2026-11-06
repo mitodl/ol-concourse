@@ -30,6 +30,7 @@ from concourse import (
     _get_in_flight_release_version,
     _is_release_machinery,
     _get_semver_tags,
+    _order_by_ancestry,
     _parse_commit_log,
     _parse_semver_tuple,
     _parse_version_tuple,
@@ -4108,6 +4109,50 @@ def test_hotfix_retrigger_still_finds_its_base_after_a_later_release(
 
     assert again.head_sha == first.head_sha
     assert again.since == PROD
+
+
+@pytest.mark.parametrize("several", [False, True])
+@pytest.mark.parametrize("finished", [False, True])
+@pytest.mark.parametrize("depth", [1, 2, 3])
+def test_check_finds_a_hotfix_at_any_clone_depth(
+    tmp_path, world, in_production, several, finished, depth
+):
+    """Picks deeper than the clone holds are deepened into, not taken as none."""
+    commits = [world.fix_sha]
+    if several:
+        commits.append(_follow_up_fix(world))
+        commits.append(_commit(world.dev, "And again", **{"more.txt": "x\n"}))
+        _git(world.dev, "push", "-q", "origin", "main")
+    created, _ = _put(_workspace(tmp_path, world.origin), commit_hash=" ".join(commits))
+    if finished:
+        _put(_workspace(tmp_path, world.origin), action="finish")
+        _git(world.dev, "pull", "-q", "--no-rebase", "origin", "main")
+        for n in range(5):
+            _commit(world.dev, f"Later {n}", **{"later.txt": f"{n}\n"})
+        _git(world.dev, "push", "-q", "origin", "main")
+
+    assert _cuts(world, clone_depth=depth)[-1] == created
+
+
+def test_hotfix_retrigger_keeps_the_order_the_commits_were_picked_in(
+    tmp_path, world, in_production, monkeypatch
+):
+    """A retrigger that orders the commits differently still names the same cut.
+
+    A deeper clone can show ancestry the first one could not, so ordering the
+    request again may not give the order the tag was picked in.
+    """
+    follow = _follow_up_fix(world)
+    commits = f"{world.fix_sha} {follow}"
+    first, _ = _put(_workspace(tmp_path, world.origin), commit_hash=commits)
+    monkeypatch.setattr(
+        "concourse._order_by_ancestry",
+        lambda repo, shas, **kwargs: _order_by_ancestry(repo, shas, **kwargs)[::-1],
+    )
+
+    again, _ = _put(_workspace(tmp_path, world.origin), commit_hash=commits)
+
+    assert again.hotfix == first.hotfix
 
 
 def test_hotfix_retrigger_for_part_of_the_commits_fails(tmp_path, world, in_production):
