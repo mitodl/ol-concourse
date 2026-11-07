@@ -425,15 +425,15 @@ wheels = [
 
 [[package]]
 name = "fastly"
-version = "14.2.0"
+version = "15.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "python-dateutil" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/14/4b/9988e4d001b6c6db07e69f1142b583a1b8a93e2fe4592876576d7c9d47ae/fastly-14.2.0.tar.gz", hash = "sha256:853a5784eddf3280a92d6e1bc35bcd696521e9d1da522aafebeaeadad693b569", size = 1020625, upload-time = "2026-09-28T06:00:08.733Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/64/b2/66dd88e1dc3549d7ca1e1f22c2441abaec3615bda9611878b74b2f689ec7/fastly-15.0.0.tar.gz", hash = "sha256:ee180e0627a29db4a5e635216af96ef4b318f1baec08f4a299de21b450e041a5", size = 1173548, upload-time = "2026-10-22T04:13:35.981Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bd/0b/a2796590ac393615581755d0de3e4566ecd5b6a4ae7042aea4bd043b3ac1/fastly-14.2.0-py3-none-any.whl", hash = "sha256:87c352d0ac659ce46cffe98670b5c3e55bb7d50ce4997859c80c9bb8ce5141dc", size = 3460119, upload-time = "2026-09-28T06:00:06.527Z" },
+    { url = "https://files.pythonhosted.org/packages/09/9a/90882d25359253eaefafc8e83e2616f6aa92dd8bf5ddad893f16d34488a5/fastly-15.0.0-py3-none-any.whl", hash = "sha256:e47bc949eafa24847fdbc93b6991424efc09c8826b43461f63875217ac3328ea", size = 3974125, upload-time = "2026-10-22T04:13:33.784Z" },
 ]
 
 [[package]]
@@ -822,7 +822,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "concoursetools", specifier = ">=0.8.0,<0.9" },
-    { name = "fastly", specifier = ">=14,<15" },
+    { name = "fastly", specifier = ">=15,<16" },
 ]
 
 [package.metadata.requires-dev]
