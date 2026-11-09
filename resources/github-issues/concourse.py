@@ -25,6 +25,12 @@ GITHUB_BODY_MAX_CHARS = 65536
 # How many of the newest issues an exact-title lookup reads to cover the lag of
 # GitHub's search index. One page at ``per_page=100``.
 _RECENT_ISSUE_SCAN = 100
+# How many of the most recently updated issues a check with no previous version
+# reads. One page at ``per_page=100``. Unbounded, a gate whose closed issues
+# have all been consumed pages through the repository's entire closed history.
+_FIRST_CHECK_SCAN = 100
+# What ``tombstone_version`` puts in front of a consumed issue's title.
+_CONSUMED_TITLE_PREFIX = "[CONSUMED #"
 _TRUNCATION_NOTICE = (
     "\n\n> :warning: **Body truncated** -- this content exceeded GitHub's "
     f"{GITHUB_BODY_MAX_CHARS}-character limit for issues and comments. See "
@@ -285,12 +291,8 @@ class ConcourseGithubIssuesResource(ConcourseResource):
 
         matching_issues = []
         for issue in all_pipeline_issues:
-            if not issue.title.startswith(self.issue_prefix or ""):
+            if not self._is_check_candidate(issue):
                 continue
-            if self._check_skip_labels:
-                issue_label_names = {lbl.name for lbl in issue.labels}
-                if issue_label_names.intersection(self._check_skip_labels):
-                    continue
             matching_issues.append(issue)
             if (
                 self.limit_old_versions
@@ -301,22 +303,43 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         matching_issues.sort(key=lambda issue: issue.number)
         return matching_issues
 
-    def _get_latest_matching_issue(self) -> "Issue | None":
-        """Return the single most-recent matching issue, or None.
+    def _is_check_candidate(self, issue: Issue) -> bool:
+        """Return whether ``check`` may report *issue* as a version.
 
-        Iterates the GitHub API PaginatedList (newest first by default) and
-        stops as soon as the first qualifying issue is found, so at most one
-        page of results is fetched rather than the entire history.
+        A ``[CONSUMED #n]`` title is skipped explicitly, not only because it
+        fails ``issue_prefix``: with no prefix configured, every title passes
+        that test, and the rename bumps ``updated_at`` back into ``since``.
         """
-        for issue in self.get_all_issues():
-            if not issue.title.startswith(self.issue_prefix or ""):
-                continue
-            if self._check_skip_labels:
-                issue_label_names = {lbl.name for lbl in issue.labels}
-                if issue_label_names.intersection(self._check_skip_labels):
-                    continue
-            return issue
-        return None
+        if issue.title.startswith(_CONSUMED_TITLE_PREFIX):
+            return False
+        if not issue.title.startswith(self.issue_prefix or ""):
+            return False
+        return not (
+            self._check_skip_labels
+            and {lbl.name for lbl in issue.labels} & self._check_skip_labels
+        )
+
+    def _get_latest_matching_issue(self) -> "Issue | None":
+        """Return the latest matching issue among the most recently updated, or None.
+
+        Reads at most :data:`_FIRST_CHECK_SCAN` issues (one page), so the cost
+        does not grow with the repository's history. Sorting by ``updated``
+        puts an issue that was closed or opened moments ago on that page. An
+        older match that has fallen off it is not found, and the check returns
+        nothing; the next issue to be closed or opened is found on the next
+        check.
+        """
+        recent = islice(
+            self.repo.get_issues(
+                state=self.issue_state,
+                labels=self.issue_labels or [],
+                sort="updated",
+                direction="desc",
+            ),
+            _FIRST_CHECK_SCAN,
+        )
+        candidates = [issue for issue in recent if self._is_check_candidate(issue)]
+        return max(candidates, key=self._to_version, default=None)
 
     def fetch_new_versions(
         self, previous_version: ConcourseGithubIssuesVersion | None = None
@@ -324,9 +347,8 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         """Fetch new versions since the previous one.
 
         On the first check (no previous version), Concourse only needs the
-        current latest version to seed its state.  Scanning the full issue
-        history is expensive, so we stop at the first (most-recent) match
-        instead of exhausting the paginated API.
+        current latest version to seed its state, so only one page of the most
+        recently updated issues is read (see :meth:`_get_latest_matching_issue`).
 
         :data:`SKIPPED_VERSION` (issue 0) is treated the same way. A skipped put
         saves it as this resource's latest version, so it can come back here,
@@ -383,7 +405,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
             return
         current_title = self.get_title_from_build(build_metadata)
         job_number = build_metadata.BUILD_NAME
-        issue.edit(title=f"[CONSUMED #{job_number}]" + current_title)
+        issue.edit(title=f"{_CONSUMED_TITLE_PREFIX}{job_number}]" + current_title)
 
     def _refuse_if_skip_labeled(self, version: ConcourseGithubIssuesVersion) -> None:
         """Raise if the version's issue carries a ``skip_if_labeled`` label now."""

@@ -1,6 +1,5 @@
 """Tests for the github-issues Concourse resource."""
 
-from github.GithubObject import NotSet
 import pytest
 from unittest.mock import MagicMock, call, patch
 from datetime import datetime, timedelta
@@ -168,8 +167,7 @@ def test_fetch_new_versions_no_previous(
     """First check returns only the single most-recent matching version.
 
     Concourse only needs the latest version to seed its state on the first
-    check, so we stop scanning as soon as we find one match rather than
-    returning the entire history.
+    check, so one page is read rather than the entire history.
     """
     mock_gh_instance, mock_repo = mock_github
 
@@ -192,10 +190,102 @@ def test_fetch_new_versions_no_previous(
 
     # Exactly one version is returned: the most-recent matching issue.
     assert version_numbers == {expected_issue_number}
-    # Verify get_issues was called with the correct state and no 'since'
     mock_repo.get_issues.assert_called_once_with(
-        state=config_state, labels=[], since=NotSet
+        state=config_state, labels=[], sort="updated", direction="desc"
     )
+
+
+def _fake_issue_pages(issues: list[MagicMock], consumed: list[int]):
+    """Yield *issues* one at a time, counting how many were read into *consumed*."""
+    for issue in issues:
+        consumed[0] += 1
+        yield issue
+
+
+def test_first_check_reads_one_page_when_every_gate_issue_is_consumed(mock_github):
+    """https://github.com/mitodl/ol-concourse/issues/142."""
+    _, mock_repo = mock_github
+    history = [
+        create_mock_issue(
+            number=n,
+            title=f"[CONSUMED #{n}][bot] gate",
+            state="closed",
+            created_at=T_MINUS_3,
+            closed_at=T_MINUS_2,
+        )
+        for n in range(500, 0, -1)
+    ]
+    read = [0]
+    mock_repo.get_issues.return_value = _fake_issue_pages(history, read)
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo", access_token="dummy_token", issue_prefix="[bot]"
+    )
+
+    versions = SimpleTestResourceWrapper(resource).fetch_new_versions(None)
+
+    assert versions == set()
+    assert read[0] == 100
+
+
+def test_first_check_returns_the_latest_closed_not_the_latest_updated(mock_github):
+    """A comment on an old closed issue moves it to the top of `sort=updated`."""
+    _, mock_repo = mock_github
+    commented_on = create_mock_issue(
+        number=1,
+        title="[bot] gate",
+        state="closed",
+        created_at=T_MINUS_3,
+        closed_at=T_MINUS_2,
+    )
+    latest = create_mock_issue(
+        number=2,
+        title="[bot] gate",
+        state="closed",
+        created_at=T_MINUS_2,
+        closed_at=NOW,
+    )
+    mock_repo.get_issues.return_value = [commented_on, latest]
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo", access_token="dummy_token", issue_prefix="[bot]"
+    )
+
+    versions = SimpleTestResourceWrapper(resource).fetch_new_versions(None)
+
+    assert {v.issue_number for v in versions} == {2}
+
+
+@pytest.mark.parametrize("has_previous", [False, True])
+def test_check_skips_consumed_titles_without_a_prefix(mock_github, has_previous):
+    """With no `issue_prefix`, every title passes the prefix test."""
+    _, mock_repo = mock_github
+    mock_repo.get_issues.return_value = [
+        create_mock_issue(
+            number=5,
+            title="[CONSUMED #12]Pipeline gate",
+            state="closed",
+            created_at=T_MINUS_1,
+            closed_at=NOW,
+        )
+    ]
+    resource = ConcourseGithubIssuesResource(
+        repository="test/repo", access_token="dummy_token"
+    )
+    previous = (
+        ConcourseGithubIssuesVersion(
+            issue_created_at=T_MINUS_3.strftime(ISO_8601_FORMAT),
+            issue_closed_at=T_MINUS_2.strftime(ISO_8601_FORMAT),
+            issue_number=4,
+            issue_state="closed",
+            issue_title="Pipeline gate",
+            issue_url="http://example.com/issue",
+        )
+        if has_previous
+        else None
+    )
+
+    versions = SimpleTestResourceWrapper(resource).fetch_new_versions(previous)
+
+    assert versions == set()
 
 
 def test_fetch_new_versions_with_previous_closed(mock_github):
@@ -1218,7 +1308,7 @@ class TestSkipIfFile:
         )
 
         assert {v.issue_number for v in versions} == {7}
-        assert mock_repo.get_issues.call_args.kwargs["since"] is NotSet
+        assert "since" not in mock_repo.get_issues.call_args.kwargs
 
     def test_implicit_get_of_the_skipped_version_does_not_tombstone(
         self, mock_github, tmp_path
