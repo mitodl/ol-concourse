@@ -31,7 +31,9 @@ resources:
 ## `check` — Fetch versions
 
 Returns issues matching the configured `issue_state` and `issue_prefix`.
-Issues that carry any label listed in `skip_if_labeled`, or the `consume_with_label` label, are excluded from results.
+Issues that carry any label listed in `skip_if_labeled`, or the `consume_with_label` label, are excluded from results, as are issues whose title starts with `[CONSUMED #`.
+
+A check with no previous version reads only the 100 most recently updated issues and returns the latest match among them. When every matching issue has been consumed, nothing on that page matches and the check returns no version instead of paging through the repository's whole history; the next issue to be closed (or opened, with `issue_state: open`) is found on a later check.
 
 ## `in` — Download version
 
