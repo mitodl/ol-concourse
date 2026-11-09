@@ -260,14 +260,22 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         self,
         issue_state: Literal["open", "closed"] | None = None,
         since: datetime | None = None,
+        sort: Literal["created", "updated"] = "created",
     ) -> list[Issue]:
-        """Return all issues from the repository matching the configured filters."""
+        """Return all issues from the repository matching the configured filters.
+
+        Newest first by *sort*; ``created`` is GitHub's own default.
+        """
         if not issue_state:
             issue_state = self.issue_state
         # Pass NotSet if since is None, as PyGithub expects this sentinel value
         since_param = since if since is not None else NotSet
         return self.repo.get_issues(
-            state=issue_state, labels=self.issue_labels or [], since=since_param
+            state=issue_state,
+            labels=self.issue_labels or [],
+            since=since_param,
+            sort=sort,
+            direction="desc",
         )
 
     def get_exact_title_match(
@@ -329,15 +337,7 @@ class ConcourseGithubIssuesResource(ConcourseResource):
         nothing; the next issue to be closed or opened is found on the next
         check.
         """
-        recent = islice(
-            self.repo.get_issues(
-                state=self.issue_state,
-                labels=self.issue_labels or [],
-                sort="updated",
-                direction="desc",
-            ),
-            _FIRST_CHECK_SCAN,
-        )
+        recent = islice(self.get_all_issues(sort="updated"), _FIRST_CHECK_SCAN)
         candidates = [issue for issue in recent if self._is_check_candidate(issue)]
         return max(candidates, key=self._to_version, default=None)
 

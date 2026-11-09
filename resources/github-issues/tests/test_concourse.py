@@ -1,5 +1,6 @@
 """Tests for the github-issues Concourse resource."""
 
+from github.GithubObject import NotSet
 import pytest
 from unittest.mock import MagicMock, call, patch
 from datetime import datetime, timedelta
@@ -191,7 +192,11 @@ def test_fetch_new_versions_no_previous(
     # Exactly one version is returned: the most-recent matching issue.
     assert version_numbers == {expected_issue_number}
     mock_repo.get_issues.assert_called_once_with(
-        state=config_state, labels=[], sort="updated", direction="desc"
+        state=config_state,
+        labels=[],
+        since=NotSet,
+        sort="updated",
+        direction="desc",
     )
 
 
@@ -331,7 +336,11 @@ def test_fetch_new_versions_with_previous_closed(mock_github):
 
     assert version_numbers == {2}  # Only issue #2 should be newer
     mock_repo.get_issues.assert_called_once_with(
-        state="closed", labels=[], since=expected_since
+        state="closed",
+        labels=[],
+        since=expected_since,
+        sort="created",
+        direction="desc",
     )
 
 
@@ -377,7 +386,11 @@ def test_fetch_new_versions_with_previous_open(mock_github):
 
     assert version_numbers == {4}  # Only issue #4 should be newer
     mock_repo.get_issues.assert_called_once_with(
-        state="open", labels=[], since=expected_since
+        state="open",
+        labels=[],
+        since=expected_since,
+        sort="created",
+        direction="desc",
     )
 
 
@@ -423,7 +436,11 @@ def test_fetch_new_versions_with_prefix_and_previous(mock_github):
     # Issue #2 is returned by API (newer), but filtered out by prefix.
     assert version_numbers == set()
     mock_repo.get_issues.assert_called_once_with(
-        state="closed", labels=[], since=expected_since
+        state="closed",
+        labels=[],
+        since=expected_since,
+        sort="created",
+        direction="desc",
     )
 
 
@@ -482,7 +499,11 @@ def test_fetch_new_versions_limit_old(mock_github):
     # first 2 matches [9,8] (limit_old_versions=2), then sorts ascending.
     assert version_numbers == {8, 9}
     mock_repo.get_issues.assert_called_once_with(
-        state="closed", labels=[], since=expected_since
+        state="closed",
+        labels=[],
+        since=expected_since,
+        sort="created",
+        direction="desc",
     )
 
 
@@ -1308,7 +1329,7 @@ class TestSkipIfFile:
         )
 
         assert {v.issue_number for v in versions} == {7}
-        assert "since" not in mock_repo.get_issues.call_args.kwargs
+        assert mock_repo.get_issues.call_args.kwargs["since"] is NotSet
 
     def test_implicit_get_of_the_skipped_version_does_not_tombstone(
         self, mock_github, tmp_path
