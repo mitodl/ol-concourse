@@ -30,6 +30,7 @@ from concourse import (
     _get_in_flight_release_version,
     _is_release_machinery,
     _get_semver_tags,
+    _order_by_ancestry,
     _parse_commit_log,
     _parse_semver_tuple,
     _parse_version_tuple,
@@ -3866,3 +3867,387 @@ def test_cut_survives_a_transient_tag_push_failure(mock_run, mock_sleep, tmp_pat
 
     assert calls.count(tag_push) == 2
     assert calls.count(["git", "push", "origin", f"releases/{version}"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# hotfix of several commits
+# ---------------------------------------------------------------------------
+#
+# A fix that took a second attempt is two commits on the tracked branch, and
+# the second does not apply without the first.  These run real git too.
+
+
+def _follow_up_fix(world: _World) -> str:
+    """Land a commit on main that corrects the fix, so it needs the fix first."""
+    sha = _commit(world.dev, "Fix the fix", **{"app.txt": "fixed properly\n"})
+    _git(world.dev, "push", "-q", "origin", "main")
+    return sha
+
+
+def _file_at(repo: Path, rev: str, name: str) -> str:
+    return _git(repo, "show", f"{rev}:{name}")
+
+
+def test_hotfix_of_several_commits_is_production_plus_those_commits(
+    tmp_path, world, in_production
+):
+    follow = _follow_up_fix(world)
+
+    version, metadata = _put(
+        _workspace(tmp_path, world.origin), commit_hash=f"{world.fix_sha} {follow}"
+    )
+
+    assert version.hotfix == f"{world.fix_sha} {follow}"
+    assert metadata["hotfix"] == version.hotfix
+    assert version.since == PROD
+    assert _file_at(world.origin, version.head_sha, "app.txt") == "fixed properly"
+    tree = _tree(world.origin, version.head_sha)
+    assert "feature.txt" not in tree, "unreleased work must not ride along"
+    assert "other.txt" not in tree
+    log = _git(world.origin, "log", "--format=%B", f"{PROD}..{version.head_sha}")
+    assert f"(cherry picked from commit {world.fix_sha})" in log
+    assert f"(cherry picked from commit {follow})" in log
+
+
+def test_hotfix_picks_in_ancestry_order_whatever_order_it_was_given(
+    tmp_path, world, in_production
+):
+    """The follow-up conflicts without the fix, so asking for it first must not fail."""
+    follow = _follow_up_fix(world)
+
+    version, _ = _put(
+        _workspace(tmp_path, world.origin), commit_hash=f"{follow} {world.fix_sha}"
+    )
+
+    assert version.hotfix == f"{world.fix_sha} {follow}"
+    assert _file_at(world.origin, version.head_sha, "app.txt") == "fixed properly"
+
+
+def test_hotfix_names_a_commit_twice_as_one(tmp_path, world, in_production):
+    version, _ = _put(
+        _workspace(tmp_path, world.origin),
+        commit_hash=f"{world.fix_sha}  {world.fix_sha[:12]}",
+    )
+
+    assert version.hotfix == world.fix_sha
+
+
+def test_hotfix_refuses_every_commit_when_one_cannot_be_found(
+    tmp_path, world, in_production
+):
+    """Nothing is spent or cut: a typo in one commit must not half-do the rest."""
+    missing = "0" * 40
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+
+    with pytest.raises(RuntimeError, match=f"Cannot find commit {missing}"):
+        _put(
+            _workspace(tmp_path, world.origin),
+            commit_hash=f"{world.fix_sha} {missing}",
+        )
+
+    assert f"hotfix/{world.fix_sha}" in _remote_tags(world.origin), (
+        "a request is only spent once every commit in it is known"
+    )
+    assert HOTFIX not in _remote_tags(world.origin)
+    assert f"releases/{HOTFIX}" not in _git(world.origin, "branch", "--list")
+
+
+def test_hotfix_refuses_the_whole_request_when_some_is_in_production(
+    tmp_path, world, in_production
+):
+    shipped = _git(world.dev, "rev-list", "--max-parents=0", "HEAD")
+
+    with pytest.raises(RuntimeError, match=f"{shipped} is already in production") as e:
+        _put(
+            _workspace(tmp_path, world.origin),
+            commit_hash=f"{world.fix_sha} {shipped}",
+        )
+
+    assert "drop them from the request" in str(e.value)
+    assert HOTFIX not in _remote_tags(world.origin)
+
+
+def test_hotfix_refuses_a_pick_that_changes_nothing(tmp_path, world, in_production):
+    """The same change under another SHA is empty on top of the first: refused."""
+    _git(world.dev, "checkout", "-q", "-b", "twin", world.prod_sha)
+    twin = _commit(world.dev, "The same fix again", **{"app.txt": "fixed\n"})
+    _git(world.dev, "push", "-q", "origin", "twin")
+
+    with pytest.raises(RuntimeError, match="changed nothing") as e:
+        _put(
+            _workspace(tmp_path, world.origin),
+            commit_hash=f"{world.fix_sha} {twin}",
+        )
+
+    assert "Drop it from the request" in str(e.value)
+    assert HOTFIX not in _remote_tags(world.origin)
+
+
+def test_hotfix_names_the_commit_that_does_not_apply(tmp_path, world, in_production):
+    """The follow-up needs the fix, which this request leaves out."""
+    follow = _follow_up_fix(world)
+    other = _commit(world.dev, "Unrelated fix", **{"late.txt": "fix\n"})
+    _git(world.dev, "push", "-q", "origin", "main")
+
+    _request_hotfix(world, follow, follow)
+    _request_hotfix(world, other, other)
+
+    with pytest.raises(RuntimeError, match=f"Cherry-picking {follow}") as e:
+        _put(_workspace(tmp_path, world.origin), commit_hash=f"{follow} {other}")
+
+    assert "(commit 1 of 2)" in str(e.value)
+    assert "it conflicts with what production runs." in str(e.value)
+    assert "add that commit" in str(e.value)
+    assert HOTFIX not in _remote_tags(world.origin)
+    assert not [t for t in _remote_tags(world.origin) if t.startswith("hotfix/")], (
+        "a failed pick spends every request, or check offers it again"
+    )
+
+
+def test_hotfix_refuses_a_commit_hash_of_only_whitespace(
+    tmp_path, world, in_production
+):
+    """A put that meant a hotfix must not quietly cut the tracked branch instead."""
+    with pytest.raises(RuntimeError, match="needs at least one commit"):
+        _put(_workspace(tmp_path, world.origin), commit_hash="  \n")
+
+    assert HOTFIX not in _remote_tags(world.origin)
+
+
+def test_hotfix_tries_every_request_before_stopping_on_one_it_cannot_delete(
+    tmp_path, world, in_production
+):
+    follow = _follow_up_fix(world)
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+    _request_hotfix(world, follow, follow)
+    hook = world.origin / "hooks" / "pre-receive"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "while read -r _old _new ref; do\n"
+        f'  [ "$ref" = refs/tags/hotfix/{world.fix_sha} ] && exit 1\n'
+        "done\n"
+        "exit 0\n"
+    )
+    hook.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="Could not delete the hotfix request"):
+        _put(
+            _workspace(tmp_path, world.origin),
+            commit_hash=f"{world.fix_sha} {follow}",
+        )
+
+    tags = _remote_tags(world.origin)
+    assert f"hotfix/{world.fix_sha}" in tags
+    assert f"hotfix/{follow}" not in tags
+
+
+def test_a_single_commit_that_does_not_apply_keeps_its_message(
+    tmp_path, world, in_production
+):
+    follow = _follow_up_fix(world)
+
+    with pytest.raises(RuntimeError) as e:
+        _put(_workspace(tmp_path, world.origin), commit_hash=follow)
+
+    assert str(e.value) == (
+        f"Cherry-picking {follow} onto {PROD} failed. It does not apply to what "
+        "production runs; release it normally instead."
+    )
+
+
+def test_hotfix_refuses_more_commits_than_the_cap_and_spends_the_requests(
+    tmp_path, world, in_production, monkeypatch
+):
+    monkeypatch.setattr("concourse.MAX_HOTFIX_COMMITS", 2)
+    follow = _follow_up_fix(world)
+    last = _commit(world.dev, "One more", **{"more.txt": "x\n"})
+    _git(world.dev, "push", "-q", "origin", "main")
+    shas = [world.fix_sha, follow, last]
+    for sha in shas:
+        _request_hotfix(world, sha, sha)
+
+    with pytest.raises(RuntimeError, match="at most 2 commits and 3 were requested"):
+        _put(_workspace(tmp_path, world.origin), commit_hash=" ".join(shas))
+
+    assert not [t for t in _remote_tags(world.origin) if t.startswith("hotfix/")], (
+        "otherwise every later check would offer the same oversized request"
+    )
+
+
+def test_hotfix_consumes_every_request(tmp_path, world, in_production):
+    follow = _follow_up_fix(world)
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+    _request_hotfix(world, follow, follow)
+
+    _put(_workspace(tmp_path, world.origin), commit_hash=f"{world.fix_sha} {follow}")
+
+    assert not [t for t in _remote_tags(world.origin) if t.startswith("hotfix/")]
+
+
+def test_hotfix_of_several_commits_retrigger_is_a_noop(tmp_path, world, in_production):
+    follow = _follow_up_fix(world)
+    commits = f"{world.fix_sha} {follow}"
+
+    first, _ = _put(_workspace(tmp_path, world.origin), commit_hash=commits)
+    second, _ = _put(_workspace(tmp_path, world.origin), commit_hash=commits)
+
+    assert second.head_sha == first.head_sha
+    assert second.hotfix == first.hotfix
+    assert _git(world.origin, "rev-list", "-n1", HOTFIX) == first.head_sha
+
+
+def test_hotfix_retrigger_still_finds_its_base_after_a_later_release(
+    tmp_path, world, in_production
+):
+    """The newest release is not this hotfix's base once another has been cut."""
+    first, _ = _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+    _put(_workspace(tmp_path, world.origin), action="finish")
+    _put(_workspace(tmp_path, world.origin, version=CUT))
+    _put(_workspace(tmp_path, world.origin, version=CUT), action="finish")
+
+    again, _ = _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+
+    assert again.head_sha == first.head_sha
+    assert again.since == PROD
+
+
+@pytest.mark.parametrize("several", [False, True])
+@pytest.mark.parametrize("finished", [False, True])
+@pytest.mark.parametrize("depth", [1, 2, 3])
+def test_check_finds_a_hotfix_at_any_clone_depth(
+    tmp_path, world, in_production, several, finished, depth
+):
+    """Picks deeper than the clone holds are deepened into, not taken as none."""
+    commits = [world.fix_sha]
+    if several:
+        commits.append(_follow_up_fix(world))
+        commits.append(_commit(world.dev, "And again", **{"more.txt": "x\n"}))
+        _git(world.dev, "push", "-q", "origin", "main")
+    created, _ = _put(_workspace(tmp_path, world.origin), commit_hash=" ".join(commits))
+    if finished:
+        _put(_workspace(tmp_path, world.origin), action="finish")
+        _git(world.dev, "pull", "-q", "--no-rebase", "origin", "main")
+        for n in range(5):
+            _commit(world.dev, f"Later {n}", **{"later.txt": f"{n}\n"})
+        _git(world.dev, "push", "-q", "origin", "main")
+
+    assert _cuts(world, clone_depth=depth)[-1] == created
+
+
+def test_hotfix_retrigger_keeps_the_order_the_commits_were_picked_in(
+    tmp_path, world, in_production, monkeypatch
+):
+    """A retrigger that orders the commits differently still names the same cut.
+
+    A deeper clone can show ancestry the first one could not, so ordering the
+    request again may not give the order the tag was picked in.
+    """
+    follow = _follow_up_fix(world)
+    commits = f"{world.fix_sha} {follow}"
+    first, _ = _put(_workspace(tmp_path, world.origin), commit_hash=commits)
+    monkeypatch.setattr(
+        "concourse._order_by_ancestry",
+        lambda repo, shas, **kwargs: _order_by_ancestry(repo, shas, **kwargs)[::-1],
+    )
+
+    again, _ = _put(_workspace(tmp_path, world.origin), commit_hash=commits)
+
+    assert again.hotfix == first.hotfix
+
+
+def test_hotfix_retrigger_for_part_of_the_commits_fails(tmp_path, world, in_production):
+    follow = _follow_up_fix(world)
+    _put(_workspace(tmp_path, world.origin), commit_hash=f"{world.fix_sha} {follow}")
+
+    with pytest.raises(RuntimeError, match="is not a hotfix of"):
+        _put(_workspace(tmp_path, world.origin), commit_hash=follow)
+
+
+def test_check_offers_every_pending_request_as_one_hotfix(world):
+    follow = _follow_up_fix(world)
+    # Pushed newest first, so the order comes from ancestry and not from the tags.
+    _request_hotfix(world, follow, follow)
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+
+    versions = _check_all(world)
+    version = versions[-1]
+
+    assert version.hotfix == f"{world.fix_sha} {follow}"
+    assert version.head_sha == follow
+    assert version.since == PROD
+    assert version.commit_count == "2"
+    assert version.version == _compute_next_version([PROD])
+    assert _check_all(world) == versions, (
+        "the same requests must be the same version, or every check is a new one"
+    )
+
+
+def test_check_counts_a_commit_whose_parent_is_also_requested(world):
+    """`<sha>^!` over both would hide the fix as the follow-up's parent."""
+    follow = _follow_up_fix(world)
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+    _request_hotfix(world, follow, follow)
+
+    assert _check(world).commit_count == "2"
+
+
+def test_in_lists_every_hotfix_commit_newest_first(tmp_path, world):
+    follow = _follow_up_fix(world)
+    _request_hotfix(world, world.fix_sha, world.fix_sha)
+    _request_hotfix(world, follow, follow)
+    dest = tmp_path / "get"
+
+    make_resource(uri=f"file://{world.origin}").download_version(
+        _check(world), dest, MagicMock()
+    )
+
+    assert (dest / "hotfix").read_text() == f"{world.fix_sha} {follow}"
+    commits = json.loads((dest / "commits.json").read_text())
+    assert [c["sha"] for c in commits] == [follow, world.fix_sha]
+
+
+def test_check_re_emits_what_a_hotfix_of_several_commits_emitted(
+    tmp_path, world, in_production
+):
+    follow = _follow_up_fix(world)
+    created, _ = _put(
+        _workspace(tmp_path, world.origin), commit_hash=f"{follow} {world.fix_sha}"
+    )
+    assert created.hotfix == f"{world.fix_sha} {follow}"
+
+    assert _cuts(world)[-1] == created
+
+
+def test_check_re_emits_a_finished_hotfix_of_several_commits(
+    tmp_path, world, in_production
+):
+    follow = _follow_up_fix(world)
+    created, _ = _put(
+        _workspace(tmp_path, world.origin), commit_hash=f"{world.fix_sha} {follow}"
+    )
+    _put(_workspace(tmp_path, world.origin), action="finish")
+
+    assert _cuts(world)[-1] == created
+
+
+def test_check_does_not_mistake_a_run_of_picks_on_main_for_a_hotfix(
+    tmp_path, world, mocker
+):
+    """Two picks landed on main right on top of a release are no hotfix either."""
+    mocker.patch.object(ReleaseResource, "_reached_production", return_value=True)
+    _put(_workspace(tmp_path, world.origin, version=CUT))
+    _git(world.dev, "pull", "-q", "--no-rebase", "origin", "main")
+    _git(world.dev, "checkout", "-q", "-b", "elsewhere", world.prod_sha)
+    first = _commit(world.dev, "Fix elsewhere", **{"elsewhere.txt": "fix\n"})
+    second = _commit(world.dev, "Fix elsewhere again", **{"again.txt": "fix\n"})
+    _git(world.dev, "checkout", "-q", "main")
+    _git(world.dev, "cherry-pick", "-x", first)
+    _git(world.dev, "cherry-pick", "-x", second)
+    assert _git(world.dev, "rev-parse", "HEAD~2") == _git(
+        world.origin, "rev-list", "-n1", CUT
+    )
+    _git(world.dev, "push", "-q", "origin", "main")
+    created, _ = _put(_workspace(tmp_path, world.origin, version="2026.9.10.3"))
+    assert created.hotfix == ""
+
+    assert _cuts(world)[-1] == created

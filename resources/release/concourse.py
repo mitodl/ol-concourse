@@ -52,6 +52,9 @@ SEMVER_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 # ``action=create`` deletes when it cuts that hotfix.
 HOTFIX_TAG_PREFIX = "hotfix/"
 HOTFIX_REQUEST_PATTERN = re.compile(r"^hotfix/([0-9a-f]{40})$")
+# The most commits one hotfix may carry.  A hotfix is production plus a fix, so
+# a request for more is a pasted log, not a fix.
+MAX_HOTFIX_COMMITS = 10
 # Abandoning a release that was tagged leaves an ``abandoned/<version>`` tag
 # at the commit the version tag named, so that version is never cut again.
 # Re-using it would re-use its image tag, and a deploy by that tag changes
@@ -142,8 +145,11 @@ class ReleaseVersion(TypedVersion):
     still deserialize.
 
     ``hotfix`` is set while a hotfix request is pending: the version is then
-    production plus that one commit, not the tracked branch, and ``head_sha``
-    is the requested commit.  Empty by default for the same reason.
+    production plus the requested commits, not the tracked branch.  It holds
+    their full SHAs separated by whitespace, in the order they are picked
+    (ancestry order, oldest first), and ``head_sha`` is the last of them.  One
+    commit reads exactly as it always did.  Empty by default for the same
+    reason.
     """
 
     version: str  # YYYY.M.D.N (no leading zeros — PEP 440 compliant)
@@ -152,7 +158,7 @@ class ReleaseVersion(TypedVersion):
     commit_count: str  # number of commits since last release tag
     authors: str  # comma-separated sorted author email list
     in_flight: str = ""  # cut-but-unfinished release version, or empty string
-    hotfix: str = ""  # commit to cherry-pick onto production, or empty string
+    hotfix: str = ""  # commits to cherry-pick onto production, or empty string
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +354,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             semver_tags = _get_semver_tags(repo_path, env=env)
             since = semver_tags[-1] if semver_tags else ""
 
-        hotfix = self._hotfix_source(repo_path, tag_sha, since, env=env)
+        hotfix = self._hotfix_source(repo_path, version, tag_sha, since, env=env)
         if hotfix is None:
             return None
         return ReleaseVersion(
@@ -362,55 +368,116 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         )
 
     def _hotfix_source(
-        self, repo_path: Path, tag_sha: str, base_tag: str, *, env: dict[str, str]
+        self,
+        repo_path: Path,
+        version: str,
+        tag_sha: str,
+        base_tag: str,
+        *,
+        env: dict[str, str],
     ) -> str | None:
-        """Return the commit a hotfix tag was cherry-picked from, or empty.
+        """Return the commits a hotfix tag was cherry-picked from, or empty.
 
-        A hotfix tag sits on a ``cherry-pick -x`` of the fix, made directly on
-        what production was built from: the base release's ``Release <base>``
-        commit, or the base tag itself when that commit never reached the
-        tracked branch (see :meth:`_create_hotfix`).  The trailer alone is not
-        enough, since anyone can land a cherry-pick on the tracked branch, so
-        the parent has to be that base, and the tag must not be on the tracked
-        branch's first-parent line, where every normal cut is and a hotfix
-        never is: it only reaches the branch through its release's merge.
-        ``None`` when the clone cannot be deepened far enough to tell.
+        A hotfix tag sits on the last of a run of ``cherry-pick -x`` commits,
+        one per fix commit, made directly on what production was built from:
+        the base release's ``Release <base>`` commit, or the base tag itself
+        when that commit never reached the tracked branch (see
+        :meth:`_create_hotfix`).  The trailer alone is not enough, since anyone
+        can land a cherry-pick on the tracked branch, so the run has to start
+        on that base, and the tag must not be on the tracked branch's
+        first-parent line, where every normal cut is and a hotfix never is: it
+        only reaches the branch through its release's merge.  Returns the
+        commits picked, oldest first, separated by whitespace, which is what
+        :meth:`_create_hotfix` put in the version.  ``None`` when the clone
+        cannot be deepened far enough to tell.
         """
-        if not VERSION_PATTERN.match(base_tag):
-            return ""
-        message = _run(
-            ["git", "log", "-1", "--format=%B", tag_sha], cwd=repo_path, env=env
-        )
-        picked = CHERRY_PICK_TRAILER.findall(message)
-        if not picked:
-            return ""
-        try:
-            base_sha = _run(
-                ["git", "rev-list", "-n1", base_tag], cwd=repo_path, env=env
-            ).strip()
-            # The parent, its own parents, and its subject.
-            shas, _, subject = (
-                _run(
-                    ["git", "log", "-1", "--format=%H %P%x09%s", f"{tag_sha}^"],
-                    cwd=repo_path,
-                    env=env,
-                )
-                .strip()
-                .partition("\t")
-            )
-        except subprocess.CalledProcessError:
-            # Outside the shallow clone: not provably a hotfix.
-            return ""
-        parent, *grandparents = shas.split() or [""]
-        on_base = parent == base_sha or (
-            grandparents[:1] == [base_sha] and subject == f"Release {base_tag}"
-        )
-        if not on_base:
+        picks = self._recorded_picks(repo_path, version, tag_sha, base_tag, env=env)
+        if picks is None:
+            return None
+        if not picks:
             return ""
         on_mainline = self._on_first_parent_line(repo_path, tag_sha, env=env)
         if on_mainline is None:
             return None
-        return "" if on_mainline else picked[-1]
+        return "" if on_mainline else " ".join(picks)
+
+    def _existing_hotfix(
+        self,
+        repo_path: Path,
+        version: str,
+        base_tag: str,
+        commit_shas: list[str],
+        *,
+        env: dict[str, str],
+    ) -> tuple[str, str, str]:
+        """Return what :meth:`_create_hotfix` returned when it cut *version*.
+
+        Re-cherry-picking would mint a new SHA, so the tagged commit is
+        identified by the trailers ``cherry-pick -x`` wrote instead: every pick
+        between *base_tag* and the tag, so a request for only some of them
+        does not read as the hotfix that was cut.
+
+        :raises RuntimeError: If the tag is not a hotfix of exactly
+            *commit_shas*, or the clone cannot be deepened far enough to tell.
+        """
+        tag_sha = _run(
+            ["git", "rev-list", "-n1", version], cwd=repo_path, env=env
+        ).strip()
+        picked = self._recorded_picks(repo_path, version, tag_sha, base_tag, env=env)
+        if picked is None:
+            msg = (
+                f"Tag {version!r} already exists at {tag_sha}, and the clone "
+                "cannot be deepened far enough to tell which commits it was cut "
+                "from. Refusing to overwrite it."
+            )
+            raise RuntimeError(msg)
+        if len(picked) != len(commit_shas) or set(picked) != set(commit_shas):
+            msg = (
+                f"Tag {version!r} already exists at {tag_sha}, which is not a "
+                f"hotfix of {', '.join(commit_shas)}. Refusing to overwrite it."
+            )
+            raise RuntimeError(msg)
+        # The order they were picked in, which is what the version named and
+        # what check rebuilds; ordering them again could differ.
+        return tag_sha, base_tag, " ".join(picked)
+
+    def _recorded_picks(
+        self,
+        repo_path: Path,
+        version: str,
+        tag_sha: str,
+        base_tag: str,
+        *,
+        env: dict[str, str],
+    ) -> list[str] | None:
+        """Return :func:`_picks_on_base` for tag *version*, deepening until it can tell.
+
+        A hotfix of several commits reaches further below its tag than the
+        clone may hold, and reading the run as no hotfix there would rebuild
+        its version without them.  ``None`` if deepening gets no further.
+        """
+        boundary: set[str] | None = None
+        while (picks := _picks_on_base(repo_path, tag_sha, base_tag, env=env)) is None:
+            shallow = _shallow_commits(repo_path, env=env)
+            if shallow == boundary:
+                return None
+            boundary = shallow
+            # Enough for the whole run below the tag in one go.  The tag itself
+            # is fetched, since an unfinished hotfix is on no branch, and
+            # deepening the branch with --tags does not reach below a tag the
+            # clone already has.
+            _run(
+                [
+                    "git",
+                    "fetch",
+                    f"--deepen={MAX_HOTFIX_COMMITS + 1}",
+                    "origin",
+                    f"refs/tags/{version}",
+                ],
+                cwd=repo_path,
+                env=env,
+            )
+        return picks
 
     def _on_first_parent_line(
         self, repo_path: Path, sha: str, *, env: dict[str, str]
@@ -423,13 +490,6 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         clone is deepened until it does.  ``None`` if deepening gets no
         further.
         """
-        shallow = Path(
-            _run(
-                ["git", "rev-parse", "--path-format=absolute", "--git-path", "shallow"],
-                cwd=repo_path,
-                env=env,
-            ).strip()
-        )
         oldest = ""
         while True:
             mainline = _run(
@@ -439,12 +499,14 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             ).split()
             if sha in mainline:
                 return True
+            # Checked before giving up: deepening at the repository's first
+            # commit adds nothing to the line but unshallows that commit.
+            boundary = mainline[-1] in _shallow_commits(repo_path, env=env)
+            if not boundary or _is_ancestor(repo_path, mainline[-1], sha, env=env):
+                return False
             if mainline[-1] == oldest:
                 return None
             oldest = mainline[-1]
-            boundary = shallow.exists() and oldest in shallow.read_text().split()
-            if not boundary or _is_ancestor(repo_path, oldest, sha, env=env):
-                return False
             _run(
                 ["git", "fetch", f"--deepen={self.clone_depth}", "origin", self.branch],
                 cwd=repo_path,
@@ -471,20 +533,22 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         # Every number ever cut, including abandoned ones, so none is reused.
         cut_versions = [*tags, *_get_abandoned_versions(repo_path, env=env)]
 
-        # A pending hotfix request wins over the tracked branch.  It is how the
-        # release bot tells the build job which commit to cherry-pick, since
-        # triggering a Concourse job carries no parameters.
-        if hotfix := _pending_hotfix_request(repo_path, env=env):
-            count, authors = _commit_info(repo_path, f"{hotfix}^!", env=env)
+        # Pending hotfix requests win over the tracked branch.  They are how
+        # the release bot tells the build job which commits to cherry-pick,
+        # since triggering a Concourse job carries no parameters.  Every
+        # pending request is one hotfix, so the version is the same for as long
+        # as the same requests are pending.
+        if hotfixes := _pending_hotfix_requests(repo_path, env=env):
+            count, authors = _hotfix_commit_info(repo_path, hotfixes, env=env)
             return [
                 ReleaseVersion(
                     version=_compute_next_version(cut_versions),
-                    head_sha=hotfix,
+                    head_sha=hotfixes[-1],
                     since=latest_tag or "",
                     commit_count=str(count),
                     authors=authors,
                     in_flight=in_flight,
-                    hotfix=hotfix,
+                    hotfix=" ".join(hotfixes),
                 )
             ]
 
@@ -622,19 +686,24 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
     ) -> list[dict[str, Any]]:
         """Return enriched commit list between the previous tag and head_sha.
 
-        A hotfix contains exactly its one commit, whatever sits between the
-        previous release and that commit on the tracked branch.
+        A hotfix contains exactly the commits it was asked for, whatever sits
+        between the previous release and them on the tracked branch.  They are
+        listed newest first, like any other range.
 
         Only the tracked branch's first-parent line is listed; see
         :func:`_first_parent_commits`.
         """
         if version.hotfix:
-            range_spec = f"{version.hotfix}^!"
-        elif version.since:
-            range_spec = f"{version.since}..{version.head_sha}"
+            commits = []
+            for sha in reversed(version.hotfix.split()):
+                commits += _first_parent_commits(repo_path, f"{sha}^!", env=env)
         else:
-            range_spec = version.head_sha
-        commits = _first_parent_commits(repo_path, range_spec, env=env)
+            range_spec = (
+                f"{version.since}..{version.head_sha}"
+                if version.since
+                else version.head_sha
+            )
+            commits = _first_parent_commits(repo_path, range_spec, env=env)
 
         token = self.github_token
         if token and self.repository:
@@ -662,7 +731,8 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
           4. Push branch and tag.
 
         action=create with commit_hash cuts a hotfix instead: production plus
-        that one commit, not the tracked branch.  See :meth:`_create_hotfix`.
+        those commits, not the tracked branch.  ``commit_hash`` holds one or
+        more commit SHAs separated by whitespace.  See :meth:`_create_hotfix`.
 
         action=finish:
           1. Fetch the configured branch and the release branch.
@@ -931,11 +1001,21 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         *,
         env: dict[str, str],
     ) -> tuple[str, str, str]:
-        """Cut *version* as production plus *commit_hash*.
+        """Cut *version* as production plus the commits in *commit_hash*.
 
-        Returns ``(tag_sha, since_ref, commit_sha)``: the cherry-picked commit
-        that was tagged, the production release it was cut from, and the full
-        SHA of the commit that was picked.
+        *commit_hash* is one or more commit SHAs separated by whitespace, at
+        most :data:`MAX_HOTFIX_COMMITS`.  They are picked in the tracked
+        branch's ancestry order, whatever order they were given in, because
+        several commits of one fix touch the same lines and a later pick can
+        conflict with a commit that comes after it.  Commits unrelated to each
+        other are picked in SHA order.
+
+        Every commit is resolved before any request is spent or any pick
+        starts, so a typo in one cannot leave the others half done.
+
+        Returns ``(tag_sha, since_ref, hotfix)``: the last cherry-picked
+        commit, which is the one tagged, the production release it was cut
+        from, and the full SHAs picked, oldest first, separated by whitespace.
 
         A hotfix cannot be cut from the tracked branch the way a normal release
         is.  That branch almost always holds unreleased work, and the fix is
@@ -955,8 +1035,19 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         branch_name = f"releases/{version}"
         _run(["git", "fetch", "origin", self.branch, "--tags"], cwd=repo_path, env=env)
 
-        commit_sha = _resolve_commit(repo_path, commit_hash, env=env)
-        _consume_hotfix_request(repo_path, commit_sha, env=env)
+        commit_shas = _resolve_hotfix_commits(repo_path, commit_hash, env=env)
+        # Every request is spent, whether or not the cut then succeeds: one
+        # left behind would make every later check offer this hotfix again.
+        _consume_hotfix_requests(repo_path, commit_shas, env=env)
+        if len(commit_shas) > MAX_HOTFIX_COMMITS:
+            msg = (
+                f"A hotfix carries at most {MAX_HOTFIX_COMMITS} commits and "
+                f"{len(commit_shas)} were requested. A hotfix is production "
+                "plus a fix; release normally instead."
+            )
+            raise RuntimeError(msg)
+        commit_shas = _order_by_ancestry(repo_path, commit_shas, env=env)
+        hotfix = " ".join(commit_shas)
 
         in_flight = _get_in_flight_release_version(repo_path, env=env)
         if in_flight and in_flight != version:
@@ -974,22 +1065,14 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         base_tag = prior_tags[-1]
 
         if version in tags:
-            # A retrigger of a cut that completed.  Re-cherry-picking would
-            # mint a new SHA, so identify the tagged commit by the trailer
-            # `cherry-pick -x` wrote instead.
-            tag_sha = _run(
-                ["git", "rev-list", "-n1", version], cwd=repo_path, env=env
-            ).strip()
-            message = _run(
-                ["git", "log", "-1", "--format=%B", tag_sha], cwd=repo_path, env=env
+            # A retrigger of a cut that completed.  Its base is the release
+            # just before it, as when it was cut, not the newest: a release
+            # cut since would be no base of it.
+            index = tags.index(version)
+            base_tag = tags[index - 1] if index > 0 else base_tag
+            return self._existing_hotfix(
+                repo_path, version, base_tag, commit_shas, env=env
             )
-            if f"(cherry picked from commit {commit_sha})" not in message:
-                msg = (
-                    f"Tag {version!r} already exists at {tag_sha}, which is not a "
-                    f"hotfix of {commit_sha}. Refusing to overwrite it."
-                )
-                raise RuntimeError(msg)
-            return tag_sha, base_tag, commit_sha
         if in_flight == version:
             self._clear_partial_cut(repo_path, version, env=env)
 
@@ -1003,12 +1086,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             raise RuntimeError(msg)
         base_sha = self._production_commit(repo_path, base_tag, env=env)
 
-        if _is_ancestor(repo_path, commit_sha, base_sha, env=env):
-            msg = (
-                f"{commit_sha} is already in production ({base_tag}); there is "
-                "nothing to hotfix."
-            )
-            raise RuntimeError(msg)
+        _refuse_shipped_commits(repo_path, commit_shas, base_sha, base_tag, env=env)
 
         # Set the bump_version_task changes aside so the tree is clean for the
         # checkout and cherry-pick, then put them back on top.
@@ -1030,7 +1108,14 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             )
         _run(["git", "checkout", "-b", branch_name, base_sha], cwd=repo_path, env=env)
 
-        tag_sha = _cherry_pick(repo_path, commit_sha, onto=base_tag, env=env)
+        for index, commit_sha in enumerate(commit_shas, start=1):
+            tag_sha = _cherry_pick(
+                repo_path,
+                commit_sha,
+                onto=base_tag,
+                position=(index, len(commit_shas)),
+                env=env,
+            )
 
         if had_stash:
             try:
@@ -1047,7 +1132,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         self._commit_and_push_cut(
             repo_path, version, branch_name, tag_sha, commits, env=env
         )
-        return tag_sha, base_tag, commit_sha
+        return tag_sha, base_tag, hotfix
 
     def _production_commit(
         self, repo_path: Path, release_tag: str, *, env: dict[str, str]
@@ -1767,8 +1852,115 @@ def _get_in_flight_release_version(
     return sorted(versions, key=_parse_version_tuple)[-1]
 
 
-def _pending_hotfix_request(repo_path: Path, *, env: dict[str, str]) -> str | None:
-    """Return the commit SHA of the newest pending hotfix request, or None.
+def _shallow_commits(repo_path: Path, *, env: dict[str, str]) -> set[str]:
+    """Return the commits at the clone's boundary, whose parents it lacks."""
+    shallow = Path(
+        _run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-path", "shallow"],
+            cwd=repo_path,
+            env=env,
+        ).strip()
+    )
+    return set(shallow.read_text().split()) if shallow.exists() else set()
+
+
+def _picks_on_base(
+    repo_path: Path, tag_sha: str, base_tag: str, *, env: dict[str, str]
+) -> list[str] | None:
+    """Return what the run of cherry-picks ending at *tag_sha* picked, oldest first.
+
+    Empty unless *tag_sha* ends a run of at most :data:`MAX_HOTFIX_COMMITS`
+    ``cherry-pick -x`` commits that starts on what *base_tag*'s release was
+    built from: its ``Release <base>`` commit, or the tag itself.  ``None``
+    where the clone's boundary hides what is needed to tell.
+    """
+    try:
+        base_sha = (
+            _run(["git", "rev-list", "-n1", base_tag], cwd=repo_path, env=env).strip()
+            if VERSION_PATTERN.match(base_tag)
+            else ""
+        )
+    except subprocess.CalledProcessError:
+        base_sha = ""
+    if not base_sha:
+        return []
+    shallow = _shallow_commits(repo_path, env=env)
+    picks: list[str] = []
+    current = tag_sha
+    for _ in range(MAX_HOTFIX_COMMITS):
+        message = _run(
+            ["git", "log", "-1", "--format=%B", current], cwd=repo_path, env=env
+        )
+        picked = CHERRY_PICK_TRAILER.findall(message)
+        if not picked:
+            return []
+        picks.append(picked[-1])
+        try:
+            # The parent, its own parents, and its subject.
+            shas, _, subject = (
+                _run(
+                    ["git", "log", "-1", "--format=%H %P%x09%s", f"{current}^"],
+                    cwd=repo_path,
+                    env=env,
+                )
+                .strip()
+                .partition("\t")
+            )
+        except subprocess.CalledProcessError:
+            # Its parent is past the clone, or it is the repository's first
+            # commit and not provably a hotfix.
+            return None if current in shallow else []
+        parent, *grandparents = shas.split() or [""]
+        if parent != base_sha and parent in shallow:
+            # The clone shows no parents of it, so it cannot be told from the
+            # base's Release commit, nor walked past.
+            return None
+        if parent == base_sha or (
+            grandparents[:1] == [base_sha] and subject == f"Release {base_tag}"
+        ):
+            return picks[::-1]
+        current = parent
+    # More picks than a hotfix may carry, and still not on the base.
+    return []
+
+
+def _refuse_shipped_commits(
+    repo_path: Path,
+    commit_shas: list[str],
+    base_sha: str,
+    base_tag: str,
+    *,
+    env: dict[str, str],
+) -> None:
+    """Refuse a hotfix with any commit production already runs.
+
+    The whole request is refused, not just those commits: dropping them
+    silently would cut a hotfix that is not the one asked for.
+
+    :raises RuntimeError: If any of *commit_shas* is in *base_sha*'s history.
+    """
+    shipped = [
+        sha for sha in commit_shas if _is_ancestor(repo_path, sha, base_sha, env=env)
+    ]
+    if not shipped:
+        return
+    msg = (
+        f"{', '.join(shipped)} {'is' if len(shipped) == 1 else 'are'} "
+        f"already in production ({base_tag}); "
+        + (
+            "there is nothing to hotfix."
+            if len(shipped) == len(commit_shas)
+            else "drop them from the request."
+        )
+    )
+    raise RuntimeError(msg)
+
+
+def _pending_hotfix_requests(repo_path: Path, *, env: dict[str, str]) -> list[str]:
+    """Return the commit SHAs of every pending hotfix request, in pick order.
+
+    Together they are one hotfix: the release bot pushes one tag per commit of
+    a fix, and ``action=create`` spends them all.  Empty when none is pending.
 
     Tags under ``hotfix/`` whose name is not a full SHA are ignored:
     ``action=create`` deletes a request by that name, so it could never
@@ -1778,45 +1970,133 @@ def _pending_hotfix_request(repo_path: Path, *, env: dict[str, str]) -> str | No
         [
             "git",
             "for-each-ref",
-            "--sort=-creatordate",
             "--format=%(refname:strip=2)",
             f"refs/tags/{HOTFIX_TAG_PREFIX}",
         ],
         cwd=repo_path,
         env=env,
     )
+    requested = []
     for name in output.splitlines():
         match = HOTFIX_REQUEST_PATTERN.match(name.strip())
         if match:
-            return match.group(1)
-    return None
+            requested.append(match.group(1))
+    return _order_by_ancestry(repo_path, requested, env=env)
 
 
-def _consume_hotfix_request(
-    repo_path: Path, commit_sha: str, *, env: dict[str, str]
-) -> None:
-    """Delete the ``hotfix/<commit_sha>`` request tag from the remote.
+def _resolve_hotfix_commits(
+    repo_path: Path, commit_hash: str, *, env: dict[str, str]
+) -> list[str]:
+    """Return the full SHA of every commit in *commit_hash*, or refuse them all.
 
-    The request is spent whether or not the cut then succeeds.  Left behind,
-    a refused or failed request would make every later check offer this hotfix
-    again instead of a normal release.  The delete itself is best-effort,
-    because there may be no request at all (a pipeline passing ``commit_hash``
-    directly), so the remote is re-read afterwards: a request that survives,
-    e.g. behind a protected-tag rule, stops the cut here.
+    *commit_hash* is whitespace-separated.  A commit named twice, or by two
+    names for the same commit, counts once.
 
-    :raises RuntimeError: If the request tag is still on the remote.
+    :raises RuntimeError: If nothing was named, or any commit cannot be found.
+        Every one that cannot is named, so a request is fixed in one go.
     """
-    ref = f"refs/tags/{HOTFIX_TAG_PREFIX}{commit_sha}"
-    with suppress(subprocess.CalledProcessError):
-        _run(["git", "push", "origin", "--delete", ref], cwd=repo_path, env=env)
-    survivor = _run(
-        ["git", "ls-remote", "--tags", "origin", ref], cwd=repo_path, env=env
-    )
-    if survivor.strip():
+    resolved: list[str] = []
+    missing: list[str] = []
+    for ref in dict.fromkeys(commit_hash.split()):
+        try:
+            sha = _resolve_commit(repo_path, ref, env=env)
+        except subprocess.CalledProcessError:
+            missing.append(ref)
+            continue
+        if sha not in resolved:
+            resolved.append(sha)
+    if missing:
+        msg = f"Cannot find commit {', '.join(missing)} to hotfix."
+        raise RuntimeError(msg)
+    if not resolved:
+        msg = "A hotfix needs at least one commit."
+        raise RuntimeError(msg)
+    return resolved
+
+
+def _order_by_ancestry(
+    repo_path: Path, shas: list[str], *, env: dict[str, str]
+) -> list[str]:
+    """Return *shas* with every commit after the ones it is built on.
+
+    That is the order the commits landed on the tracked branch, so each pick
+    finds the lines it changes the way its author left them.  Commits with no
+    ancestry between them are ordered by SHA, so the same set always yields the
+    same order: check offers it as a Concourse version, and a version that
+    changed between checks would be a new version every time.
+
+    Ancestry is read from this clone, so two commits that are only related
+    beyond its depth read as unrelated.
+    """
+    remaining = sorted(set(shas))
+    built_on = {
+        sha: {
+            other
+            for other in remaining
+            if other != sha and _is_ancestor(repo_path, other, sha, env=env)
+        }
+        for sha in remaining
+    }
+    ordered: list[str] = []
+    while remaining:
+        # A commit has an ancestor among those still waiting only while that
+        # ancestor has not been placed, and ancestry cannot loop, so there is
+        # always one to place.
+        sha = next(s for s in remaining if not built_on[s].intersection(remaining))
+        ordered.append(sha)
+        remaining.remove(sha)
+    return ordered
+
+
+def _hotfix_commit_info(
+    repo_path: Path, shas: list[str], *, env: dict[str, str]
+) -> tuple[int, str]:
+    """Return (commit_count, comma-separated unique author emails) for *shas*.
+
+    Each commit is read on its own, as ``<sha>^!``: a range over several would
+    hide a commit whose parent is also asked for.
+    """
+    count = 0
+    authors: set[str] = set()
+    for sha in shas:
+        commit_count, emails = _commit_info(repo_path, f"{sha}^!", env=env)
+        count += commit_count
+        authors.update(email for email in emails.split(",") if email)
+    return count, ",".join(sorted(authors))
+
+
+def _consume_hotfix_requests(
+    repo_path: Path, commit_shas: list[str], *, env: dict[str, str]
+) -> None:
+    """Delete the ``hotfix/<sha>`` request tag of every commit from the remote.
+
+    The requests are spent whether or not the cut then succeeds.  Left behind,
+    a refused or failed request would make every later check offer this hotfix
+    again instead of a normal release.  Each delete is best-effort, because
+    there may be no request at all (a pipeline passing ``commit_hash``
+    directly), so the remote is re-read afterwards.  Every delete is tried
+    before that, so one request that survives, e.g. behind a protected-tag
+    rule, does not leave the others in place too; any survivor stops the cut.
+
+    :raises RuntimeError: If any request tag is still on the remote.
+    """
+    refs = [f"refs/tags/{HOTFIX_TAG_PREFIX}{sha}" for sha in commit_shas]
+    for ref in refs:
+        with suppress(subprocess.CalledProcessError):
+            _run(["git", "push", "origin", "--delete", ref], cwd=repo_path, env=env)
+    survivors = [
+        ref
+        for ref in refs
+        if _run(
+            ["git", "ls-remote", "--tags", "origin", ref], cwd=repo_path, env=env
+        ).strip()
+    ]
+    if survivors:
+        names = ", ".join(survivors)
         msg = (
-            f"Could not delete the hotfix request {ref} from the remote. Refusing "
-            "to continue: left in place, every later check would offer this "
-            "hotfix again."
+            f"Could not delete the hotfix request {names} from the remote. "
+            "Refusing to continue: left in place, every later check would "
+            "offer this hotfix again."
         )
         raise RuntimeError(msg)
 
@@ -1895,14 +2175,25 @@ def _is_ancestor(
 
 
 def _cherry_pick(
-    repo_path: Path, commit_sha: str, *, onto: str, env: dict[str, str]
+    repo_path: Path,
+    commit_sha: str,
+    *,
+    onto: str,
+    env: dict[str, str],
+    position: tuple[int, int] = (1, 1),
 ) -> str:
     """Cherry-pick *commit_sha* onto HEAD with ``-x`` and return the new HEAD.
 
     A merge commit is picked against its first parent: the diff the merge
     brought into the branch it landed on.
 
-    :raises RuntimeError: If the pick does not apply to *onto*.
+    *position* is ``(index, total)`` of this pick in a hotfix of several
+    commits, counting from 1.  A pick that comes out empty is refused like one
+    that conflicts, never skipped: a skipped commit would leave the request
+    and what was cut disagreeing about what the hotfix contains.
+
+    :raises RuntimeError: If the pick does not apply on top of *onto* and the
+        picks before it.
     """
     parents = _run(
         ["git", "rev-list", "--parents", "-n1", commit_sha], cwd=repo_path, env=env
@@ -1915,12 +2206,40 @@ def _cherry_pick(
             env=env,
         )
     except subprocess.CalledProcessError as exc:
+        # A conflict leaves unmerged paths; a pick with nothing left to apply
+        # leaves none.
+        conflicted = _run(
+            ["git", "diff", "--name-only", "--diff-filter=U"],
+            cwd=repo_path,
+            env=env,
+        ).strip()
         with suppress(subprocess.CalledProcessError):
             _run(["git", "cherry-pick", "--abort"], cwd=repo_path, env=env)
-        msg = (
-            f"Cherry-picking {commit_sha} onto {onto} failed. It does not apply "
-            "to what production runs; release it normally instead."
+        index, total = position
+        applied_to = (
+            "what production runs"
+            if index == 1
+            else f"what production runs plus the {index - 1} commit(s) picked before it"
         )
+        if total == 1:
+            msg = (
+                f"Cherry-picking {commit_sha} onto {onto} failed. It does not apply "
+                "to what production runs; release it normally instead."
+            )
+        elif conflicted:
+            msg = (
+                f"Cherry-picking {commit_sha} (commit {index} of {total}) onto "
+                f"{onto} failed: it conflicts with {applied_to}. Commits are picked in "
+                "the order they landed on the branch, so it may depend on a "
+                "commit that is not in the request; add that commit, or release "
+                "normally instead."
+            )
+        else:
+            msg = (
+                f"Cherry-picking {commit_sha} (commit {index} of {total}) onto "
+                f"{onto} changed nothing: {applied_to} already has its change. "
+                "Drop it from the request."
+            )
         raise RuntimeError(msg) from exc
     return _run(["git", "rev-parse", "HEAD"], cwd=repo_path, env=env).strip()
 
