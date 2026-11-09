@@ -32,6 +32,8 @@ jobs:
           test_path: resources/github-deployments/tests/
         - name: ol-concourse-release
           test_path: resources/release/tests/
+        - name: ol-concourse-fastly
+          test_path: resources/fastly/tests/
 
     permissions:
       contents: read

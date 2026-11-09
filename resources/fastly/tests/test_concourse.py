@@ -364,7 +364,7 @@ def test_put_purge_all_service_id_override(
 
 
 def test_put_surrogate_key(resource: FastlyResource, tmp_path: Path) -> None:
-    """Put with mode='surrogate_key' calls purge_tag with correct arguments."""
+    """Put with mode='surrogate_key' calls purge_tag without the soft-purge header."""
     purge_mock = _mock_purge_client()
     with (
         patch("concourse.purge_api.PurgeApi", return_value=purge_mock),
@@ -377,9 +377,7 @@ def test_put_surrogate_key(resource: FastlyResource, tmp_path: Path) -> None:
             mode="surrogate_key",
             surrogate_key="html-pages",
         )
-    purge_mock.purge_tag.assert_called_once_with(
-        SERVICE_ID, "html-pages", fastly_soft_purge=0
-    )
+    purge_mock.purge_tag.assert_called_once_with(SERVICE_ID, "html-pages")
     assert meta["surrogate_key"] == "html-pages"
     assert (
         meta["purged"]
@@ -387,24 +385,54 @@ def test_put_surrogate_key(resource: FastlyResource, tmp_path: Path) -> None:
     )
 
 
-def test_put_surrogate_key_soft(resource: FastlyResource, tmp_path: Path) -> None:
-    """Put with mode='surrogate_key' and soft=True passes fastly_soft_purge=1."""
+@pytest.mark.parametrize(
+    ("params", "method", "expected_args", "expected_kwargs"),
+    [
+        (
+            {"mode": "surrogate_key", "surrogate_key": "html-pages"},
+            "purge_tag",
+            (SERVICE_ID, "html-pages"),
+            {},
+        ),
+        (
+            {"mode": "surrogate_keys", "surrogate_keys": ["key1", "key2"]},
+            "bulk_purge_tag",
+            (SERVICE_ID,),
+            {"surrogate_key": "key1 key2"},
+        ),
+        (
+            {"mode": "url", "url": "https://www.example.com/page"},
+            "purge_single_url",
+            ("https://www.example.com/page",),
+            {},
+        ),
+    ],
+    ids=["surrogate_key", "surrogate_keys", "url"],
+)
+def test_put_soft_purge_sends_header(
+    resource: FastlyResource,
+    tmp_path: Path,
+    params: dict[str, Any],
+    method: str,
+    expected_args: tuple[object, ...],
+    expected_kwargs: dict[str, object],
+) -> None:
+    """soft=True passes fastly_soft_purge=1 in every mode that supports it."""
     purge_mock = _mock_purge_client()
     with (
         patch("concourse.purge_api.PurgeApi", return_value=purge_mock),
         patch("concourse.fastly.ApiClient"),
         patch("concourse.fastly.Configuration"),
     ):
-        resource.publish_new_version(
-            tmp_path,
-            mock_build_metadata(),
-            mode="surrogate_key",
-            surrogate_key="html-pages",
-            soft=True,
+        _, meta = resource.publish_new_version(
+            tmp_path, mock_build_metadata(), soft=True, **params
         )
-    purge_mock.purge_tag.assert_called_once_with(
-        SERVICE_ID, "html-pages", fastly_soft_purge=1
-    )
+    call = getattr(purge_mock, method)
+    call.assert_called_once_with(*expected_args, **expected_kwargs, fastly_soft_purge=1)
+    # fastly-py type-checks the header as int, so a bool (== 1) would pass this
+    # mock and fail the real client.
+    assert type(call.call_args.kwargs["fastly_soft_purge"]) is int
+    assert meta["soft"] == "true"
 
 
 def test_put_surrogate_keys_batch(resource: FastlyResource, tmp_path: Path) -> None:
@@ -422,9 +450,7 @@ def test_put_surrogate_keys_batch(resource: FastlyResource, tmp_path: Path) -> N
             surrogate_keys=["key1", "key2", "key3"],
         )
     purge_mock.bulk_purge_tag.assert_called_once_with(
-        SERVICE_ID,
-        surrogate_key="key1 key2 key3",
-        fastly_soft_purge=0,
+        SERVICE_ID, surrogate_key="key1 key2 key3"
     )
     assert meta["surrogate_keys"] == "key1 key2 key3"
     assert (
@@ -448,7 +474,7 @@ def test_put_url_purge(resource: FastlyResource, tmp_path: Path) -> None:
             mode="url",
             url=target_url,
         )
-    purge_mock.purge_single_url.assert_called_once_with(target_url, fastly_soft_purge=0)
+    purge_mock.purge_single_url.assert_called_once_with(target_url)
     assert meta["url"] == target_url
     assert meta["purged"] == f"hard URL purge of {target_url}"
 
