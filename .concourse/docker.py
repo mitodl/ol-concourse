@@ -54,12 +54,19 @@ _REPO_ROOT = Path(__file__).parent.parent
 # Astral stopped publishing the `pythonX.Y-*` variants after uv 0.9.30 -- there is no
 # `0.13.8-python3.13-bookworm` -- so `python3.13-bookworm` is frozen on a uv from that
 # release, not a lagging alias. The `-debian-slim` line tracks current uv but ships no
-# interpreter, so UV_PYTHON below pins the one uv fetches instead of taking the newest.
+# interpreter, so UV_PYTHON pins the one uv fetches instead of taking the newest.
+#
+# Both are Renovate-managed through the marker comments: a pinned version with nothing
+# bumping it is how the tag this replaces ended up a year stale.
+# renovate: datasource=docker depName=uv packageName=ghcr.io/astral-sh/uv
+UV_VERSION = "0.13.8"
+# renovate: datasource=docker depName=python
+UV_PYTHON = "3.13"
+
 UV_IMAGE = AnonymousResource(
     type="registry-image",
-    source={"repository": "ghcr.io/astral-sh/uv", "tag": "0.13.8-debian-slim"},
+    source={"repository": "ghcr.io/astral-sh/uv", "tag": f"{UV_VERSION}-debian-slim"},
 )
-UV_PYTHON = "3.13"
 
 OCI_BUILD_IMAGE = AnonymousResource(
     type="registry-image",
