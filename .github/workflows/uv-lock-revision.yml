@@ -39,10 +39,10 @@ jobs:
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
       with:
-        # Kept in every repository, public or private. The autofix templates let private
-        # repositories drop this because autofix-ci/action runs `git fetch origin <sha>`,
-        # which needs the persisted token; this workflow only runs `git ls-files` against
-        # the checkout it already has, so persisting credentials would buy nothing.
+          # Kept in every repository, public or private. The autofix templates let private
+          # repositories drop this because autofix-ci/action runs `git fetch origin <sha>`,
+          # which needs the persisted token; this workflow only runs `git ls-files` against
+          # the checkout it already has, so persisting credentials would buy nothing.
         persist-credentials: false
     - name: Every uv.lock is on the expected revision
       id: revision
@@ -52,7 +52,20 @@ jobs:
         count=0
         while IFS= read -r -d '' lock; do
           count=$((count + 1))
-          actual="$(awk -F' = ' '/^revision = /{print $2; exit}' "$lock")"
+          if [ ! -f "$lock" ]; then
+            echo "::error file=$lock::tracked by git but missing from the checkout"
+            status=1
+            continue
+          fi
+          # Tolerate CRLF, trailing spaces and loose spacing around `=`: a mismatch
+          # the eye cannot see ("revision is 5, expected 5") is worse than no check.
+          actual="$(awk '/^revision[ \t]*=/ {
+            v = $0
+            sub(/^revision[ \t]*=[ \t]*/, "", v)
+            sub(/[^0-9].*$/, "", v)
+            print v
+            exit
+          }' "$lock" 2>/dev/null)"
           if [ "$actual" != "$EXPECTED_REVISION" ]; then
             echo "::error file=$lock::lockfile revision is ${actual:-absent}, expected ${EXPECTED_REVISION}. A uv that re-resolves (uv add, uv lock --upgrade) rewrites this; change EXPECTED_REVISION only when the new format is intended."
             status=1
