@@ -39,7 +39,11 @@ jobs:
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
       with:
-        persist-credentials: false   # ADAPT: private repositories delete this block
+        # Kept in every repository, public or private. The autofix templates let private
+        # repositories drop this because autofix-ci/action runs `git fetch origin <sha>`,
+        # which needs the persisted token; this workflow only runs `git ls-files` against
+        # the checkout it already has, so persisting credentials would buy nothing.
+        persist-credentials: false
     - name: Every uv.lock is on the expected revision
       id: revision
       run: |
