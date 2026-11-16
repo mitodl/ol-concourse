@@ -1,1 +1,13 @@
-{"extends": ["local>mitodl/.github:renovate-config"]}
+{
+  "extends": ["local>mitodl/.github:renovate-config"],
+  "customManagers": [
+    {
+      "description": "Version pins in the Concourse pipeline definitions, marked with a `# renovate:` comment. Same convention as ol-infrastructure's src/bridge/lib/versions.py.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.concourse/.*\\.py$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+?) depName=(?<depName>.+?)(?: packageName=(?<packageName>.+?))?(?: registryUrl=(?<registryUrl>.+?))?(?: versioning=(?<versioning>[a-z-]+?))?\\s*.+\\s*=\\s*\"(?<currentValue>.+?)\""
+      ]
+    }
+  ]
+}
