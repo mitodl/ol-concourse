@@ -1846,6 +1846,55 @@ def test_the_release_after_a_hotfix_of_a_merge_commit_counts_none_of_it(
     assert version.version == HOTFIX, "everything shipped; nothing to release"
 
 
+def test_the_release_after_a_hotfix_of_a_merge_still_lists_unpicked_work(
+    tmp_path, world, in_production
+):
+    """Only what the picked merge brought in is left out."""
+    _git(world.dev, "pull", "-q", "--no-rebase", "origin", "main")
+    _git(world.dev, "checkout", "-q", "-b", "pr")
+    _commit(world.dev, "Fix on a branch", **{"patch.txt": "fixed\n"})
+    _git(world.dev, "checkout", "-q", "main")
+    _git(world.dev, "merge", "-q", "--no-ff", "pr", "-m", "Merge pull request #9")
+    merge = _git(world.dev, "rev-parse", "HEAD")
+    _git(world.dev, "push", "-q", "origin", "main")
+    _put(_workspace(tmp_path, world.origin), commit_hash=merge)
+    _put(_workspace(tmp_path, world.origin), action="finish")
+
+    version = _check(world)
+
+    assert version.version != HOTFIX
+    assert version.commit_count == "3"
+    commits = json.loads((_get(tmp_path, world, version) / "commits.json").read_text())
+    assert _subjects(commits) == [
+        "More unreleased work",
+        "Fix the bug",
+        "Unreleased feature",
+    ]
+
+
+def test_finishing_a_hotfix_matches_consumed_paths_literally(
+    tmp_path, world, in_production
+):
+    """A consumed name holding [ ] must not take a file it happens to match."""
+    _git(world.dev, "pull", "-q", "--no-rebase", "origin", "main")
+    (world.dev / "changelog.d").mkdir()
+    fix = _commit(
+        world.dev,
+        "Fix with a bracketed fragment",
+        **{"patch.txt": "fixed\n", "changelog.d/fix[1].md": "- Fixed\n"},
+    )
+    _commit(world.dev, "Sibling", **{"changelog.d/fix1.md": "- Fixed\n"})
+    _git(world.dev, "push", "-q", "origin", "main")
+    sources = _hotfix_tree(tmp_path, world, fix)
+    (sources / "app-source" / "changelog.d" / "fix[1].md").unlink()
+    _put(sources, commit_hash=fix)
+
+    _put(_workspace(tmp_path, world.origin), action="finish")
+
+    fragments = _git(world.origin, "ls-tree", "--name-only", "main", "changelog.d/")
+    assert fragments.split() == ["changelog.d/fix1.md"]
+
+
 def test_check_never_re_emits_an_abandoned_release(tmp_path, world, mocker):
     """Its tag is gone, so the release before it is rebuilt instead."""
     mocker.patch.object(ReleaseResource, "_reached_production", return_value=False)
