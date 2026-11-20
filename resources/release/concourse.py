@@ -1275,14 +1275,18 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             cwd=repo_path,
             env=env,
         )
-        _drop_what_the_release_commit_consumed(
-            repo_path, f"origin/{branch_name}", version, env=env
-        )
-        _run(
-            ["git", "commit", "-q", "-m", f"Merge releases/{version}"],
-            cwd=repo_path,
-            env=env,
-        )
+        # No MERGE_HEAD means the branch was already merged: an earlier finish
+        # pushed the merge and then failed to delete the branch.  There is
+        # nothing to commit, and pushing the unchanged branch is a no-op.
+        if _merge_in_progress(repo_path, env=env):
+            _drop_what_the_release_commit_consumed(
+                repo_path, f"origin/{branch_name}", version, env=env
+            )
+            _run(
+                ["git", "commit", "-q", "-m", f"Merge releases/{version}"],
+                cwd=repo_path,
+                env=env,
+            )
         _run_push(["git", "push", "origin", self.branch], cwd=repo_path, env=env)
         # Remove the release branch so subsequent check calls no longer
         # see a release as in-flight.
@@ -2380,7 +2384,23 @@ def _already_picked(
         cwd=repo_path,
         env=env,
     )
-    return frozenset(CHERRY_PICK_TRAILER.findall(messages))
+    picked = set(CHERRY_PICK_TRAILER.findall(messages))
+    # A picked merge commit (cherry-pick -m 1) shipped the branch it merged
+    # too, which the commit count reads past the first-parent line.  Only
+    # merges on the range's line are expanded; the clone has those.
+    for sha in sorted(picked & set(line)):
+        parents = _run(
+            ["git", "rev-list", "--parents", "-n1", sha], cwd=repo_path, env=env
+        ).split()[1:]
+        if len(parents) > 1:
+            picked.update(
+                _run(
+                    ["git", "rev-list", f"{parents[0]}..{sha}"],
+                    cwd=repo_path,
+                    env=env,
+                ).split()
+            )
+    return frozenset(picked)
 
 
 def _commit_info_all(
@@ -2466,6 +2486,19 @@ def _first_parent_of(repo_path: Path, sha: str, *, env: dict[str, str]) -> str:
         return ""
 
 
+def _merge_in_progress(repo_path: Path, *, env: dict[str, str]) -> bool:
+    """Return whether a ``--no-commit`` merge is waiting to be committed."""
+    try:
+        _run(
+            ["git", "rev-parse", "--quiet", "--verify", "MERGE_HEAD"],
+            cwd=repo_path,
+            env=env,
+        )
+    except subprocess.CalledProcessError:
+        return False
+    return True
+
+
 def _drop_what_the_release_commit_consumed(
     repo_path: Path, branch_ref: str, version: str, *, env: dict[str, str]
 ) -> None:
@@ -2509,14 +2542,16 @@ def _drop_what_the_release_commit_consumed(
         if not path:
             continue
         old_blob = meta.split()[2]
+        # :(literal) so a name holding *, ? or [ matches only itself.
+        literal = f":(literal){path}"
         staged = _run(
-            ["git", "ls-files", "--stage", "-z", "--", path],
+            ["git", "ls-files", "--stage", "-z", "--", literal],
             cwd=repo_path,
             env=env,
         ).strip("\0")
         # "<mode> <blob> <stage>\t<path>", stage 0 once merged cleanly.
         if staged and staged.split()[1] == old_blob:
-            _run(["git", "rm", "-q", "--", path], cwd=repo_path, env=env)
+            _run(["git", "rm", "-q", "--", literal], cwd=repo_path, env=env)
 
 
 def _first_parent_commits(

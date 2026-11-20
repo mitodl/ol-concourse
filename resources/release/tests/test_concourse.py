@@ -1801,6 +1801,51 @@ def test_finishing_a_hotfix_keeps_a_consumed_file_edited_on_main(
     assert _git(world.origin, "show", "main:changelog.d/fix.md") == "- Fixed it better"
 
 
+def test_finish_rerun_after_main_was_pushed_deletes_the_branch(
+    tmp_path, world, in_production
+):
+    """A finish that pushed main but not the branch delete must not wedge."""
+    _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+    tip = _git(world.origin, "rev-parse", f"releases/{HOTFIX}")
+    _put(_workspace(tmp_path, world.origin), action="finish")
+    merged = _git(world.origin, "rev-parse", "main")
+    _git(world.origin, "branch", f"releases/{HOTFIX}", tip)
+
+    _put(_workspace(tmp_path, world.origin), action="finish")
+
+    assert _git(world.origin, "rev-parse", "main") == merged
+    assert not _git(world.origin, "branch", "--list", f"releases/{HOTFIX}")
+
+
+def test_the_release_after_a_hotfix_of_a_merge_commit_counts_none_of_it(
+    tmp_path, world, in_production
+):
+    """The branch a picked merge brought in shipped with it."""
+    _git(world.dev, "pull", "-q", "--no-rebase", "origin", "main")
+    _git(world.dev, "checkout", "-q", "-b", "pr")
+    _commit(world.dev, "Fix on a branch", **{"patch.txt": "fixed\n"})
+    _git(world.dev, "checkout", "-q", "main")
+    _git(world.dev, "merge", "-q", "--no-ff", "pr", "-m", "Merge pull request #9")
+    merge = _git(world.dev, "rev-parse", "HEAD")
+    _git(world.dev, "push", "-q", "origin", "main")
+    unreleased = [
+        sha
+        for sha in _git(
+            world.origin, "rev-list", "--first-parent", f"{PROD}..main"
+        ).split()
+        if not _git(world.origin, "log", "-1", "--format=%s", sha).startswith(
+            "Merge rel"
+        )
+    ]
+    assert merge in unreleased
+    _put(_workspace(tmp_path, world.origin), commit_hash=" ".join(unreleased))
+    _put(_workspace(tmp_path, world.origin), action="finish")
+
+    version = _check(world)
+
+    assert version.version == HOTFIX, "everything shipped; nothing to release"
+
+
 def test_check_never_re_emits_an_abandoned_release(tmp_path, world, mocker):
     """Its tag is gone, so the release before it is rebuilt instead."""
     mocker.patch.object(ReleaseResource, "_reached_production", return_value=False)
