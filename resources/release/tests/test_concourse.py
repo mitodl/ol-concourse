@@ -531,8 +531,11 @@ def test_fetch_new_versions_semver_fallback_used_when_no_date_tags(
         "",  # for-each-ref refs/tags/hotfix/ (no pending hotfix)
         # semver fallback branch: git tag --list again for _get_semver_tags
         "v1.2.3\nv1.3.0\nbad-tag",
-        # _commit_info_range for v1.3.0..head_sha
-        "dev@example.com\nalice@example.com",
+        # _commit_info_range for v1.3.0..head_sha: the first-parent line
+        # _already_picked bounds its search with (empty, so no search), then
+        # the log itself
+        "",
+        "a1|dev@example.com|work\na2|alice@example.com|work",
     ]
     idx = 0
 
@@ -574,7 +577,8 @@ def test_fetch_new_versions_semver_fallback_ignored_when_date_tags_exist(
         "",  # git branch -r (no in-flight)
         "",  # git tag --list abandoned/* (none abandoned)
         "",  # for-each-ref refs/tags/hotfix/ (no pending hotfix)
-        "dev@example.com|new work",  # git log 2026.4.14.1..HEAD
+        "",  # _already_picked: rev-list --first-parent (empty, no search)
+        "a1|dev@example.com|new work",  # git log 2026.4.14.1..HEAD
         tag_sha,  # _cut: rev-list -n1 2026.4.14.1
         "v1.3.0\n2026.4.14.1",  # _cut: semver baseline of the first cut
     ]
@@ -742,7 +746,7 @@ def _check_git_stub(
     is what made the previous positional-output fixtures unmaintainable.
 
     *logs* maps a ``git log`` rev-range (``"a..b"`` or a bare ref) to that
-    call's output in ``%ae|%s`` format; ranges not listed produce no commits.
+    call's output in ``%H|%ae|%s`` format; ranges not listed produce no commits.
     """
     logs = logs or {}
 
@@ -763,8 +767,11 @@ def _check_git_stub(
 
 
 def _log(*commits: tuple[str, str]) -> str:
-    """Render ``(email, subject)`` pairs as ``git log --format=%ae|%s`` output."""
-    return "\n".join(f"{email}|{subject}" for email, subject in commits)
+    """Render ``(email, subject)`` pairs as ``git log --format=%H|%ae|%s`` output."""
+    return "\n".join(
+        f"{index:040x}|{email}|{subject}"
+        for index, (email, subject) in enumerate(commits, 1)
+    )
 
 
 @patch("concourse._run")
@@ -878,7 +885,9 @@ def test_download_version_writes_all_outputs(
             f"{'b' * 40}|alice@example.com|Alice Author|Add feature",
         ]
     )
-    outputs = ["", "", git_log_output]
+    # clone, fetch, the first-parent line _already_picked reads (empty, so it
+    # searches nothing), then the log.
+    outputs = ["", "", "", git_log_output]
     call_index = 0
 
     def run_side_effect(cmd, **kwargs):
@@ -1631,6 +1640,103 @@ def test_check_re_emits_a_finished_hotfix_too(tmp_path, world, in_production):
     _put(_workspace(tmp_path, world.origin), action="finish")
 
     assert _cuts(world)[-1] == created
+
+
+def _subjects(commits: list[dict[str, Any]]) -> list[str]:
+    return [c["message"] for c in commits]
+
+
+def _get(tmp_path: Path, world: _World, version: ReleaseVersion) -> Path:
+    dest = Path(tempfile.mkdtemp(dir=tmp_path))
+    make_resource(uri=f"file://{world.origin}").download_version(
+        version, dest, MagicMock()
+    )
+    return dest
+
+
+@pytest.mark.parametrize("finished", [True, False], ids=["finished", "in-flight"])
+def test_the_release_after_a_hotfix_does_not_list_the_fix_again(
+    tmp_path, world, in_production, finished
+):
+    """The hotfix shipped a copy of the fix; the original is not unreleased work.
+
+    Listing it again put the fix in the next release's changelog and checklist
+    a second time and mentioned its author again.
+    """
+    _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+    if finished:
+        _put(_workspace(tmp_path, world.origin), action="finish")
+
+    version = _check(world)
+
+    assert version.since == HOTFIX
+    assert version.commit_count == "2"
+    dest = _get(tmp_path, world, version)
+    commits = json.loads((dest / "commits.json").read_text())
+    assert _subjects(commits) == ["More unreleased work", "Unreleased feature"]
+    assert "Fix the bug" not in (dest / "changelog_entry.md").read_text()
+    assert "Fix the bug" not in (dest / "checklist.md").read_text()
+
+
+def test_the_release_after_two_hotfixes_lists_neither_fix(
+    tmp_path, world, in_production
+):
+    """A hotfix of a hotfix carries the first one's picks in its ancestry too."""
+    _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+    _put(_workspace(tmp_path, world.origin), action="finish")
+    _git(world.dev, "pull", "-q", "--no-rebase", "origin", "main")
+    second_fix = _commit(world.dev, "Fix it again", **{"app.txt": "fixed twice\n"})
+    _git(world.dev, "push", "-q", "origin", "main")
+    second = "2026.9.10.2"
+    _put(_workspace(tmp_path, world.origin, version=second), commit_hash=second_fix)
+    _put(_workspace(tmp_path, world.origin, version=second), action="finish")
+
+    version = _check(world)
+
+    assert version.since == second
+    commits = json.loads((_get(tmp_path, world, version) / "commits.json").read_text())
+    assert _subjects(commits) == ["More unreleased work", "Unreleased feature"]
+
+
+def test_a_hotfix_of_everything_unreleased_leaves_nothing_to_release(
+    tmp_path, world, in_production
+):
+    """With every commit shipped by the hotfix, check offers no new release."""
+    unreleased = _git(world.origin, "rev-list", f"{world.prod_sha}..main").split()
+    unreleased = [
+        sha
+        for sha in unreleased
+        if not _git(world.origin, "log", "-1", "--format=%s", sha).startswith("Merge")
+    ]
+    _put(_workspace(tmp_path, world.origin), commit_hash=" ".join(unreleased))
+    _put(_workspace(tmp_path, world.origin), action="finish")
+
+    version = _check(world)
+
+    assert version.version == HOTFIX, "no new release for work already shipped"
+
+
+def test_a_normal_release_after_a_hotfix_leaves_the_fix_out_of_its_changelog(
+    tmp_path, world, in_production
+):
+    """The CHANGELOG.md entry that create writes is built from the same range."""
+    _put(_workspace(tmp_path, world.origin), commit_hash=world.fix_sha)
+    _put(_workspace(tmp_path, world.origin), action="finish")
+    nxt = "2026.9.10.2"
+
+    make_resource(changelog_style="cumulative").publish_new_version(
+        _workspace(tmp_path, world.origin, version=nxt),
+        MagicMock(),
+        action="create",
+        repo_dir="app-source",
+        version_file="release/version",
+    )
+
+    changelog = _git(world.origin, "show", f"releases/{nxt}:CHANGELOG.md")
+    entry = changelog.split(f"## [{nxt}]")[1].split("## [")[0]
+    assert "Unreleased feature" in entry
+    assert "More unreleased work" in entry
+    assert "Fix the bug" not in entry
 
 
 def test_check_never_re_emits_an_abandoned_release(tmp_path, world, mocker):
@@ -3062,9 +3168,9 @@ def test_parse_commit_log_drops_release_machinery_commits():
 def test_commit_info_range_excludes_release_machinery(mock_run, tmp_path):
     """Machinery commits must not inflate commit_count or the author list."""
     mock_run.return_value = (
-        "ci@example.com|Merge releases/2026.4.14.1\n"
-        "ci@example.com|Release 2026.4.14.1\n"
-        "dev@example.com|feat: something real\n"
+        "aaa111|ci@example.com|Merge releases/2026.4.14.1\n"
+        "bbb222|ci@example.com|Release 2026.4.14.1\n"
+        "ccc333|dev@example.com|feat: something real\n"
     )
     count, authors = _commit_info_range(tmp_path, "2026.4.14.1", "headsha", env={})
     assert count == 1
@@ -3073,8 +3179,8 @@ def test_commit_info_range_excludes_release_machinery(mock_run, tmp_path):
 
 @patch("concourse._run")
 def test_commit_info_range_keeps_subjects_containing_a_pipe(mock_run, tmp_path):
-    """%s is last and split with maxsplit=1, so a piped subject stays intact."""
-    mock_run.return_value = "dev@example.com|feat: support a|b syntax\n"
+    """%s is last and split off last, so a piped subject stays intact."""
+    mock_run.return_value = "aaa111|dev@example.com|feat: support a|b syntax\n"
     count, authors = _commit_info_range(tmp_path, "", "headsha", env={})
     assert count == 1
     assert authors == "dev@example.com"

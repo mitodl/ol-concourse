@@ -104,6 +104,17 @@ once a release completes. Both are excluded from `commit_count`, `authors`,
 `commits.json`, `checklist.md`, and the changelog, so a finished release does
 not immediately propose its own bookkeeping as the next release's contents.
 
+### Commits a hotfix shipped are not releasable work
+
+A hotfix ships a `cherry-pick -x` copy of each commit it carries, so the
+original commit on the tracked branch is not an ancestor of the hotfix tag and
+`<hotfix tag>..origin/<branch>` still lists it. A commit is left out of
+`commit_count`, `authors`, `commits.json`, `checklist.md` and the changelog
+when a `(cherry picked from commit <sha>)` line naming it is in the history of
+`since`. So the release after a hotfix lists only the work the hotfix did not
+ship, and does not ask the fix's author to check it off again. When the hotfix
+carried everything unreleased, check offers no new release.
+
 ### In-flight releases are reported, not obeyed
 
 `in_flight` names a release that was cut but never **finished** — a
@@ -369,7 +380,9 @@ ship everything unreleased or fail on an empty cherry-pick.
    on top as the `Release YYYY.MM.DD.N` commit, and pushes branch and tag.
 
 `since` is the production release, so the release notes list only the hotfix.
-`finish` merges the branch back as usual. The put metadata carries `hotfix`.
+`finish` merges the branch back as usual, and the next release leaves out the
+commits the hotfix carried (see
+[above](#commits-a-hotfix-shipped-are-not-releasable-work)). The put metadata carries `hotfix`.
 
 A retriggered hotfix whose tag already exists is left alone if the commits
 below the tag record exactly the requested commits in their `cherry picked
