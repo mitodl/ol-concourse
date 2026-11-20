@@ -697,19 +697,13 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             commits = []
             for sha in reversed(version.hotfix.split()):
                 commits += _first_parent_commits(repo_path, f"{sha}^!", env=env)
-        else:
-            range_spec = (
-                f"{version.since}..{version.head_sha}"
-                if version.since
-                else version.head_sha
-            )
-            commits = _first_parent_commits(repo_path, range_spec, env=env)
-
-        token = self.github_token
-        if token and self.repository:
-            commits = _enrich_with_github(commits, token, self.repository)
-
-        return commits
+            token = self.github_token
+            if token and self.repository:
+                commits = _enrich_with_github(commits, token, self.repository)
+            return commits
+        return self._collect_commits_range(
+            repo_path, version.since, version.head_sha, env=env
+        )
 
     def publish_new_version(  # noqa: PLR0913
         self,
@@ -1277,17 +1271,22 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             env=env,
         )
         _run(
-            [
-                "git",
-                "merge",
-                "--no-ff",
-                f"origin/{branch_name}",
-                "-m",
-                f"Merge releases/{version}",
-            ],
+            ["git", "merge", "--no-ff", "--no-commit", f"origin/{branch_name}"],
             cwd=repo_path,
             env=env,
         )
+        # No MERGE_HEAD means the branch was already merged: an earlier finish
+        # pushed the merge and then failed to delete the branch.  There is
+        # nothing to commit, and pushing the unchanged branch is a no-op.
+        if _merge_in_progress(repo_path, env=env):
+            _drop_what_the_release_commit_consumed(
+                repo_path, f"origin/{branch_name}", version, env=env
+            )
+            _run(
+                ["git", "commit", "-q", "-m", f"Merge releases/{version}"],
+                cwd=repo_path,
+                env=env,
+            )
         _run_push(["git", "push", "origin", self.branch], cwd=repo_path, env=env)
         # Remove the release branch so subsequent check calls no longer
         # see a release as in-flight.
@@ -1563,10 +1562,17 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
     ) -> list[dict[str, Any]]:
         """Return enriched commit list between two refs.
 
-        First-parent only; see :func:`_first_parent_commits`.
+        First-parent only; see :func:`_first_parent_commits`.  Commits
+        *since_ref* already carries as a hotfix are left out; see
+        :func:`_already_picked`.
         """
         range_spec = f"{since_ref}..{until_ref}" if since_ref else until_ref
-        commits = _first_parent_commits(repo_path, range_spec, env=env)
+        commits = _first_parent_commits(
+            repo_path,
+            range_spec,
+            env=env,
+            exclude=_already_picked(repo_path, since_ref, until_ref, env=env),
+        )
 
         token = self.github_token
         if token and self.repository:
@@ -2297,22 +2303,30 @@ def _parse_semver_tuple(tag: str) -> tuple[int, int, int]:
 
 
 def _commit_info(
-    repo_path: Path, range_spec: str, *, env: dict[str, str]
+    repo_path: Path,
+    range_spec: str,
+    *,
+    env: dict[str, str],
+    exclude: frozenset[str] = frozenset(),
 ) -> tuple[int, str]:
     """Return (commit_count, comma-separated unique author emails) for a rev range.
 
     Release-machinery commits are excluded, so a completed release does not
-    read as unreleased work.  ``%s`` is placed last and split with
-    ``maxsplit=1`` so a subject containing a literal ``|`` stays intact.
+    read as unreleased work, and so are the commits in *exclude*.  ``%s`` is
+    placed last and split off last, so a subject containing a literal ``|``
+    stays intact.
     """
-    output = _run(["git", "log", "--format=%ae|%s", range_spec], cwd=repo_path, env=env)
+    output = _run(
+        ["git", "log", "--format=%H|%ae|%s", range_spec], cwd=repo_path, env=env
+    )
     emails = []
     for raw in output.splitlines():
         line = raw.strip()
         if not line:
             continue
-        email, _, subject = line.partition("|")
-        if _is_release_machinery(subject):
+        sha, _, rest = line.partition("|")
+        email, _, subject = rest.partition("|")
+        if _is_release_machinery(subject) or sha.strip() in exclude:
             continue
         emails.append(email.strip())
     return len(emails), ",".join(sorted(set(emails)))
@@ -2321,9 +2335,72 @@ def _commit_info(
 def _commit_info_range(
     repo_path: Path, since_ref: str, until_ref: str, *, env: dict[str, str]
 ) -> tuple[int, str]:
-    """Return (commit_count, comma-separated unique author emails) for a range."""
+    """Return (commit_count, comma-separated unique author emails) for a range.
+
+    Commits *since_ref* already carries as a hotfix are not counted; see
+    :func:`_already_picked`.
+    """
     range_spec = f"{since_ref}..{until_ref}" if since_ref else until_ref
-    return _commit_info(repo_path, range_spec, env=env)
+    return _commit_info(
+        repo_path,
+        range_spec,
+        env=env,
+        exclude=_already_picked(repo_path, since_ref, until_ref, env=env),
+    )
+
+
+def _already_picked(
+    repo_path: Path, since_ref: str, until_ref: str, *, env: dict[str, str]
+) -> frozenset[str]:
+    """Return the commits *since_ref* already carries as cherry-picks.
+
+    A hotfix ships a ``cherry-pick -x`` copy of each commit it carries, not the
+    commit itself, so the original stays outside the hotfix tag's ancestry and
+    ``since_ref..until_ref`` lists it again: the release after a hotfix
+    would put the fix in its changelog and checklist a second time and
+    mention its author again.  Its change has already shipped, so it is not
+    unreleased work.
+
+    The copies are found by their ``(cherry picked from commit <sha>)``
+    lines, in the commits reachable from *since_ref* but not from the oldest
+    commit of the range's first-parent line.  No copy of a commit in the range
+    can be an ancestor of that oldest commit, which is an ancestor of every
+    other commit on that line, since a copy is made after the commit it
+    copies.  So limiting the search to those commits misses no copy, and the
+    search stays small, typically the picks of the hotfixes since that
+    commit.  A trailer naming a commit outside the range changes nothing.
+    """
+    if not since_ref:
+        return frozenset()
+    line = _run(
+        ["git", "rev-list", "--first-parent", f"{since_ref}..{until_ref}"],
+        cwd=repo_path,
+        env=env,
+    ).split()
+    if not line:
+        return frozenset()
+    messages = _run(
+        ["git", "log", "--format=%B", since_ref, "--not", line[-1]],
+        cwd=repo_path,
+        env=env,
+    )
+    picked = set(CHERRY_PICK_TRAILER.findall(messages))
+    # A picked merge commit (cherry-pick -m 1) shipped the branch it merged
+    # too, which the commit count reads past the first-parent line.  Only
+    # merges on the range's line are expanded; the clone has those.
+    for sha in sorted(picked & set(line)):
+        parents = _run(
+            ["git", "rev-list", "--parents", "-n1", sha], cwd=repo_path, env=env
+        ).split()[1:]
+        if len(parents) > 1:
+            picked.update(
+                _run(
+                    ["git", "rev-list", f"{parents[0]}..{sha}"],
+                    cwd=repo_path,
+                    env=env,
+                ).split()
+            )
+    return frozenset(picked)
 
 
 def _commit_info_all(
@@ -2409,8 +2486,80 @@ def _first_parent_of(repo_path: Path, sha: str, *, env: dict[str, str]) -> str:
         return ""
 
 
+def _merge_in_progress(repo_path: Path, *, env: dict[str, str]) -> bool:
+    """Return whether a ``--no-commit`` merge is waiting to be committed."""
+    try:
+        _run(
+            ["git", "rev-parse", "--quiet", "--verify", "MERGE_HEAD"],
+            cwd=repo_path,
+            env=env,
+        )
+    except subprocess.CalledProcessError:
+        return False
+    return True
+
+
+def _drop_what_the_release_commit_consumed(
+    repo_path: Path, branch_ref: str, version: str, *, env: dict[str, str]
+) -> None:
+    """Delete, in the merge being made, the files the release commit deleted.
+
+    A version bump can consume files, as scriv's collect deletes the changelog
+    fragments it writes into CHANGELOG.md.  For a normal release the merge
+    deletes them on the tracked branch too, since the branch was cut from it.
+    A hotfix is cut from production instead: its cherry-picks add the
+    fragments and its ``Release <version>`` commit deletes them, so relative
+    to the merge base they never existed on the release branch and the merge
+    keeps the tracked branch's copies.  The next release would then collect
+    them again and list the fix twice.  So each file the release commit
+    deleted is deleted here too, if the merge still has it byte for byte as
+    the release commit deleted it.  A file edited since on the tracked branch
+    is someone's later work and is kept.
+
+    Does nothing unless *branch_ref*'s tip is the ``Release <version>``
+    commit.
+    """
+    subject = _run(
+        ["git", "log", "-1", "--format=%s", branch_ref], cwd=repo_path, env=env
+    ).strip()
+    if subject != f"Release {version}":
+        return
+    deleted = _run(
+        [
+            "git",
+            "diff-tree",
+            "-r",
+            "-z",
+            "--diff-filter=D",
+            f"{branch_ref}^",
+            branch_ref,
+        ],
+        cwd=repo_path,
+        env=env,
+    ).split("\0")
+    # -z output alternates ":<modes> <old blob> <new blob> D" and the path.
+    for meta, path in zip(deleted[0::2], deleted[1::2], strict=False):
+        if not path:
+            continue
+        old_blob = meta.split()[2]
+        # :(literal) so a name holding *, ? or [ matches only itself.
+        literal = f":(literal){path}"
+        staged = _run(
+            ["git", "ls-files", "--stage", "-z", "--", literal],
+            cwd=repo_path,
+            env=env,
+        ).strip("\0")
+        # "<mode> <blob> <stage>\t<path>", stage 0 once merged cleanly.
+        if staged and staged.split()[1] == old_blob:
+            _run(["git", "rm", "-q", "--", literal], cwd=repo_path, env=env)
+
+
 def _first_parent_commits(
-    repo_path: Path, range_spec: str, *, env: dict[str, str]
+    repo_path: Path,
+    range_spec: str,
+    *,
+    env: dict[str, str],
+    exclude: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     """Return the commits on *range_spec*'s first-parent line, unenriched.
 
@@ -2421,13 +2570,15 @@ def _first_parent_commits(
     A merge commit is authored by whoever merged it, which need not be whoever
     wrote the change, and the checklist asks its author to sign off. So it is
     credited to the author of its second parent, the tip of the merged branch.
+
+    Commits in *exclude* are left out too.
     """
     output = _run(
         ["git", "log", "--first-parent", "--format=%H|%ae|%an|%s", range_spec],
         cwd=repo_path,
         env=env,
     )
-    commits = _parse_commit_log(output)
+    commits = [c for c in _parse_commit_log(output) if c["sha"] not in exclude]
     _credit_merged_branches(repo_path, range_spec, commits, env=env)
     return commits
 
