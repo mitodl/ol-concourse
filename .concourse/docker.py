@@ -59,7 +59,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 # Both are Renovate-managed through the marker comments: a pinned version with nothing
 # bumping it is how the tag this replaces ended up a year stale.
 # renovate: datasource=docker depName=uv packageName=ghcr.io/astral-sh/uv
-UV_VERSION = "0.13.8"
+UV_VERSION = "0.13.9"
 # renovate: datasource=docker depName=python
 UV_PYTHON = "3.13"
 
