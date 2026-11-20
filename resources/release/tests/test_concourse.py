@@ -1739,6 +1739,68 @@ def test_a_normal_release_after_a_hotfix_leaves_the_fix_out_of_its_changelog(
     assert "Fix the bug" not in entry
 
 
+def _fragment_world(world: _World) -> str:
+    """Give main a fix that adds a changelog fragment; return the fix."""
+    _git(world.dev, "pull", "-q", "--no-rebase", "origin", "main")
+    (world.dev / "changelog.d").mkdir()
+    fix = _commit(
+        world.dev,
+        "Fix with a fragment",
+        **{"patch.txt": "fixed\n", "changelog.d/fix.md": "- Fixed it\n"},
+    )
+    _commit(world.dev, "Unreleased fragment", **{"changelog.d/later.md": "- Later\n"})
+    _git(world.dev, "push", "-q", "origin", "main")
+    return fix
+
+
+def _consume_fragment(sources: Path) -> Path:
+    """Do what scriv's collect does in bump_version_task: delete the fragment."""
+    (sources / "app-source" / "changelog.d" / "fix.md").unlink()
+    return sources
+
+
+def _hotfix_tree(tmp_path: Path, world: _World, fix: str) -> Path:
+    """Build a workspace on production plus *fix*, as a hotfix bump sees it."""
+    sources = _workspace(tmp_path, world.origin)
+    checkout = sources / "app-source"
+    _git(checkout, "checkout", "-q", "--detach", world.prod_sha)
+    _git(checkout, "cherry-pick", "-x", fix)
+    (checkout / "version.txt").write_text(f"{HOTFIX}\n")
+    return sources
+
+
+def test_finishing_a_hotfix_deletes_what_its_release_commit_consumed(
+    tmp_path, world, in_production
+):
+    """The hotfix's fragment must not stay on main to be collected again."""
+    fix = _fragment_world(world)
+    _put(_consume_fragment(_hotfix_tree(tmp_path, world, fix)), commit_hash=fix)
+    assert "fix.md" not in _git(world.origin, "ls-tree", "-r", f"releases/{HOTFIX}")
+
+    _put(_workspace(tmp_path, world.origin), action="finish")
+
+    fragments = _git(world.origin, "ls-tree", "--name-only", "main", "changelog.d/")
+    assert fragments.split() == ["changelog.d/later.md"], "unreleased work stays"
+    assert _git(world.origin, "log", "-1", "--format=%s", "main") == (
+        f"Merge releases/{HOTFIX}"
+    )
+    assert len(_git(world.origin, "log", "-1", "--format=%P", "main").split()) == 2
+
+
+def test_finishing_a_hotfix_keeps_a_consumed_file_edited_on_main(
+    tmp_path, world, in_production
+):
+    """An edit made since is later work, not what the release consumed."""
+    fix = _fragment_world(world)
+    _put(_consume_fragment(_hotfix_tree(tmp_path, world, fix)), commit_hash=fix)
+    _commit(world.dev, "Reword", **{"changelog.d/fix.md": "- Fixed it better\n"})
+    _git(world.dev, "push", "-q", "origin", "main")
+
+    _put(_workspace(tmp_path, world.origin), action="finish")
+
+    assert _git(world.origin, "show", "main:changelog.d/fix.md") == "- Fixed it better"
+
+
 def test_check_never_re_emits_an_abandoned_release(tmp_path, world, mocker):
     """Its tag is gone, so the release before it is rebuilt instead."""
     mocker.patch.object(ReleaseResource, "_reached_production", return_value=False)

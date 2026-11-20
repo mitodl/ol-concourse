@@ -1271,14 +1271,15 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             env=env,
         )
         _run(
-            [
-                "git",
-                "merge",
-                "--no-ff",
-                f"origin/{branch_name}",
-                "-m",
-                f"Merge releases/{version}",
-            ],
+            ["git", "merge", "--no-ff", "--no-commit", f"origin/{branch_name}"],
+            cwd=repo_path,
+            env=env,
+        )
+        _drop_what_the_release_commit_consumed(
+            repo_path, f"origin/{branch_name}", version, env=env
+        )
+        _run(
+            ["git", "commit", "-q", "-m", f"Merge releases/{version}"],
             cwd=repo_path,
             env=env,
         )
@@ -2463,6 +2464,59 @@ def _first_parent_of(repo_path: Path, sha: str, *, env: dict[str, str]) -> str:
         ).strip()
     except subprocess.CalledProcessError:
         return ""
+
+
+def _drop_what_the_release_commit_consumed(
+    repo_path: Path, branch_ref: str, version: str, *, env: dict[str, str]
+) -> None:
+    """Delete, in the merge being made, the files the release commit deleted.
+
+    A version bump can consume files, as scriv's collect deletes the changelog
+    fragments it writes into CHANGELOG.md.  For a normal release the merge
+    deletes them on the tracked branch too, since the branch was cut from it.
+    A hotfix is cut from production instead: its cherry-picks add the
+    fragments and its ``Release <version>`` commit deletes them, so relative
+    to the merge base they never existed on the release branch and the merge
+    keeps the tracked branch's copies.  The next release would then collect
+    them again and list the fix twice.  So each file the release commit
+    deleted is deleted here too, if the merge still has it byte for byte as
+    the release commit deleted it.  A file edited since on the tracked branch
+    is someone's later work and is kept.
+
+    Does nothing unless *branch_ref*'s tip is the ``Release <version>``
+    commit.
+    """
+    subject = _run(
+        ["git", "log", "-1", "--format=%s", branch_ref], cwd=repo_path, env=env
+    ).strip()
+    if subject != f"Release {version}":
+        return
+    deleted = _run(
+        [
+            "git",
+            "diff-tree",
+            "-r",
+            "-z",
+            "--diff-filter=D",
+            f"{branch_ref}^",
+            branch_ref,
+        ],
+        cwd=repo_path,
+        env=env,
+    ).split("\0")
+    # -z output alternates ":<modes> <old blob> <new blob> D" and the path.
+    for meta, path in zip(deleted[0::2], deleted[1::2], strict=False):
+        if not path:
+            continue
+        old_blob = meta.split()[2]
+        staged = _run(
+            ["git", "ls-files", "--stage", "-z", "--", path],
+            cwd=repo_path,
+            env=env,
+        ).strip("\0")
+        # "<mode> <blob> <stage>\t<path>", stage 0 once merged cleanly.
+        if staged and staged.split()[1] == old_blob:
+            _run(["git", "rm", "-q", "--", path], cwd=repo_path, env=env)
 
 
 def _first_parent_commits(

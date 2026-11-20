@@ -399,6 +399,14 @@ Merges `releases/YYYY.MM.DD.N` back into the configured `branch` (no fast-forwar
 then deletes the release branch from the remote.
 Run as the final step of the `deploy-production` job after production deployment is verified.
 
+The merge also deletes each file the `Release <version>` commit deleted, when
+the tracked branch still has it unchanged. A version bump can consume files,
+as scriv's collect deletes the changelog fragments it writes into the
+changelog. A normal release's merge deletes them anyway, but a hotfix is cut
+from production, so without this the tracked branch keeps the hotfix's
+fragments and the next release collects them again. A file edited on the
+tracked branch since is kept.
+
 **Idempotent**: if the release branch is already gone the release has been
 finished (or abandoned), so this returns the current tip of the tracked branch
 instead of failing. Callers should therefore **not** wrap this put in a `try` —
