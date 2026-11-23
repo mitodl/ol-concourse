@@ -476,7 +476,8 @@ abandoning one a second time is refused as never cut.
 established keeps the tag. A release whose production deploy succeeded and
 whose `action: finish` then failed is still in flight, so it is the branch-and-
 tag-present row, and it keeps its tag. The put metadata reports `abandoned_tag`
-as `kept` or `deleted`.
+as `kept` or `deleted`, or `already-abandoned` when an earlier abandon did the
+work and this one changed nothing.
 
 The tag is deleted before the branch, and the branch only once the tag is
 confirmed gone. Deleting a ref tolerates one that is already absent, so that

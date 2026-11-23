@@ -1992,9 +1992,12 @@ def test_create_refuses_an_abandoned_version(tmp_path, world, never_shipped):
 def test_abandoning_twice_is_still_a_no_op(tmp_path, world, never_shipped):
     abandoned = _cut_and_abandon(tmp_path, world)
 
-    _put(_workspace(tmp_path, world.origin, version=abandoned), action="abandon")
+    _, metadata = _put(
+        _workspace(tmp_path, world.origin, version=abandoned), action="abandon"
+    )
 
     assert f"{ABANDONED_TAG_PREFIX}{abandoned}" in _remote_tags(world.origin)
+    assert metadata["abandoned_tag"] == "already-abandoned"
 
 
 def test_abandon_of_the_next_version_fails_and_in_flight_names_the_release(
@@ -2856,7 +2859,8 @@ def test_publish_new_version_abandon_idempotent(mock_run, tmp_path):
 
     assert returned_version.version == version_str
     assert metadata["action"] == "abandon"
-    assert metadata["abandoned_tag"] == "deleted"
+    # Nothing was deleted on this run, so the metadata must not say so.
+    assert metadata["abandoned_tag"] == "already-abandoned"
     assert not [c for c in calls if "push" in c]
 
 

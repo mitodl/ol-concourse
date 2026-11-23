@@ -758,7 +758,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
         superseded = ""
         superseded_tag_kept = False
-        abandoned_tag_kept = False
+        abandoned_tag = ""
         hotfix = ""
         with _git_ssh_env(self.private_key) as env:
             _configure_git_identity(
@@ -790,14 +790,14 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 # less time to land mid-step and error a finished deploy.
                 since = _first_parent_of(repo_path, head_sha, env=env)
             else:  # abandon
-                head_sha, abandoned_tag_kept = self._abandon_requested_release(
+                head_sha, abandoned_tag = self._abandon_requested_release(
                     repo_path, version_str, env=env
                 )
                 since = ""
 
         metadata = {"version": version_str, "action": action}
         if action == "abandon":
-            metadata["abandoned_tag"] = "kept" if abandoned_tag_kept else "deleted"
+            metadata["abandoned_tag"] = abandoned_tag
         if hotfix:
             metadata["hotfix"] = hotfix
         if superseded:
@@ -1362,10 +1362,13 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
     def _abandon_requested_release(
         self, repo_path: Path, version: str, *, env: dict[str, str]
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, str]:
         """Abandon *version* on request, guarding what that is allowed to delete.
 
-        Returns ``(tracked_branch_sha, tag_kept)``.
+        Returns ``(tracked_branch_sha, abandoned_tag)``, where *abandoned_tag*
+        is the put metadata value: ``kept``, ``deleted``, or
+        ``already-abandoned`` when an earlier abandon did the work and this one
+        changed nothing.
 
         An abandon job cannot bind only a release that is in flight.
         ol-infrastructure's ``abandon-<app>-release`` gets this resource with
@@ -1418,7 +1421,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                     cwd=repo_path,
                     env=env,
                 ).strip()
-                return head_sha, False
+                return head_sha, "already-abandoned"
             msg = (
                 f"Refusing to abandon {version!r}: it was never cut. Neither "
                 f"{branch_name} nor the {version} tag is on the remote, and "
@@ -1441,7 +1444,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         head_sha = self._abandon_release(
             repo_path, version, env=env, delete_tag=not tag_kept
         )
-        return head_sha, tag_kept
+        return head_sha, "kept" if tag_kept else "deleted"
 
     def _clear_partial_cut(
         self, repo_path: Path, version: str, *, env: dict[str, str]
