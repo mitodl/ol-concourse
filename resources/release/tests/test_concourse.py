@@ -1997,6 +1997,41 @@ def test_abandoning_twice_is_still_a_no_op(tmp_path, world, never_shipped):
     assert f"{ABANDONED_TAG_PREFIX}{abandoned}" in _remote_tags(world.origin)
 
 
+def test_abandon_of_the_next_version_fails_and_in_flight_names_the_release(
+    tmp_path, world, never_shipped
+):
+    """Once the branch moves on, check's newest version is not the one in flight.
+
+    Live on ol-analytics-api 2026-11-23: an abandon job bound the next version,
+    found nothing to delete and succeeded, leaving the release in flight. That
+    version now fails the build, and its `in_flight` field names the release
+    the abandon has to cancel.
+    """
+    cut = _check(world).version
+    _put(_workspace(tmp_path, world.origin, version=cut))
+    _commit(world.dev, "Unreleased work", **{"later.txt": "later\n"})
+    _git(world.dev, "push", "-q", "origin", "main")
+    offered = _check(world)
+    assert offered.version != cut
+    assert offered.in_flight == cut
+
+    with pytest.raises(RuntimeError, match="it was never cut"):
+        _put(
+            _workspace(tmp_path, world.origin, version=offered.version),
+            action="abandon",
+        )
+    assert cut in _remote_tags(world.origin)
+    assert _git(world.origin, "branch", "--list", f"releases/{cut}")
+
+    _put(
+        _workspace(tmp_path, world.origin, version=offered.in_flight), action="abandon"
+    )
+
+    assert cut not in _remote_tags(world.origin)
+    assert not _git(world.origin, "branch", "--list", f"releases/{cut}")
+    assert f"{ABANDONED_TAG_PREFIX}{cut}" in _remote_tags(world.origin)
+
+
 def test_a_shipped_release_that_keeps_its_tag_is_not_recorded(
     tmp_path, world, in_production
 ):
@@ -2765,38 +2800,21 @@ def test_fetch_new_versions_ignores_its_own_release_commits(
 # ---------------------------------------------------------------------------
 
 
+@patch("concourse.ReleaseResource._reached_production", return_value=False)
 @patch("concourse._run")
-def test_publish_new_version_abandon(mock_run, tmp_path):
+def test_publish_new_version_abandon(mock_run, _mock_reached, tmp_path):
     """Abandon deletes the release branch and tag from the remote."""
     version_str = "2026.4.14.1"
-    version_file = tmp_path / "release" / "version"
-    version_file.parent.mkdir()
-    version_file.write_text(version_str)
-    (tmp_path / "app-source").mkdir()
-
-    main_sha = "mainshaa1" * 5
     calls: list[list[str]] = []
+    mock_run.side_effect = _abandon_run_stub(version_str, calls, in_flight=True)
 
-    def track_run(cmd, **kw):
-        calls.append(list(cmd))
-        if "rev-parse" in cmd:
-            return main_sha
-        return ""
-
-    mock_run.side_effect = track_run
-
-    resource = make_resource()
-    returned_version, metadata = resource.publish_new_version(
-        tmp_path,
-        MagicMock(),
-        action="abandon",
-        repo_dir="app-source",
-        version_file="release/version",
+    returned_version, metadata = _abandon_a_release(
+        make_resource(), tmp_path, version_str
     )
 
     assert returned_version.version == version_str
     assert metadata["action"] == "abandon"
-    assert returned_version.head_sha == main_sha
+    assert returned_version.head_sha == "mainshaa1" * 5
 
     push_cmds = [c for c in calls if "push" in c and "--delete" in c]
     deleted_refs = {" ".join(c) for c in push_cmds}
@@ -2808,40 +2826,68 @@ def test_publish_new_version_abandon(mock_run, tmp_path):
     )
 
 
-@patch("concourse._run")
-def test_publish_new_version_abandon_idempotent(mock_run, tmp_path):
-    """Abandon is idempotent — CalledProcessError from missing refs is silenced."""
-    import subprocess
-
-    version_str = "2026.4.14.1"
-    version_file = tmp_path / "release" / "version"
-    version_file.parent.mkdir()
-    version_file.write_text(version_str)
-    (tmp_path / "app-source").mkdir()
-
-    main_sha = "mainshaa1" * 5
+def _ls_remote_stub(version_str: str, calls: list[list[str]], *, refs: set[str]):
+    """Build an `_run` side effect for a remote listing exactly *refs*."""
 
     def track_run(cmd, **kw):
-        if "push" in cmd and "--delete" in cmd:
-            raise subprocess.CalledProcessError(1, cmd, "", "remote ref not found")
+        calls.append(list(cmd))
+        if "ls-remote" in cmd:
+            ref = cmd[-1]
+            return f"{'a' * 40}\t{ref}\n" if ref in refs else ""
         if "rev-parse" in cmd:
-            return main_sha
+            return "mainshaa1" * 5
         return ""
 
-    mock_run.side_effect = track_run
+    return track_run
 
-    resource = make_resource()
-    # Must not raise even though all push --delete calls fail
-    returned_version, metadata = resource.publish_new_version(
-        tmp_path,
-        MagicMock(),
-        action="abandon",
-        repo_dir="app-source",
-        version_file="release/version",
+
+@patch("concourse._run")
+def test_publish_new_version_abandon_idempotent(mock_run, tmp_path):
+    """Abandoning an already-abandoned release is a no-op that touches nothing."""
+    version_str = "2026.4.14.1"
+    calls: list[list[str]] = []
+    mock_run.side_effect = _ls_remote_stub(
+        version_str, calls, refs={f"refs/tags/{ABANDONED_TAG_PREFIX}{version_str}"}
+    )
+
+    returned_version, metadata = _abandon_a_release(
+        make_resource(), tmp_path, version_str
     )
 
     assert returned_version.version == version_str
     assert metadata["action"] == "abandon"
+    assert metadata["abandoned_tag"] == "deleted"
+    assert not [c for c in calls if "push" in c]
+
+
+@patch("concourse._run")
+def test_publish_new_version_abandon_refuses_a_version_never_cut(mock_run, tmp_path):
+    """No branch, no tag and no record of an abandon: there is nothing to cancel.
+
+    This is the version an abandon job binds when check has moved past the
+    in-flight release to the next one. Passing it quietly left the real
+    release, and its gate issue, in place behind a green build.
+    """
+    version_str = "2026.4.14.2"
+    calls: list[list[str]] = []
+    mock_run.side_effect = _ls_remote_stub(version_str, calls, refs=set())
+
+    with pytest.raises(RuntimeError, match="it was never cut"):
+        _abandon_a_release(make_resource(), tmp_path, version_str)
+
+    assert not [c for c in calls if "push" in c]
+
+
+@patch("concourse._run")
+def test_publish_new_version_abandon_refuses_an_empty_version(mock_run, tmp_path):
+    """An empty in_flight file means nothing is in flight."""
+    calls: list[list[str]] = []
+    mock_run.side_effect = _ls_remote_stub("", calls, refs=set())
+
+    with pytest.raises(RuntimeError, match="nothing to cancel"):
+        _abandon_a_release(make_resource(), tmp_path, "")
+
+    assert not [c for c in calls if "push" in c]
 
 
 @patch("concourse._run")

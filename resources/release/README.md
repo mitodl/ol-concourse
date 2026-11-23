@@ -440,15 +440,36 @@ again.
 An abandon job cannot bind only a release that is in flight. A `put` publishes
 a version of this resource, and a job that gets it with no `passed` takes
 whichever version is latest, so what this action is handed may not be the
-release the operator has in mind. Two guards follow, both of them about the
-tag, which is the only thing tying what production runs back to a commit:
+release the operator has in mind. In particular, once the tracked branch has
+commits past the release in flight, the newest version is the *next* release,
+which `check` offers with `in_flight` naming the real one. So an abandon job
+should pass the `in` step's `in_flight` file as `version_file`, not `version`:
+
+```yaml
+- put: app-release
+  params:
+    action: abandon
+    repo_dir: app-source
+    version_file: app-release/in_flight
+```
+
+The guards below are about the tag, which is the only thing tying what
+production runs back to a commit, and about failing loudly when there is
+nothing to cancel:
 
 | `releases/<version>` | `<version>` tag | What that is | Result |
 |---|---|---|---|
 | present | present | in flight | branch deleted; tag deleted only if the release never reached production |
 | present | absent | a partially-created cut (the branch is pushed before the tag) | branch deleted |
 | absent | present | nothing to cancel, most likely a release that was finished | **refused** |
-| absent | absent | already abandoned | no-op |
+| absent | absent, with an `abandoned/<version>` tag | already abandoned | no-op |
+| absent | absent, no `abandoned/<version>` tag | never cut, most likely the next version `check` offers | **refused** |
+
+An empty version (an empty `in_flight` file: nothing in flight) is refused too.
+Before the never-cut row was refused, binding the next version deleted nothing
+and succeeded, and the release in flight, with its gate issue, outlived an
+abandon that reported success. A partially-created cut is not recorded, so
+abandoning one a second time is refused as never cut.
 
 "Reached production" is the same `production_environment` deployment lookup
 `create` uses when superseding, and errs the same way: an answer that cannot be
