@@ -2512,9 +2512,9 @@ def _drop_what_the_release_commit_consumed(
     to the merge base they never existed on the release branch and the merge
     keeps the tracked branch's copies.  The next release would then collect
     them again and list the fix twice.  So each file the release commit
-    deleted is deleted here too, if the merge still has it byte for byte as
-    the release commit deleted it.  A file edited since on the tracked branch
-    is someone's later work and is kept.
+    deleted is deleted here too, if the merge still has it with the mode and
+    contents the release commit deleted.  A file edited since on the tracked
+    branch, even only its mode, is someone's later work and is kept.
 
     Does nothing unless *branch_ref*'s tip is the ``Release <version>``
     commit.
@@ -2541,16 +2541,20 @@ def _drop_what_the_release_commit_consumed(
     for meta, path in zip(deleted[0::2], deleted[1::2], strict=False):
         if not path:
             continue
-        old_blob = meta.split()[2]
+        old_mode, _, old_blob, *_ = meta[1:].split()
         # :(literal) so a name holding *, ? or [ matches only itself.
         literal = f":(literal){path}"
         staged = _run(
             ["git", "ls-files", "--stage", "-z", "--", literal],
             cwd=repo_path,
             env=env,
-        ).strip("\0")
-        # "<mode> <blob> <stage>\t<path>", stage 0 once merged cleanly.
-        if staged and staged.split()[1] == old_blob:
+        ).split("\0")
+        # Entries read "<mode> <blob> <stage>\t<path>".  Only a cleanly merged
+        # (stage 0) entry for this exact path, with the mode and blob the
+        # release commit deleted, is what it consumed.  A mode change, a
+        # symlink holding the same text, or files under a directory now at
+        # that path are later work and are kept.
+        if f"{old_mode} {old_blob} 0\t{path}" in staged:
             _run(["git", "rm", "-q", "--", literal], cwd=repo_path, env=env)
 
 

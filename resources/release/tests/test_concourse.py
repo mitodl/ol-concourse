@@ -1801,6 +1801,22 @@ def test_finishing_a_hotfix_keeps_a_consumed_file_edited_on_main(
     assert _git(world.origin, "show", "main:changelog.d/fix.md") == "- Fixed it better"
 
 
+def test_finishing_a_hotfix_keeps_a_consumed_file_whose_mode_changed_on_main(
+    tmp_path, world, in_production
+):
+    """Same bytes under a new mode is still a change made since."""
+    fix = _fragment_world(world)
+    _put(_consume_fragment(_hotfix_tree(tmp_path, world, fix)), commit_hash=fix)
+    _git(world.dev, "update-index", "--chmod=+x", "changelog.d/fix.md")
+    _git(world.dev, "commit", "-q", "-m", "Make it executable")
+    _git(world.dev, "push", "-q", "origin", "main")
+
+    _put(_workspace(tmp_path, world.origin), action="finish")
+
+    entry = _git(world.origin, "ls-tree", "main", "changelog.d/fix.md")
+    assert entry.startswith("100755 "), entry
+
+
 def test_finish_rerun_after_main_was_pushed_deletes_the_branch(
     tmp_path, world, in_production
 ):
