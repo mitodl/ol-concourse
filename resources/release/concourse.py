@@ -734,8 +734,9 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
           3. Push, then delete the release branch from the remote.
 
         action=abandon:
-          1. Refuse if nothing is in flight for the version but its tag is
-             still on the remote.
+          1. Refuse an empty version, a version that was never cut, and one
+             with nothing in flight whose tag is still on the remote.  A
+             version already abandoned is a no-op.
           2. Delete the release branch, and the version tag unless the release
              already reached production.  A deleted tag leaves an
              ``abandoned/<version>`` tag behind.
@@ -757,7 +758,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
         superseded = ""
         superseded_tag_kept = False
-        abandoned_tag_kept = False
+        abandoned_tag = ""
         hotfix = ""
         with _git_ssh_env(self.private_key) as env:
             _configure_git_identity(
@@ -789,14 +790,14 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 # less time to land mid-step and error a finished deploy.
                 since = _first_parent_of(repo_path, head_sha, env=env)
             else:  # abandon
-                head_sha, abandoned_tag_kept = self._abandon_requested_release(
+                head_sha, abandoned_tag = self._abandon_requested_release(
                     repo_path, version_str, env=env
                 )
                 since = ""
 
         metadata = {"version": version_str, "action": action}
         if action == "abandon":
-            metadata["abandoned_tag"] = "kept" if abandoned_tag_kept else "deleted"
+            metadata["abandoned_tag"] = abandoned_tag
         if hotfix:
             metadata["hotfix"] = hotfix
         if superseded:
@@ -1361,10 +1362,13 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
 
     def _abandon_requested_release(
         self, repo_path: Path, version: str, *, env: dict[str, str]
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, str]:
         """Abandon *version* on request, guarding what that is allowed to delete.
 
-        Returns ``(tracked_branch_sha, tag_kept)``.
+        Returns ``(tracked_branch_sha, abandoned_tag)``, where *abandoned_tag*
+        is the put metadata value: ``kept``, ``deleted``, or
+        ``already-abandoned`` when an earlier abandon did the work and this one
+        changed nothing.
 
         An abandon job cannot bind only a release that is in flight.
         ol-infrastructure's ``abandon-<app>-release`` gets this resource with
@@ -1379,14 +1383,55 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         A release whose production deploy succeeded and whose ``action=finish``
         then failed is still in flight, and keeps its tag.
 
-        :raises RuntimeError: If nothing is in flight for *version* while its
-            tag is still on the remote.  There is no release to cancel, so the
+        A version with neither its branch nor its tag on the remote is either
+        one this resource already abandoned, which leaves an
+        ``abandoned/<version>`` tag, or one that was never cut.  The first is a
+        no-op, so a retried abandon stays green.  The second is refused: it is
+        what an abandon job binds when ``check`` has moved past the in-flight
+        release to the next version, and passing it quietly let the release
+        the operator meant to cancel, and its gate issue, survive a build
+        that reported success.  Pass the ``in_flight`` file as
+        ``version_file`` to name the release that is actually in flight.
+
+        :raises RuntimeError: If *version* is empty, if nothing is in flight
+            for *version* while its tag is still on the remote, or if
+            *version* was never cut.  There is no release to cancel, so the
             request was made against the wrong version.
         """
+        if not version:
+            msg = (
+                "Refusing to abandon: the version file is empty, so no release "
+                "is in flight and there is nothing to cancel."
+            )
+            raise RuntimeError(msg)
         _run(["git", "fetch", "origin", "--tags"], cwd=repo_path, env=env)
         branch_name = f"releases/{version}"
         in_flight = _remote_branch_exists(repo_path, branch_name, env=env)
-        if not in_flight and _remote_tag_exists(repo_path, version, env=env):
+        tagged = _remote_tag_exists(repo_path, version, env=env)
+        if not in_flight and not tagged:
+            tombstone = f"{ABANDONED_TAG_PREFIX}{version}"
+            if _remote_tag_exists(repo_path, tombstone, env=env):
+                print(  # noqa: T201
+                    f"[release] {version} was already abandoned ({tombstone}); "
+                    "nothing to do",
+                    file=sys.stderr,
+                )
+                head_sha = _run(
+                    ["git", "rev-parse", f"origin/{self.branch}"],
+                    cwd=repo_path,
+                    env=env,
+                ).strip()
+                return head_sha, "already-abandoned"
+            msg = (
+                f"Refusing to abandon {version!r}: it was never cut. Neither "
+                f"{branch_name} nor the {version} tag is on the remote, and "
+                f"there is no {tombstone} tag from an earlier abandon. This is "
+                "most likely the next version check offers rather than the "
+                "release in flight; abandon the version in the `in_flight` "
+                "file instead."
+            )
+            raise RuntimeError(msg)
+        if not in_flight and tagged:
             msg = (
                 f"Refusing to abandon {version!r}: it is not in flight. "
                 f"{branch_name} is gone from the remote while the {version} "
@@ -1399,7 +1444,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         head_sha = self._abandon_release(
             repo_path, version, env=env, delete_tag=not tag_kept
         )
-        return head_sha, tag_kept
+        return head_sha, "kept" if tag_kept else "deleted"
 
     def _clear_partial_cut(
         self, repo_path: Path, version: str, *, env: dict[str, str]
