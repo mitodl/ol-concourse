@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from concourse import (
+    ABANDON_REQUEST_TAG_PREFIX,
     ABANDONED_TAG_PREFIX,
     ReleaseResource,
     ReleaseVersion,
@@ -2033,6 +2034,114 @@ def test_abandon_of_the_next_version_fails_and_in_flight_names_the_release(
     assert cut not in _remote_tags(world.origin)
     assert not _git(world.origin, "branch", "--list", f"releases/{cut}")
     assert f"{ABANDONED_TAG_PREFIX}{cut}" in _remote_tags(world.origin)
+
+
+# ---------------------------------------------------------------------------
+# abandon with require_request: only the release someone asked to cancel
+# ---------------------------------------------------------------------------
+
+
+def _request_abandon(world: _World, version: str) -> None:
+    _git(world.dev, "fetch", "-q", "origin", f"releases/{version}")
+    _git(world.dev, "tag", f"{ABANDON_REQUEST_TAG_PREFIX}{version}", "FETCH_HEAD")
+    _git(world.dev, "push", "-q", "origin", f"{ABANDON_REQUEST_TAG_PREFIX}{version}")
+
+
+def _abandon_in_flight(tmp_path: Path, world: _World):
+    """Abandon what check names in flight, as abandon-<app>-release does."""
+    in_flight = _check(world).in_flight
+    return _put(
+        _workspace(tmp_path, world.origin, version=in_flight),
+        action="abandon",
+        require_request=True,
+    )
+
+
+def test_a_requested_abandon_cancels_the_release_and_consumes_the_request(
+    tmp_path, world, never_shipped
+):
+    cut = _check(world).version
+    _put(_workspace(tmp_path, world.origin, version=cut))
+    _request_abandon(world, cut)
+
+    _, metadata = _abandon_in_flight(tmp_path, world)
+
+    assert metadata["abandoned_tag"] == "deleted"
+    assert not _git(world.origin, "branch", "--list", f"releases/{cut}")
+    assert f"{ABANDONED_TAG_PREFIX}{cut}" in _remote_tags(world.origin)
+    assert f"{ABANDON_REQUEST_TAG_PREFIX}{cut}" not in _remote_tags(world.origin)
+
+
+def test_an_abandon_nobody_requested_is_refused(tmp_path, world, never_shipped):
+    """E.g. a manual trigger in the Concourse UI: nothing says which release."""
+    cut = _check(world).version
+    _put(_workspace(tmp_path, world.origin, version=cut))
+
+    with pytest.raises(RuntimeError, match="no abandon-request/"):
+        _abandon_in_flight(tmp_path, world)
+
+    assert cut in _remote_tags(world.origin)
+    assert _git(world.origin, "branch", "--list", f"releases/{cut}")
+
+
+def test_an_abandon_requested_for_a_superseded_release_spares_its_successor(
+    tmp_path, world, never_shipped
+):
+    """The race: `/doof abandon` saw A, then a supersede cut B before the build.
+
+    Without the request the build's check names B in flight and the job
+    cancels B, a release nobody asked to abandon.
+    """
+    first = _check(world).version
+    _put(_workspace(tmp_path, world.origin, version=first))
+    _request_abandon(world, first)
+    _commit(world.dev, "More work", **{"more.txt": "more\n"})
+    _git(world.dev, "push", "-q", "origin", "main")
+    second = _check(world).version
+    _, created = _put(_workspace(tmp_path, world.origin, version=second))
+    assert created["superseded"] == first
+    assert _check(world).in_flight == second
+
+    with pytest.raises(RuntimeError, match=f"no abandon-request/{second} tag"):
+        _abandon_in_flight(tmp_path, world)
+
+    assert second in _remote_tags(world.origin)
+    assert _git(world.origin, "branch", "--list", f"releases/{second}")
+
+    _request_abandon(world, second)
+    _abandon_in_flight(tmp_path, world)
+
+    assert not _git(world.origin, "branch", "--list", f"releases/{second}")
+    assert f"{ABANDONED_TAG_PREFIX}{second}" in _remote_tags(world.origin)
+
+
+def test_a_refused_abandon_keeps_its_request_for_a_re_run(
+    tmp_path, world, never_shipped, mocker
+):
+    """A re-run of the failed build binds the same version and needs the request."""
+    cut = _check(world).version
+    _put(_workspace(tmp_path, world.origin, version=cut))
+    _request_abandon(world, cut)
+    mocker.patch.object(
+        ReleaseResource,
+        "_abandon_release",
+        side_effect=RuntimeError("Could not delete the tag"),
+    )
+
+    with pytest.raises(RuntimeError, match="Could not delete the tag"):
+        _abandon_in_flight(tmp_path, world)
+
+    assert f"{ABANDON_REQUEST_TAG_PREFIX}{cut}" in _remote_tags(world.origin)
+
+
+def test_without_require_request_no_request_is_needed(tmp_path, world, never_shipped):
+    """Pipelines that do not opt in keep working until they do."""
+    cut = _check(world).version
+    _put(_workspace(tmp_path, world.origin, version=cut))
+
+    _put(_workspace(tmp_path, world.origin, version=cut), action="abandon")
+
+    assert not _git(world.origin, "branch", "--list", f"releases/{cut}")
 
 
 def test_a_shipped_release_that_keeps_its_tag_is_not_recorded(

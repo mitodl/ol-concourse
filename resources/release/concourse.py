@@ -60,6 +60,12 @@ MAX_HOTFIX_COMMITS = 10
 # Re-using it would re-use its image tag, and a deploy by that tag changes
 # nothing.  It does not match VERSION_PATTERN, so nothing re-emits it.
 ABANDONED_TAG_PREFIX = "abandoned/"
+# An abandon is requested by pushing an ``abandon-request/<version>`` tag.
+# With ``require_request``, ``action=abandon`` refuses a version no request
+# names and deletes the request once that version is abandoned.  It binds the
+# job, which takes no parameters, to the release the requester saw in flight.
+# It does not match VERSION_PATTERN or the ``abandoned/`` prefix.
+ABANDON_REQUEST_TAG_PREFIX = "abandon-request/"
 # What ``cherry-pick -x`` appends to a hotfix commit.  The last one names the
 # commit picked; earlier ones were carried over from the fix's own message.
 CHERRY_PICK_TRAILER = re.compile(r"\(cherry picked from commit ([0-9a-f]{40})\)")
@@ -714,6 +720,7 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         repo_dir: str,
         version_file: str,
         commit_hash: str | None = None,
+        require_request: bool = False,
     ) -> tuple[ReleaseVersion, dict[str, str]]:
         """Create or finish a release.
 
@@ -741,6 +748,10 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
              already reached production.  A deleted tag leaves an
              ``abandoned/<version>`` tag behind.
           3. Subsequent check calls compute the next version past it.
+
+        action=abandon with require_request also refuses a version that no
+        ``abandon-request/<version>`` tag names, and deletes that tag once the
+        version is abandoned.  See :meth:`_abandon_requested_release`.
 
         ``repo_dir`` is the path within the Concourse workspace to the
         checked-out git repository (i.e. the ``get`` output directory name).
@@ -791,7 +802,10 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 since = _first_parent_of(repo_path, head_sha, env=env)
             else:  # abandon
                 head_sha, abandoned_tag = self._abandon_requested_release(
-                    repo_path, version_str, env=env
+                    repo_path,
+                    version_str,
+                    env=env,
+                    require_request=require_request,
                 )
                 since = ""
 
@@ -1361,7 +1375,12 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         ).strip()
 
     def _abandon_requested_release(
-        self, repo_path: Path, version: str, *, env: dict[str, str]
+        self,
+        repo_path: Path,
+        version: str,
+        *,
+        env: dict[str, str],
+        require_request: bool = False,
     ) -> tuple[str, str]:
         """Abandon *version* on request, guarding what that is allowed to delete.
 
@@ -1393,10 +1412,19 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
         that reported success.  Pass the ``in_flight`` file as
         ``version_file`` to name the release that is actually in flight.
 
-        :raises RuntimeError: If *version* is empty, if nothing is in flight
-            for *version* while its tag is still on the remote, or if
-            *version* was never cut.  There is no release to cancel, so the
-            request was made against the wrong version.
+        Even the ``in_flight`` file can name a release the operator never
+        meant: one cut between the request and this build's check, e.g. by a
+        supersede.  With *require_request*, the version must also be named by
+        an ``abandon-request/<version>`` tag, which whoever asked for the
+        abandon pushes before triggering the job.  Nothing is deleted without
+        one, and the request is deleted only after the abandon succeeds, so a
+        re-run of a failed build still finds it.
+
+        :raises RuntimeError: If *version* is empty, if *require_request* is
+            set and no request names *version*, if nothing is in flight for
+            *version* while its tag is still on the remote, or if *version*
+            was never cut.  There is no release to cancel, so the request was
+            made against the wrong version.
         """
         if not version:
             msg = (
@@ -1404,6 +1432,26 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
                 "is in flight and there is nothing to cancel."
             )
             raise RuntimeError(msg)
+        request = f"{ABANDON_REQUEST_TAG_PREFIX}{version}"
+        if require_request and not _remote_tag_exists(repo_path, request, env=env):
+            msg = (
+                f"Refusing to abandon {version!r}: no {request} tag asks for "
+                "it. Either the abandon was requested for a different release, "
+                "for example one this release superseded, or nobody requested "
+                "it. `/doof abandon` requests the release it sees in flight."
+            )
+            raise RuntimeError(msg)
+        head_sha, abandoned_tag = self._abandon_unless_guarded(
+            repo_path, version, env=env
+        )
+        if require_request:
+            _delete_remote_ref(repo_path, f"refs/tags/{request}", env=env)
+        return head_sha, abandoned_tag
+
+    def _abandon_unless_guarded(
+        self, repo_path: Path, version: str, *, env: dict[str, str]
+    ) -> tuple[str, str]:
+        """Apply :meth:`_abandon_requested_release`'s branch and tag guards."""
         _run(["git", "fetch", "origin", "--tags"], cwd=repo_path, env=env)
         branch_name = f"releases/{version}"
         in_flight = _remote_branch_exists(repo_path, branch_name, env=env)

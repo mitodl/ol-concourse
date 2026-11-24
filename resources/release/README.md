@@ -451,7 +451,20 @@ should pass the `in` step's `in_flight` file as `version_file`, not `version`:
     action: abandon
     repo_dir: app-source
     version_file: app-release/in_flight
+    require_request: true
 ```
+
+Even `in_flight` can name a release nobody asked to cancel. A job takes no
+parameters, so whoever triggers it sees one release in flight, and a release
+cut before the build's own `check` (for example by a supersede) is what the
+build then finds. With `require_request: true`, `abandon` also refuses a
+version that no `abandon-request/<version>` tag names, before it changes
+anything. The requester pushes that tag (the release bot's `/doof abandon`
+pushes it at the head of `releases/<version>`) and then triggers the job. The
+put deletes the request once the version is abandoned, including when it was
+already abandoned, and keeps it when it fails, so a re-run of the failed build
+still finds it. A manual trigger with no request is refused. The tag matches
+neither the version pattern nor `abandoned/`, so `check` ignores it.
 
 The guards below are about the tag, which is the only thing tying what
 production runs back to a commit, and about failing loudly when there is
@@ -495,6 +508,7 @@ so the abandon can simply be run again.
 | `repo_dir` | Yes | Name of the workspace directory containing the checked-out repo |
 | `version_file` | Yes | Path to the `version` file (relative to workspace root), e.g. `release/version` |
 | `commit_hash` | No | Commit SHAs to cherry-pick onto production, separated by whitespace, at most 10 (`create` only; hotfix support) |
+| `require_request` | No | Refuse to abandon a version no `abandon-request/<version>` tag names, and delete that tag once the version is abandoned (`abandon` only; default `false`) |
 
 ### The create job must not trigger on this resource
 
