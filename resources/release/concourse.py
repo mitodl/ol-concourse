@@ -1433,7 +1433,11 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             )
             raise RuntimeError(msg)
         request = f"{ABANDON_REQUEST_TAG_PREFIX}{version}"
-        if require_request and not _remote_tag_exists(repo_path, request, env=env):
+        if (
+            require_request
+            and not _remote_tag_exists(repo_path, request, env=env)
+            and not self._already_abandoned(repo_path, version, env=env)
+        ):
             msg = (
                 f"Refusing to abandon {version!r}: no {request} tag asks for "
                 "it. Either the abandon was requested for a different release, "
@@ -1445,8 +1449,36 @@ class ReleaseResource(ConcourseResource[ReleaseVersion]):
             repo_path, version, env=env
         )
         if require_request:
+            # Best-effort, like every ref deletion here: a version is never
+            # cut twice, so a request that survives can never match again.
             _delete_remote_ref(repo_path, f"refs/tags/{request}", env=env)
+            if _remote_tag_exists(repo_path, request, env=env):
+                print(  # noqa: T201
+                    f"[release] warning: could not delete {request} from the "
+                    "remote; it names a version that is now abandoned",
+                    file=sys.stderr,
+                )
         return head_sha, abandoned_tag
+
+    @staticmethod
+    def _already_abandoned(
+        repo_path: Path, version: str, *, env: dict[str, str]
+    ) -> bool:
+        """Return whether an earlier abandon finished *version*.
+
+        Neither its branch nor its tag is on the remote and its
+        ``abandoned/<version>`` tombstone is.  Such an abandon deletes
+        nothing, so it needs no request.  That keeps a re-run of a build whose
+        release put consumed the request, and whose issue put then failed,
+        a no-op that goes on to retire the issue.
+        """
+        return (
+            not _remote_branch_exists(repo_path, f"releases/{version}", env=env)
+            and not _remote_tag_exists(repo_path, version, env=env)
+            and _remote_tag_exists(
+                repo_path, f"{ABANDONED_TAG_PREFIX}{version}", env=env
+            )
+        )
 
     def _abandon_unless_guarded(
         self, repo_path: Path, version: str, *, env: dict[str, str]
@@ -2229,12 +2261,26 @@ def _remote_tag_exists(repo_path: Path, tag: str, *, env: dict[str, str]) -> boo
     adds to but never prunes: a tag deleted on the remote lingers in the
     workspace checkout indefinitely.
     """
+    ref = f"refs/tags/{tag}"
     output = _run(
-        ["git", "ls-remote", "--tags", "origin", f"refs/tags/{tag}"],
+        ["git", "ls-remote", "--tags", "origin", ref],
         cwd=repo_path,
         env=env,
     )
-    return bool(output.strip())
+    return _lists_ref(output, ref)
+
+
+def _lists_ref(ls_remote_output: str, ref: str) -> bool:
+    """Return whether ``git ls-remote`` output lists exactly *ref*.
+
+    ``ls-remote`` matches a pattern against the end of each ref name, so
+    asking for ``refs/tags/abandon-request/V`` also lists
+    ``refs/tags/x/refs/tags/abandon-request/V``, a tag anyone who can push
+    could create to pass a check that only looked for non-empty output.
+    """
+    return any(
+        line.partition("\t")[2].strip() == ref for line in ls_remote_output.splitlines()
+    )
 
 
 def _resolve_commit(repo_path: Path, commit_hash: str, *, env: dict[str, str]) -> str:

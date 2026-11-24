@@ -463,7 +463,11 @@ anything. The requester pushes that tag (the release bot's `/doof abandon`
 pushes it at the head of `releases/<version>`) and then triggers the job. The
 put deletes the request once the version is abandoned, including when it was
 already abandoned, and keeps it when it fails, so a re-run of the failed build
-still finds it. A manual trigger with no request is refused. The tag matches
+still finds it. A version that is already abandoned (the no-op row below) needs
+no request, because that abandon deletes nothing. So a re-run of a build whose
+release put consumed the request, and whose issue put then failed, still gets
+as far as the issue put. A manual trigger with no request is refused. Only a tag
+named exactly `refs/tags/abandon-request/<version>` counts. The tag matches
 neither the version pattern nor `abandoned/`, so `check` ignores it.
 
 The guards below are about the tag, which is the only thing tying what

@@ -2134,6 +2134,46 @@ def test_a_refused_abandon_keeps_its_request_for_a_re_run(
     assert f"{ABANDON_REQUEST_TAG_PREFIX}{cut}" in _remote_tags(world.origin)
 
 
+def test_re_running_a_finished_abandon_needs_no_request(tmp_path, world, never_shipped):
+    """A re-run after the issue put failed must reach the issue put again.
+
+    The first run's release put consumed the request, and the re-run binds
+    the same version. It deletes nothing, so it stays a no-op.
+    """
+    cut = _check(world).version
+    _put(_workspace(tmp_path, world.origin, version=cut))
+    _request_abandon(world, cut)
+    _put(
+        _workspace(tmp_path, world.origin, version=cut),
+        action="abandon",
+        require_request=True,
+    )
+    assert f"{ABANDON_REQUEST_TAG_PREFIX}{cut}" not in _remote_tags(world.origin)
+
+    _, metadata = _put(
+        _workspace(tmp_path, world.origin, version=cut),
+        action="abandon",
+        require_request=True,
+    )
+
+    assert metadata["abandoned_tag"] == "already-abandoned"
+
+
+def test_a_look_alike_request_tag_is_not_a_request(tmp_path, world, never_shipped):
+    """`git ls-remote` matches the end of a ref name; the check must not."""
+    cut = _check(world).version
+    _put(_workspace(tmp_path, world.origin, version=cut))
+    look_alike = f"x/refs/tags/{ABANDON_REQUEST_TAG_PREFIX}{cut}"
+    _git(world.dev, "tag", look_alike, "main")
+    _git(world.dev, "push", "-q", "origin", look_alike)
+
+    with pytest.raises(RuntimeError, match="no abandon-request/"):
+        _abandon_in_flight(tmp_path, world)
+
+    assert cut in _remote_tags(world.origin)
+    assert _git(world.origin, "branch", "--list", f"releases/{cut}")
+
+
 def test_without_require_request_no_request_is_needed(tmp_path, world, never_shipped):
     """Pipelines that do not opt in keep working until they do."""
     cut = _check(world).version
