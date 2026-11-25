@@ -1,6 +1,6 @@
 # MIT ODL provisioner image: uses python:3.13-slim + manually installs Pulumi CLI,
 # kubectl, and AWS CLI. Syncs Python dependencies from mitodl/ol-infrastructure via uv.
-FROM mitodl/ol-infrastructure@sha256:eeee6d832e6bb946758e43a8a5b3e2796695f96b00b49e4d84e01f7be4e984bd AS infra
+FROM mitodl/ol-infrastructure@sha256:0f0cab165a17c7bf8f7104e70d62abd658fb2e6901416de6ef593d57b218db41 AS infra
 
 FROM ghcr.io/astral-sh/uv:latest@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 AS uv
 
